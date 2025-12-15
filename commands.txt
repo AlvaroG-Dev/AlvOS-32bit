@@ -1,0 +1,22 @@
+qemu-system-i386 -cdrom ./build/os.iso -drive file=disk.img,format=raw,cache=none,if=ide -machine pc -no-reboot -m 1G -d int -boot d
+dd if=/dev/zero of=disco.img bs=1M count=1000
+sudo mkfs.vfat -F 16 ./disco.img
+
+qemu-system-i386 \
+  -machine q35,accel=kvm \
+  -cpu pentium3 \
+  -smp 2 \
+  -m 2048 \
+  -bios /usr/share/seabios/bios.bin \
+  -device ahci,id=ahci0 \
+  -drive id=disk0,file=disk.img,if=none,format=raw \
+  -device ide-hd,drive=disk0,bus=ahci0.0 \
+  -drive id=cd0,media=cdrom,file=build/os.iso,if=none \
+  -device ide-cd,drive=cd0,bus=ahci0.1 \
+  -boot d \
+  -device e1000e,netdev=net0 \
+  -netdev user,id=net0 \
+  -device ich9-intel-hda -device hda-duplex \
+  -vga std \
+  -display sdl,gl=on \
+  -no-reboot

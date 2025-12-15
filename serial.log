@@ -1,0 +1,42 @@
+VFS: Matched root mount for path /dev (fs: tmpfs)
+VFS: Matched root mount for path / (fs: tmpfs)
+VFS: Matched root mount for path /ramfs (fs: tmpfs)
+VFS: Matched root mount for path / (fs: tmpfs)
+VFS: Matched root mount for path /home (fs: tmpfs)
+VFS: Matched root mount for path / (fs: tmpfs)
+FAT32: FSInfo read: free_clusters=255235, next_free_cluster=2
+fat32_mount: FAT[1]=0x07ffffff
+fat32_mount: Invalid FAT[1]=0x07ffffff, setting to 0x0FFFFFFF
+FAT32: Set FAT entry for cluster 1 to 0x0fffffff
+FAT32: Set FAT entry for cluster 1 to 0x07ffffff
+fat32_cluster_to_sector: Cluster 2 -> Sector 4032
+fat32_cluster_to_sector: Cluster 2 -> Sector 4032
+fat32_cluster_to_sector: Cluster 2 -> Sector 4032
+fat32_cluster_to_sector: Cluster 2 -> Sector 4032
+fat32_cluster_to_sector: Cluster 2 -> Sector 4032
+fat32_cluster_to_sector: Cluster 2 -> Sector 4032
+fat32_cluster_to_sector: Cluster 2 -> Sector 4032
+fat32_cluster_to_sector: Cluster 2 -> Sector 4032
+FAT32: Dumping FAT entries from cluster 2
+FAT32: Cluster 2 -> 0x0ffffff8
+FAT32: Cluster 3 -> 0x00000000
+FAT32: Cluster 4 -> 0x00000000
+FAT32: Cluster 5 -> 0x00000000
+FAT32: Cluster 6 -> 0x00000000
+FAT32: Cluster 7 -> 0x00000000
+FAT32: Cluster 8 -> 0x00000000
+FAT32: Cluster 9 -> 0x00000000
+FAT32: Cluster 10 -> 0x00000000
+FAT32: Cluster 11 -> 0x00000000
+fat32_mount: Success, root cluster=2, total clusters=255236
+Serial ONvfs_open: Opening path: /ramfs/syslog.log with flags 0xc
+DEBUG: Path input: 2f 72 61 6d 66 73 2f 73 79 73 6c 6f 67 2e 6c 6f 67 
+DEBUG: Normalized path: 2f 72 61 6d 66 73 2f 73 79 73 6c 6f 67 2e 6c 6f 67 
+VFS: Matched root mount for path /ramfs/syslog.log (fs: tmpfs)
+VFS: Matched mount /ramfs for path /ramfs/syslog.log (fs: tmpfs)
+vfs_open: Mountpoint found, relative path: syslog.log
+DEBUG: Relative path: 73 79 73 6c 6f 67 2e 6c 6f 67 
+DEBUG: Relative path copy: 73 79 73 6c 6f 67 2e 6c 6f 67 
+vfs_open: Parent path: , Name: syslog.log
+DEBUG: Filename: 73 79 73 6c 6f 67 2e 6c 6f 67 
+vfs_open: Successfully opened /ramfs/syslog.log, fd=0
