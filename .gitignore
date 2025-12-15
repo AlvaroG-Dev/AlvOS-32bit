@@ -1,0 +1,20 @@
+# ----------------------------------
+# 1. Directorios y archivos de compilación
+# (Evita subir los resultados intermedios y finales de la compilación)
+# ----------------------------------
+/build/      # Ignora todo el directorio de compilación
+*.o          # Ignora todos los archivos objeto (.o)
+*.bin        # Ignora todos los archivos binarios (.bin)
+*.img        # Ignora todas las imágenes de disco (.img)
+
+#-----------------------------------
+# 2. Archivos temporales y de logs
+# ----------------------------------
+*.log        # Ignora todos los archivos de logs
+*~           # Archivos temporales de algunos editores
+
+#--------------------------------
+# 3. Archivos de sistema y IDE/Editor
+# ----------------------------------
+# Archivos de la configuración de Visual Studio Code
+.vscode/
