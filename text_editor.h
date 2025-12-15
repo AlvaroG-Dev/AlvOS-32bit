@@ -1,85 +1,85 @@
 #ifndef TEXT_EDITOR_H
 #define TEXT_EDITOR_H
 
-#include <stdint.h>
-#include <stdbool.h>
 #include "keyboard.h"
 #include "terminal.h"
+#include <stdbool.h>
+#include <stdint.h>
 
 // Configuración del editor
-#define EDITOR_MAX_LINES        1024
-#define EDITOR_LINE_MAX_LENGTH  256
-#define EDITOR_TAB_SIZE         4
-#define EDITOR_STATUS_HEIGHT    2
-#define EDITOR_BUFFER_SIZE      (EDITOR_MAX_LINES * EDITOR_LINE_MAX_LENGTH)
+#define EDITOR_MAX_LINES 1024
+#define EDITOR_LINE_MAX_LENGTH 256
+#define EDITOR_TAB_SIZE 4
+#define EDITOR_STATUS_HEIGHT 2
+#define EDITOR_BUFFER_SIZE (EDITOR_MAX_LINES * EDITOR_LINE_MAX_LENGTH)
 
 // Modos del editor
 typedef enum {
-    EDITOR_MODE_NORMAL,      // Navegación y comandos
-    EDITOR_MODE_INSERT,      // Inserción de texto
-    EDITOR_MODE_COMMAND,     // Modo de comandos (línea inferior)
-    EDITOR_MODE_SEARCH,      // Búsqueda
-    EDITOR_MODE_REPLACE,      // Reemplazo
-    EDITOR_MODE_HELP         // Ayuda
+  EDITOR_MODE_NORMAL,  // Navegación y comandos
+  EDITOR_MODE_INSERT,  // Inserción de texto
+  EDITOR_MODE_COMMAND, // Modo de comandos (línea inferior)
+  EDITOR_MODE_SEARCH,  // Búsqueda
+  EDITOR_MODE_REPLACE, // Reemplazo
+  EDITOR_MODE_HELP     // Ayuda
 } editor_mode_t;
 
 // Estructura de una línea de texto
 typedef struct editor_line {
-    char data[EDITOR_LINE_MAX_LENGTH];
-    uint32_t length;
-    bool modified;
+  char data[EDITOR_LINE_MAX_LENGTH];
+  uint32_t length;
+  bool modified;
 } editor_line_t;
 
 // Estructura principal del editor
 typedef struct text_editor {
-    // Buffer de líneas
-    editor_line_t *lines;
-    uint32_t line_count;
-    uint32_t max_lines;
-    
-    // Cursor
-    uint32_t cursor_x;      // Columna (carácter)
-    uint32_t cursor_y;      // Línea
-    
-    // Viewport (porción visible de texto)
-    uint32_t viewport_x;    // Primera columna visible
-    uint32_t viewport_y;    // Primera línea visible
-    uint32_t viewport_width;
-    uint32_t viewport_height;
-    
-    // Terminal asociado
-    Terminal *term;
-    
-    // Archivo
-    char filename[256];
-    int file_descriptor;
-    bool file_open;
-    bool modified;
-    
-    // Modo actual
-    editor_mode_t mode;
-    
-    // Buffer de comandos
-    char command_buffer[256];
-    uint32_t command_length;
-    
-    // Buffer del portapapeles
-    char clipboard[EDITOR_LINE_MAX_LENGTH];
-    uint32_t clipboard_length;
-    
-    // Búsqueda
-    char search_term[128];
-    uint32_t search_length;
-    
-    // Estado
-    bool running;
-    char status_message[256];
-    uint32_t status_time;
-    
+  // Buffer de líneas
+  editor_line_t *lines;
+  uint32_t line_count;
+  uint32_t max_lines;
+
+  // Cursor
+  uint32_t cursor_x; // Columna (carácter)
+  uint32_t cursor_y; // Línea
+
+  // Viewport (porción visible de texto)
+  uint32_t viewport_x; // Primera columna visible
+  uint32_t viewport_y; // Primera línea visible
+  uint32_t viewport_width;
+  uint32_t viewport_height;
+
+  // Terminal asociado
+  Terminal *term;
+
+  // Archivo
+  char filename[256];
+  int file_descriptor;
+  bool file_open;
+  bool modified;
+
+  // Modo actual
+  editor_mode_t mode;
+
+  // Buffer de comandos
+  char command_buffer[256];
+  uint32_t command_length;
+
+  // Buffer del portapapeles
+  char clipboard[EDITOR_LINE_MAX_LENGTH];
+  uint32_t clipboard_length;
+
+  // Búsqueda
+  char search_term[128];
+  uint32_t search_length;
+
+  // Estado
+  bool running;
+  char status_message[256];
+  uint32_t status_time;
+
 } text_editor_t;
 
 // Funciones públicas del editor
-text_editor_t* editor_create(Terminal *term);
+text_editor_t *editor_create(Terminal *term);
 void editor_destroy(text_editor_t *editor);
 
 // Operaciones de archivo
@@ -94,6 +94,7 @@ void editor_delete_char(text_editor_t *editor);
 void editor_backspace(text_editor_t *editor);
 void editor_insert_newline(text_editor_t *editor);
 void editor_delete_line(text_editor_t *editor);
+void editor_mark_line_dirty(text_editor_t *editor, uint32_t line);
 
 // Navegación
 void editor_move_cursor(text_editor_t *editor, int dx, int dy);

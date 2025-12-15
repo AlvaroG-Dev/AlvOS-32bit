@@ -27,6 +27,7 @@
 #include "terminal.h"
 #include "tmpfs.h"
 #include "vfs.h"
+
 // Global definition of BootInfo.
 BootInfo boot_info;
 uint32_t *g_framebuffer = NULL;
@@ -54,6 +55,7 @@ install_options_t options = {.mode = INSTALL_MODE_FULL,
                              .target_partition = 0};
 void keyboard_terminal_handler(int key);
 static void main_loop_task(void *arg);
+
 // Función de apagado del sistema operativo
 void shutdown(void) {
   terminal_printf(&main_terminal, "\n\nSystem shutdown initiated\r\n");
@@ -138,6 +140,7 @@ void shutdown(void) {
     __asm__ volatile("cli; hlt");
   }
 }
+
 void initialize_acpi_pci(void) {
   boot_log_start("Initializing PCI subsystem");
   // Mapear regiones críticas para ACPI
@@ -183,6 +186,7 @@ void initialize_acpi_pci(void) {
     boot_log_error();
   }
 }
+
 void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
   // Verify Multiboot2
   if (magic != 0x36d76289) {
@@ -668,6 +672,7 @@ static void main_loop_task(void *arg) {
     task_sleep(1); // Dormir 10ms, luego el scheduler lo despertará
   }
 }
+
 void keyboard_terminal_handler(int key) {
   terminal_handle_key(&main_terminal, key);
 }
