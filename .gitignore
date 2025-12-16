@@ -5,7 +5,7 @@
 /build/      # Ignora todo el directorio de compilación
 *.o          # Ignora todos los archivos objeto (.o)
 *.bin        # Ignora todos los archivos binarios (.bin)
-*.img        # Ignora todas las imágenes de disco (.img)
+disk.img        # Ignora todas las imágenes de disco (.img)
 
 #-----------------------------------
 # 2. Archivos temporales y de logs
