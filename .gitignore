@@ -2,7 +2,7 @@
 # 1. Directorios y archivos de compilación
 # (Evita subir los resultados intermedios y finales de la compilación)
 # ----------------------------------
-/build/      # Ignora todo el directorio de compilación
+build/      # Ignora todo el directorio de compilación
 *.o          # Ignora todos los archivos objeto (.o)
 *.bin        # Ignora todos los archivos binarios (.bin)
 disk.img        # Ignora todas las imágenes de disco (.img)
