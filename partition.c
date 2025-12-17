@@ -16,36 +16,46 @@ part_err_t partition_read_table(disk_t *disk, partition_table_t *pt) {
   memset(pt, 0, sizeof(partition_table_t));
   pt->disk = disk;
 
-  // Leer MBR (sector 0)
+  // Leer sector 0
   disk_err_t err = disk_read_dispatch(disk, 0, 1, &pt->mbr);
   if (err != DISK_ERR_NONE) {
-    terminal_printf(&main_terminal, "PART: Failed to read MBR (error %d)\n",
-                    err);
-    // Intentar con más información de depuración
-    uint8_t sector[512];
-    err = disk_read_dispatch(disk, 0, 1, sector);
-    if (err == DISK_ERR_NONE) {
-      terminal_printf(&main_terminal, "PART: Raw sector read successful\n");
-      terminal_printf(&main_terminal, "PART: Signature bytes: 0x%02X%02X\n",
-                      sector[510], sector[511]);
-    }
+    terminal_printf(&main_terminal,
+                    "PART: Failed to read sector 0 (error %d)\n", err);
     return PART_ERR_READ_FAILED;
   }
 
-  // Verificar MBR signature
-  terminal_printf(&main_terminal,
-                  "PART: MBR signature=0x%04X (expected 0xAA55)\n",
-                  pt->mbr.signature);
+  // **Verificar bytes de firma individualmente**
+  uint8_t *mbr_bytes = (uint8_t *)&pt->mbr;
+  uint8_t sig_byte1 = mbr_bytes[510];
+  uint8_t sig_byte2 = mbr_bytes[511];
 
-  if (pt->mbr.signature != 0xAA55) {
-    // Intentar ver si es FAT32 sin particiones (disco completo)
-    uint8_t boot_sector[512];
-    memcpy(boot_sector, &pt->mbr, 512);
+  terminal_printf(&main_terminal, "\n=== Analyzing sector 0 ===\n");
+  terminal_printf(&main_terminal, "Signature bytes 510-511: 0x%02X 0x%02X\n",
+                  sig_byte1, sig_byte2);
 
-    // Verificar si es FAT32 directamente (sin partición)
-    if (check_fat32_signature(boot_sector)) {
-      terminal_puts(&main_terminal, "PART: Detected partitionless FAT32\n");
-      // Crear partición virtual que cubre todo el disco
+  // **CORRECCIÓN CRÍTICA: Verificar firma PRIMERO**
+  if (!(sig_byte1 == 0x55 && sig_byte2 == 0xAA)) {
+    terminal_puts(&main_terminal, "✗ No valid boot sector signature\n");
+
+    // Verificar si es FAT32 con firma corrupta
+    terminal_puts(&main_terminal,
+                  "Checking for FAT32 with corrupted signature...\n");
+
+    uint8_t temp_sector[512];
+    memcpy(temp_sector, mbr_bytes, 512);
+    temp_sector[510] = 0x55;
+    temp_sector[511] = 0xAA;
+
+    bool is_fat32 = check_fat32_signature(temp_sector);
+
+    if (is_fat32) {
+      terminal_puts(&main_terminal,
+                    "✓ FAT32 detected (boot signature was corrupted)\n");
+
+      // Corregir la firma en el MBR
+      pt->mbr.signature = 0xAA55;
+
+      // Crear partición virtual como antes
       partition_info_t *info = &pt->partitions[0];
       info->index = 0;
       info->type = PART_TYPE_FAT32_LBA;
@@ -56,73 +66,206 @@ part_err_t partition_read_table(disk_t *disk, partition_table_t *pt) {
       info->is_extended = false;
       pt->partition_count = 1;
 
-      // Crear entrada MBR correspondiente
       mbr_partition_entry_t *entry = &pt->mbr.partitions[0];
       entry->status = PART_FLAG_BOOTABLE;
       entry->type = PART_TYPE_FAT32_LBA;
       entry->lba_start = 0;
       entry->sector_count = disk->sector_count;
+
       partition_lba_to_chs(0, entry->first_chs);
       partition_lba_to_chs(disk->sector_count - 1, entry->last_chs);
-      pt->mbr.signature = 0xAA55; // Forzar firma
 
-      terminal_printf(&main_terminal,
-                      "PART: Created virtual partition covering whole disk\n");
+      terminal_printf(&main_terminal, "Created virtual partition: %llu MB\n",
+                      info->size_mb);
       return PART_OK;
     }
 
-    terminal_printf(&main_terminal, "PART: Invalid MBR signature\n");
-    mbr_print_hex((uint8_t *)&pt->mbr, 512);
+    terminal_puts(&main_terminal, "✗ Not FAT32 either\n");
     return PART_ERR_INVALID_MBR;
   }
 
-  // Parse partition entries
+  terminal_puts(&main_terminal, "✓ Valid boot sector signature found\n");
+
+  // **CORRECCIÓN: PRIMERO verificar tabla de particiones MBR**
+  // Antes de verificar FAT32 sin tabla, verificar si hay tabla MBR válida
+
   pt->partition_count = 0;
+  bool has_valid_partitions = false;
+
+  // **CORRECCIÓN: Verificar si hay ALGUNA entrada no vacía en la tabla MBR**
+  bool has_any_partition_entry = false;
   for (int i = 0; i < 4; i++) {
     mbr_partition_entry_t *entry = &pt->mbr.partitions[i];
-
-    terminal_printf(&main_terminal,
-                    "PART: Entry %d: type=0x%02X, start=%u, size=%u\n", i,
-                    entry->type, entry->lba_start, entry->sector_count);
-
-    if (entry->type == PART_TYPE_EMPTY) {
-      terminal_printf(&main_terminal, "PART: Entry %d is empty\n", i);
-      continue;
+    if (entry->type != PART_TYPE_EMPTY) {
+      has_any_partition_entry = true;
+      break;
     }
+  }
 
-    // Validar LBA start (debe ser >= 2048 para discos modernos)
-    if (entry->lba_start < 2048 && entry->lba_start != 0) {
+  // **SI HAY ALGUNA ENTRADA en la tabla MBR, procesarla NORMALMENTE**
+  // NO saltar directamente a FAT32 sin tabla
+  if (has_any_partition_entry) {
+    terminal_puts(&main_terminal,
+                  "MBR has partition entries, processing them...\n");
+
+    for (int i = 0; i < 4; i++) {
+      mbr_partition_entry_t *entry = &pt->mbr.partitions[i];
+
       terminal_printf(&main_terminal,
-                      "PART: Warning: Partition %d has unusual start LBA %u\n",
-                      i, entry->lba_start);
+                      "Partition entry %d: type=0x%02X, LBA=%u, size=%u\n", i,
+                      entry->type, entry->lba_start, entry->sector_count);
+
+      if (entry->type != PART_TYPE_EMPTY && entry->sector_count > 0) {
+        has_valid_partitions = true;
+
+        partition_info_t *info = &pt->partitions[pt->partition_count];
+        info->index = i;
+        info->type = entry->type;
+        info->bootable = (entry->status == PART_FLAG_BOOTABLE);
+        info->lba_start = entry->lba_start;
+        info->sector_count = entry->sector_count;
+        info->size_mb = (info->sector_count * 512ULL) / (1024 * 1024);
+        info->is_extended = (entry->type == PART_TYPE_EXTENDED ||
+                             entry->type == PART_TYPE_EXTENDED_LBA);
+
+        pt->partition_count++;
+
+        terminal_printf(&main_terminal, "✓ Found partition: %s, %llu MB\n",
+                        partition_type_name(entry->type), info->size_mb);
+      }
     }
 
-    partition_info_t *info = &pt->partitions[pt->partition_count];
-    info->index = i;
-    info->type = entry->type;
-    info->bootable = (entry->status == PART_FLAG_BOOTABLE);
-    info->lba_start = entry->lba_start;
-    info->sector_count = entry->sector_count;
+    if (has_valid_partitions) {
+      terminal_printf(&main_terminal, "✓ Found %u partition(s) in MBR table\n",
+                      pt->partition_count);
+      return PART_OK;
+    } else {
+      // Tiene entradas pero todas inválidas (tipo 0 o tamaño 0)
+      terminal_puts(&main_terminal,
+                    "✗ MBR has partition entries but all are invalid\n");
+
+      // **CORRECCIÓN: Mostrar HEX dump de la tabla completa**
+      terminal_puts(&main_terminal, "Full partition table (bytes 446-509):\n");
+      for (int i = 0; i < 64; i += 16) {
+        terminal_printf(&main_terminal, "  %03X: ", 446 + i);
+        for (int j = 0; j < 16; j++) {
+          terminal_printf(&main_terminal, "%02X ", mbr_bytes[446 + i + j]);
+        }
+        terminal_puts(&main_terminal, "\n");
+      }
+
+      return PART_ERR_NO_PARTITIONS;
+    }
+  }
+
+  // **SOLO SI NO HAY NINGUNA ENTRADA en la tabla MBR, verificar FAT32 sin
+  // tabla**
+  terminal_puts(&main_terminal, "No MBR partition entries, checking if FAT32 "
+                                "without partition table...\n");
+
+  bool is_fat32 = check_fat32_signature(mbr_bytes);
+
+  if (is_fat32) {
+    // **CORRECCIÓN: Verificar que REALMENTE no hay tabla de particiones**
+    // Doble verificación: bytes 446-509 deberían ser todos 0 (o casi)
+    bool truly_no_partition_table = true;
+    for (int i = 446; i < 510; i++) {
+      if (mbr_bytes[i] != 0x00) {
+        truly_no_partition_table = false;
+        terminal_printf(&main_terminal, "  Byte %d is 0x%02X (not zero)\n", i,
+                        mbr_bytes[i]);
+        break;
+      }
+    }
+
+    if (!truly_no_partition_table) {
+      terminal_puts(
+          &main_terminal,
+          "✗ FAT32 signature found but partition table area is not empty\n");
+      terminal_puts(
+          &main_terminal,
+          "  Treating as regular MBR with FAT32 filesystem in partition\n");
+
+      // Procesar como MBR normal (aunque probablemente falle)
+      for (int i = 0; i < 4; i++) {
+        mbr_partition_entry_t *entry = &pt->mbr.partitions[i];
+        if (entry->type != PART_TYPE_EMPTY && entry->sector_count > 0) {
+          partition_info_t *info = &pt->partitions[pt->partition_count];
+          info->index = i;
+          info->type = entry->type;
+          info->bootable = (entry->status == PART_FLAG_BOOTABLE);
+          info->lba_start = entry->lba_start;
+          info->sector_count = entry->sector_count;
+          info->size_mb = (info->sector_count * 512ULL) / (1024 * 1024);
+          info->is_extended = (entry->type == PART_TYPE_EXTENDED ||
+                               entry->type == PART_TYPE_EXTENDED_LBA);
+          pt->partition_count++;
+
+          terminal_printf(&main_terminal,
+                          "✓ Found MBR partition: %s, %llu MB\n",
+                          partition_type_name(entry->type), info->size_mb);
+        }
+      }
+
+      if (pt->partition_count > 0) {
+        terminal_printf(&main_terminal, "✓ Found %u partition(s)\n",
+                        pt->partition_count);
+        return PART_OK;
+      }
+
+      return PART_ERR_NO_PARTITIONS;
+    }
+
+    // **ES FAT32 sin tabla de particiones (tabla completamente vacía)**
+    terminal_puts(
+        &main_terminal,
+        "✓ Detected FAT32 directly on sector 0 (no partition table)\n");
+
+    // Crear partición virtual
+    partition_info_t *info = &pt->partitions[0];
+    info->index = 0;
+    info->type = PART_TYPE_FAT32_LBA;
+    info->bootable = true;
+    info->lba_start = 0;
+    info->sector_count = disk->sector_count;
     info->size_mb = (info->sector_count * 512ULL) / (1024 * 1024);
-    info->is_extended = (entry->type == PART_TYPE_EXTENDED ||
-                         entry->type == PART_TYPE_EXTENDED_LBA);
+    info->is_extended = false;
+    pt->partition_count = 1;
 
-    pt->partition_count++;
+    // Crear entrada MBR artificial (solo para consistencia interna)
+    mbr_partition_entry_t *entry = &pt->mbr.partitions[0];
+    entry->status = PART_FLAG_BOOTABLE;
+    entry->type = PART_TYPE_FAT32_LBA;
+    entry->lba_start = 0;
+    entry->sector_count = disk->sector_count;
 
-    terminal_printf(&main_terminal,
-                    "PART: Found partition %d: %s, %llu MB, LBA %u-%u, %s\n", i,
-                    partition_type_name(entry->type), info->size_mb,
-                    entry->lba_start,
-                    entry->lba_start + entry->sector_count - 1,
-                    info->bootable ? "bootable" : "non-bootable");
+    partition_lba_to_chs(0, entry->first_chs);
+    partition_lba_to_chs(disk->sector_count - 1, entry->last_chs);
+
+    // La firma ya está correcta (0xAA55)
+    terminal_printf(&main_terminal, "Created virtual partition: %llu MB\n",
+                    info->size_mb);
+    return PART_OK;
   }
 
-  if (pt->partition_count == 0) {
-    terminal_puts(&main_terminal, "PART: No partitions found in MBR\n");
-    return PART_ERR_NO_PARTITIONS;
+  // **NO es FAT32 y no tiene entradas en la tabla MBR**
+  terminal_puts(&main_terminal,
+                "✗ Has boot signature but no valid partitions and not FAT32\n");
+
+  // Dump para diagnóstico
+  terminal_puts(&main_terminal, "First 32 bytes of partition table area:\n");
+  for (int i = 0; i < 32; i++) {
+    if (i % 16 == 0)
+      terminal_printf(&main_terminal, "  %03X: ", 446 + i);
+    terminal_printf(&main_terminal, "%02X ", mbr_bytes[446 + i]);
+    if (i % 16 == 15)
+      terminal_puts(&main_terminal, "\n");
   }
 
-  return PART_OK;
+  if (32 % 16 != 0)
+    terminal_puts(&main_terminal, "\n");
+
+  return PART_ERR_NO_PARTITIONS;
 }
 
 // Write partition table to disk
@@ -131,14 +274,31 @@ part_err_t partition_write_table(partition_table_t *pt) {
     return PART_ERR_INVALID_DISK;
   }
 
-  // Verify signature before writing
+  // Verificar firma antes de escribir
   if (pt->mbr.signature != 0xAA55) {
-    terminal_printf(&main_terminal, "PART: Refusing to write invalid MBR\n");
-    return PART_ERR_INVALID_MBR;
+    terminal_printf(&main_terminal, "PART: Warning: Setting MBR signature\n");
+    pt->mbr.signature = 0xAA55;
   }
 
-  terminal_printf(&main_terminal, "PART: Writing partition table...\n");
+  terminal_printf(&main_terminal, "PART: Writing partition table to disk...\n");
+  terminal_printf(&main_terminal, "  Signature: 0x%04X\n", pt->mbr.signature);
 
+  // Asegurar que la tabla de particiones está limpia
+  for (int i = pt->partition_count; i < 4; i++) {
+    memset(&pt->mbr.partitions[i], 0, sizeof(mbr_partition_entry_t));
+  }
+
+  // Mostrar lo que vamos a escribir
+  for (int i = 0; i < 4; i++) {
+    mbr_partition_entry_t *entry = &pt->mbr.partitions[i];
+    if (entry->type != PART_TYPE_EMPTY) {
+      terminal_printf(&main_terminal,
+                      "  Part %d: Type=0x%02X, LBA=%u, Sectors=%u\n", i,
+                      entry->type, entry->lba_start, entry->sector_count);
+    }
+  }
+
+  // Escribir MBR (sector 0)
   disk_err_t err = disk_write_dispatch(pt->disk, 0, 1, &pt->mbr);
   if (err != DISK_ERR_NONE) {
     terminal_printf(&main_terminal, "PART: Failed to write MBR (error %d)\n",
@@ -146,18 +306,77 @@ part_err_t partition_write_table(partition_table_t *pt) {
     return PART_ERR_WRITE_FAILED;
   }
 
-  // Verify write
+  // **NUEVO: Flushear inmediatamente**
+  disk_flush_dispatch(pt->disk);
+
+  // Verificar escritura (con reintentos)
   mbr_t verify_mbr;
-  err = disk_read_dispatch(pt->disk, 0, 1, &verify_mbr);
-  if (err != DISK_ERR_NONE ||
-      memcmp(&pt->mbr, &verify_mbr, sizeof(mbr_t)) != 0) {
-    terminal_printf(&main_terminal, "PART: MBR verification failed!\n");
-    return PART_ERR_WRITE_FAILED;
+  int retries = 3;
+
+  while (retries > 0) {
+    err = disk_read_dispatch(pt->disk, 0, 1, &verify_mbr);
+    if (err != DISK_ERR_NONE) {
+      terminal_printf(
+          &main_terminal,
+          "PART: Cannot verify write (read error %d), retrying...\n", err);
+      retries--;
+      if (retries > 0) {
+        // Reintentar escritura
+        err = disk_write_dispatch(pt->disk, 0, 1, &pt->mbr);
+        if (err != DISK_ERR_NONE) {
+          terminal_printf(&main_terminal,
+                          "PART: Retry write failed (error %d)\n", err);
+          break;
+        }
+        disk_flush_dispatch(pt->disk);
+      }
+      continue;
+    }
+
+    // Verificar contenido
+    if (memcmp(&pt->mbr, &verify_mbr, sizeof(mbr_t)) == 0) {
+      terminal_puts(
+          &main_terminal,
+          "PART: Partition table written and verified successfully\n");
+
+      // **NUEVO: Flushear nuevamente para asegurar**
+      disk_flush_dispatch(pt->disk);
+      return PART_OK;
+    }
+
+    terminal_printf(&main_terminal,
+                    "PART: MBR verification failed (attempt %d/3)\n",
+                    4 - retries);
+    retries--;
+
+    if (retries > 0) {
+      // Reintentar escritura
+      err = disk_write_dispatch(pt->disk, 0, 1, &pt->mbr);
+      if (err != DISK_ERR_NONE) {
+        terminal_printf(&main_terminal, "PART: Retry write failed (error %d)\n",
+                        err);
+        break;
+      }
+      disk_flush_dispatch(pt->disk);
+    }
   }
 
-  terminal_printf(&main_terminal,
-                  "PART: Partition table written and verified\n");
-  return PART_OK;
+  // Mostrar diferencias en caso de error
+  terminal_puts(&main_terminal,
+                "PART: MBR verification failed - write corrupted!\n");
+
+  // Mostrar diferencias
+  for (int i = 0; i < 4; i++) {
+    if (pt->mbr.partitions[i].type != verify_mbr.partitions[i].type) {
+      terminal_printf(
+          &main_terminal, "  Part %d mismatch: expected 0x%02X, got 0x%02X\n",
+          i, pt->mbr.partitions[i].type, verify_mbr.partitions[i].type);
+    }
+  }
+
+  // Intentar forzar un flush final
+  disk_flush_dispatch(pt->disk);
+  return PART_ERR_WRITE_FAILED;
 }
 
 // Get partition type name

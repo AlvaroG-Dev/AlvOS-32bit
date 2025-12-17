@@ -62,7 +62,7 @@ task_switch_context:
     movl %eax, CTX_EDI(%esi)
     
     # ESP: debe apuntar a ANTES del PUSHA y del CALL
-    leal 36(%esp), %eax
+    leal 44(%esp), %eax     # 32 (pusha) + 4 (ret) + 8 (args)
     movl %eax, CTX_ESP(%esi)
     
     # EIP: dirección de retorno
@@ -90,15 +90,17 @@ task_switch_context:
     movl %eax, CTX_EFLAGS(%esi)
 
 .restore_context:
-    # ============================================
-    # RESTAURAR CONTEXTO DESDE NEW_CONTEXT
-    # ============================================
-    
-    # EDI = new_context (preservado)
     testl %edi, %edi
     jz .switch_error
     
-    # 1. Restaurar segmentos de datos
+    # ✅ FIX: Verificar ESP válido antes de restaurar
+    movl CTX_ESP(%edi), %ecx
+    cmpl $0x100000, %ecx    # ESP debe ser >= 1MB
+    jb .switch_error
+    cmpl $0xFFFF0000, %ecx  # ESP debe ser < 4GB-64K
+    ja .switch_error
+    
+    # 1. Restaurar segmentos
     movl CTX_DS(%edi), %eax
     movw %ax, %ds
     movl CTX_ES(%edi), %eax
@@ -108,37 +110,30 @@ task_switch_context:
     movl CTX_GS(%edi), %eax
     movw %ax, %gs
     
-    # 2. ✅ CORRECCIÓN CRÍTICA: Restaurar SS:ESP de manera segura
-    movl CTX_ESP(%edi), %ecx    # ECX = nuevo ESP
-    movl CTX_SS(%edi), %ebx     # EBX = nuevo SS
-    
-    # Cambiar SS:ESP atómicamente
+    # 2. ✅ CRÍTICO: Cambiar SS:ESP atómicamente
+    cli                         # Asegurar que no hay interrupciones
+    movl CTX_SS(%edi), %ebx
     movw %bx, %ss
-    movl %ecx, %esp
+    movl %ecx, %esp             # ECX = CTX_ESP que validamos
     
-    # 3. Preparar stack para retorno
-    pushl CTX_EIP(%edi)         # Dirección de retorno
-    
-    # 4. Restaurar EFLAGS
+    # 3. Preparar IRET frame
     pushl CTX_EFLAGS(%edi)
-    popfl
+    pushl CTX_CS(%edi)
+    pushl CTX_EIP(%edi)
     
-    # 5. Restaurar registros de propósito general
+    # 4. Restaurar registros
     movl CTX_EAX(%edi), %eax
     movl CTX_EBX(%edi), %ebx
     movl CTX_ECX(%edi), %ecx
     movl CTX_EDX(%edi), %edx
     movl CTX_ESI(%edi), %esi
     movl CTX_EBP(%edi), %ebp
-    
-    # 6. EDI al final (preservamos EDI hasta el final)
     movl CTX_EDI(%edi), %edi
     
-    # 7. Retornar a la nueva tarea
-    ret
+    # 5. ✅ IRET restaura CS:EIP y habilita interrupciones
+    iret
 
 .switch_error:
-    # Si new_context es NULL, restaurar desde PUSHA y retornar
     popa
     ret
 

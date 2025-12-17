@@ -16,8 +16,8 @@ extern Terminal main_terminal;
 static vfs_fs_type_t fs_table[VFS_MAX_FS_TYPES];
 static int fs_count = 0;
 
-vfs_superblock_t *mount_table[VFS_MAX_MOUNTS];
-char mount_points[VFS_MAX_MOUNTS][VFS_PATH_MAX];
+/* NUEVO: Tabla de montajes como lista enlazada */
+static vfs_mount_info_t *mount_list = NULL;
 int mount_count = 0;
 
 /* FD table */
@@ -130,10 +130,19 @@ void vfs_init(void) {
   unsigned int f = vfs_lock_disable_irq();
   fs_count = 0;
   mount_count = 0;
+
   for (int i = 0; i < VFS_MAX_FDS; i++)
     fd_table[i] = NULL;
-  for (int i = 0; i < VFS_MAX_MOUNTS; i++)
-    mount_table[i] = NULL;
+
+  // Limpiar lista de montajes
+  vfs_mount_info_t *current = mount_list;
+  while (current) {
+    vfs_mount_info_t *next = current->next;
+    vfs_free(current);
+    current = next;
+  }
+  mount_list = NULL;
+
   vfs_unlock_restore_irq(f);
 }
 
@@ -195,52 +204,55 @@ vfs_superblock_t *find_mount_for_path(const char *path,
   vfs_superblock_t *best_sb = NULL;
   int best_len = -1;
   const char *best_relpath = NULL;
+  char best_mountpoint[VFS_PATH_MAX] = "";
 
-  for (int i = 0; i < mount_count; i++) {
-    if (!mount_table[i] || !mount_points[i][0])
-      continue;
-
+  vfs_mount_info_t *current = mount_list;
+  while (current) {
     char normalized_mount[VFS_PATH_MAX];
-    if (vfs_normalize_path(mount_points[i], normalized_mount, VFS_PATH_MAX) !=
-        VFS_OK)
+    if (vfs_normalize_path(current->mountpoint, normalized_mount,
+                           VFS_PATH_MAX) != VFS_OK) {
+      current = current->next;
       continue;
+    }
 
     int mount_len = strlen(normalized_mount);
 
     if (strcmp(normalized_mount, "/") == 0) {
       if (best_len == -1) {
-        best_sb = mount_table[i];
+        best_sb = current->sb;
         best_len = 0;
         best_relpath = normalized + 1;
         if (*best_relpath == '\0')
           best_relpath = "";
-        serial_printf(COM1_BASE,
-                      "VFS: Matched root mount for path %s (fs: %s)\r\n",
-                      normalized, best_sb->fs_name);
+        strncpy(best_mountpoint, normalized_mount, VFS_PATH_MAX - 1);
       }
     } else {
       if (strncmp(normalized, normalized_mount, mount_len) == 0 &&
           (normalized[mount_len] == '\0' || normalized[mount_len] == '/')) {
         if (mount_len > best_len) {
-          best_sb = mount_table[i];
+          best_sb = current->sb;
           best_len = mount_len;
           best_relpath = normalized + mount_len;
           if (*best_relpath == '/')
             best_relpath++;
           if (*best_relpath == '\0')
             best_relpath = "";
-          serial_printf(COM1_BASE,
-                        "VFS: Matched mount %s for path %s (fs: %s)\r\n",
-                        normalized_mount, normalized, best_sb->fs_name);
+          strncpy(best_mountpoint, normalized_mount, VFS_PATH_MAX - 1);
         }
       }
     }
+    current = current->next;
   }
 
   if (!best_sb) {
     terminal_printf(&main_terminal, "VFS: No mount found for path %s\r\n",
                     normalized);
+    vfs_unlock_restore_irq(f);
+    return NULL;
   }
+
+  serial_printf(COM1_BASE, "VFS: Matched mount %s for path %s (fs: %s)\r\n",
+                best_mountpoint, normalized, best_sb->fs_name);
 
   *out_relpath = best_relpath;
   vfs_unlock_restore_irq(f);
@@ -253,26 +265,17 @@ int vfs_mount(const char *mountpoint, const char *fsname, void *device) {
     return VFS_ERR;
 
   unsigned int f = vfs_lock_disable_irq();
-  if (mount_count >= VFS_MAX_MOUNTS) {
-    vfs_unlock_restore_irq(f);
-    return VFS_ERR;
-  }
-
-  vfs_fs_type_t *fst = find_fs(fsname);
-  if (!fst) {
-    vfs_unlock_restore_irq(f);
-    return VFS_ERR;
-  }
 
   // Check if mount point is already mounted
-  for (int i = 0; i < mount_count; i++) {
-    if (strcmp(mount_points[i], mountpoint) == 0) {
+  vfs_mount_info_t *current = mount_list;
+  while (current) {
+    if (strcmp(current->mountpoint, mountpoint) == 0) {
       vfs_unlock_restore_irq(f);
       return VFS_ERR; // Already mounted
     }
+    current = current->next;
   }
 
-  // Release IRQ lock before doing filesystem operations
   vfs_unlock_restore_irq(f);
 
   // Create mount point directory if it's not root and doesn't exist
@@ -352,25 +355,36 @@ int vfs_mount(const char *mountpoint, const char *fsname, void *device) {
 
   // Now proceed with mounting
   vfs_superblock_t *sb = NULL;
-  if (fst->mount(device, &sb) != VFS_OK || !sb) {
+  vfs_fs_type_t *fst = find_fs(fsname);
+  if (!fst || fst->mount(device, &sb) != VFS_OK || !sb) {
     return VFS_ERR;
   }
 
-  // Re-acquire lock for mount table modification
+  // Create mount info
+  vfs_mount_info_t *mount_info =
+      (vfs_mount_info_t *)vfs_alloc(sizeof(vfs_mount_info_t));
+  if (!mount_info) {
+    // Cleanup sb
+    if (sb->private)
+      vfs_free(sb->private);
+    vfs_free(sb);
+    return VFS_ERR;
+  }
+
+  memset(mount_info, 0, sizeof(vfs_mount_info_t));
+  mount_info->sb = sb;
+  strncpy(mount_info->mountpoint, mountpoint, VFS_PATH_MAX - 1);
+  mount_info->mountpoint[VFS_PATH_MAX - 1] = '\0';
+  strncpy(mount_info->fs_type, fsname, sizeof(mount_info->fs_type) - 1);
+  mount_info->flags = 0;
+
+  // Agregar a lista
   f = vfs_lock_disable_irq();
-  if (mount_count >= VFS_MAX_MOUNTS) {
-    vfs_unlock_restore_irq(f);
-    // TODO: Should cleanup sb here
-    return VFS_ERR;
-  }
-
-  // Add to mount table
-  mount_table[mount_count] = sb;
-  strncpy(mount_points[mount_count], mountpoint, VFS_PATH_MAX - 1);
-  mount_points[mount_count][VFS_PATH_MAX - 1] = '\0';
+  mount_info->next = mount_list;
+  mount_list = mount_info;
   mount_count++;
-
   vfs_unlock_restore_irq(f);
+
   return VFS_OK;
 }
 
@@ -466,12 +480,14 @@ int vfs_list_mounts(void (*callback)(const char *mountpoint,
 
   unsigned int f = vfs_lock_disable_irq();
   int count = 0;
-  for (int i = 0; i < mount_count; i++) {
-    if (mount_table[i] && mount_points[i][0]) {
-      callback(mount_points[i], mount_table[i]->fs_name, arg);
-      count++;
-    }
+
+  vfs_mount_info_t *current = mount_list;
+  while (current) {
+    callback(current->mountpoint, current->sb->fs_name, arg);
+    count++;
+    current = current->next;
   }
+
   vfs_unlock_restore_irq(f);
   return count;
 }
@@ -840,25 +856,30 @@ int vfs_unmount(const char *mountpoint) {
     return VFS_ERR;
   }
 
-  // Buscar el mountpoint
+  // Buscar el mountpoint en la lista
   unsigned int f = vfs_lock_disable_irq();
-  int found = -1;
-  for (int i = 0; i < VFS_MAX_MOUNTS; i++) {
-    if (mount_table[i] && strcmp(mount_points[i], normalized) == 0) {
-      found = i;
+  vfs_mount_info_t *prev = NULL;
+  vfs_mount_info_t *current = mount_list;
+  vfs_mount_info_t *found_info = NULL;
+
+  while (current) {
+    if (strcmp(current->mountpoint, normalized) == 0) {
+      found_info = current;
       break;
     }
+    prev = current;
+    current = current->next;
   }
   vfs_unlock_restore_irq(f);
 
-  if (found == -1) {
+  if (!found_info) {
     terminal_printf(&main_terminal,
                     "VFS: unmount failed: mountpoint %s not found\r\n",
                     normalized);
     return VFS_ERR;
   }
 
-  vfs_superblock_t *sb = mount_table[found];
+  vfs_superblock_t *sb = found_info->sb;
   if (!sb) {
     terminal_printf(&main_terminal,
                     "VFS: unmount failed: invalid superblock for %s\r\n",
@@ -910,10 +931,16 @@ int vfs_unmount(const char *mountpoint) {
 
   // ✅ Limpiar tabla de mounts (esto debe hacerse SIEMPRE)
   f = vfs_lock_disable_irq();
-  mount_table[found] = NULL;
-  mount_points[found][0] = '\0';
+  if (prev) {
+    prev->next = found_info->next;
+  } else {
+    mount_list = found_info->next;
+  }
   mount_count--;
   vfs_unlock_restore_irq(f);
+
+  // Liberar mount_info
+  vfs_free(found_info);
 
   return VFS_OK;
 }
@@ -975,4 +1002,313 @@ int vfs_mknod(const char *path, vfs_dev_type_t dev_type, uint32_t major,
   }
 
   return VFS_OK;
+}
+
+/* ================ NUEVAS FUNCIONES PARA BIND MOUNTS ================ */
+
+/* Buscar mount info por punto de montaje (helper) */
+static vfs_mount_info_t *find_mount_info(const char *mountpoint) {
+  vfs_mount_info_t *current = mount_list;
+  while (current) {
+    if (strcmp(current->mountpoint, mountpoint) == 0) {
+      return current;
+    }
+    current = current->next;
+  }
+  return NULL;
+}
+
+/* Crear bind mount */
+int vfs_bind_mount(const char *source, const char *target, int recursive) {
+  if (!source || !target) {
+    return VFS_ERR;
+  }
+
+  char norm_source[VFS_PATH_MAX];
+  char norm_target[VFS_PATH_MAX];
+
+  if (vfs_normalize_path(source, norm_source, VFS_PATH_MAX) != VFS_OK ||
+      vfs_normalize_path(target, norm_target, VFS_PATH_MAX) != VFS_OK) {
+    return VFS_ERR;
+  }
+
+  // Buscar el filesystem source
+  const char *source_rel;
+  vfs_superblock_t *source_sb = find_mount_for_path(norm_source, &source_rel);
+  if (!source_sb) {
+    terminal_printf(&main_terminal, "vfs_bind_mount: Source not found: %s\r\n",
+                    norm_source);
+    return VFS_ERR;
+  }
+
+  // Resolver el nodo source
+  vfs_node_t *source_node = resolve_path_to_vnode(source_sb, source_rel);
+  if (!source_node) {
+    terminal_printf(&main_terminal,
+                    "vfs_bind_mount: Source node not found: %s\r\n",
+                    source_rel);
+    return VFS_ERR;
+  }
+
+  // Verificar que sea un directorio
+  if (source_node->type != VFS_NODE_DIR) {
+    terminal_printf(&main_terminal,
+                    "vfs_bind_mount: Source is not a directory\r\n");
+    source_node->refcount--;
+    if (source_node->refcount == 0 && source_node->ops->release) {
+      source_node->ops->release(source_node);
+    }
+    return VFS_ERR;
+  }
+
+  // Crear nuevo superblock para bind mount
+  vfs_superblock_t *bind_sb =
+      (vfs_superblock_t *)vfs_alloc(sizeof(vfs_superblock_t));
+  if (!bind_sb) {
+    source_node->refcount--;
+    if (source_node->refcount == 0 && source_node->ops->release) {
+      source_node->ops->release(source_node);
+    }
+    return VFS_ERR;
+  }
+
+  memset(bind_sb, 0, sizeof(vfs_superblock_t));
+  strncpy(bind_sb->fs_name, "bind", sizeof(bind_sb->fs_name) - 1);
+  bind_sb->root = source_node;
+  bind_sb->flags = VFS_MOUNT_BIND | (recursive ? VFS_MOUNT_RECURSIVE : 0);
+  bind_sb->bind_source = source_sb;
+  strncpy(bind_sb->bind_path, source_rel, VFS_PATH_MAX - 1);
+
+  // Crear mount info
+  vfs_mount_info_t *mount_info =
+      (vfs_mount_info_t *)vfs_alloc(sizeof(vfs_mount_info_t));
+  if (!mount_info) {
+    vfs_free(bind_sb);
+    return VFS_ERR;
+  }
+
+  memset(mount_info, 0, sizeof(vfs_mount_info_t));
+  mount_info->sb = bind_sb;
+  strncpy(mount_info->mountpoint, norm_target, VFS_PATH_MAX - 1);
+  strncpy(mount_info->source, norm_source, VFS_PATH_MAX - 1);
+  strncpy(mount_info->fs_type, "bind", sizeof(mount_info->fs_type) - 1);
+  mount_info->flags = bind_sb->flags;
+
+  // Agregar a lista de montajes
+  unsigned int f = vfs_lock_disable_irq();
+  mount_info->next = mount_list;
+  mount_list = mount_info;
+  mount_count++;
+  vfs_unlock_restore_irq(f);
+
+  terminal_printf(&main_terminal, "Bind mount created: %s -> %s\r\n",
+                  norm_source, norm_target);
+
+  return VFS_OK;
+}
+
+/* Crear symlink */
+int vfs_symlink(const char *target, const char *linkpath) {
+  if (!target || !linkpath) {
+    return VFS_ERR;
+  }
+
+  char parent_path[VFS_PATH_MAX];
+  char name[VFS_NAME_MAX];
+
+  if (vfs_split_path(linkpath, parent_path, name) != VFS_OK) {
+    return VFS_ERR;
+  }
+
+  const char *rel;
+  vfs_superblock_t *sb = find_mount_for_path(parent_path, &rel);
+  if (!sb) {
+    return VFS_ERR;
+  }
+
+  vfs_node_t *parent = resolve_path_to_vnode(sb, rel);
+  if (!parent) {
+    return VFS_ERR;
+  }
+
+  if (!parent->ops || !parent->ops->symlink) {
+    parent->refcount--;
+    if (parent->refcount == 0 && parent->ops->release) {
+      parent->ops->release(parent);
+    }
+    return VFS_ERR;
+  }
+
+  int ret = parent->ops->symlink(parent, name, target);
+
+  parent->refcount--;
+  if (parent->refcount == 0 && parent->ops->release) {
+    parent->ops->release(parent);
+  }
+
+  return ret;
+}
+
+/* Leer symlink */
+int vfs_readlink(const char *path, char *buf, uint32_t size) {
+  if (!path || !buf || size == 0) {
+    return VFS_ERR;
+  }
+
+  const char *rel;
+  vfs_superblock_t *sb = find_mount_for_path(path, &rel);
+  if (!sb) {
+    return VFS_ERR;
+  }
+
+  vfs_node_t *node = resolve_path_to_vnode(sb, rel);
+  if (!node) {
+    return VFS_ERR;
+  }
+
+  if (node->type != VFS_NODE_SYMLINK) {
+    node->refcount--;
+    if (node->refcount == 0 && node->ops->release) {
+      node->ops->release(node);
+    }
+    return VFS_ERR;
+  }
+
+  if (!node->ops || !node->ops->readlink) {
+    node->refcount--;
+    if (node->refcount == 0 && node->ops->release) {
+      node->ops->release(node);
+    }
+    return VFS_ERR;
+  }
+
+  int ret = node->ops->readlink(node, buf, size);
+
+  node->refcount--;
+  if (node->refcount == 0 && node->ops->release) {
+    node->ops->release(node);
+  }
+
+  return ret;
+}
+
+/* Resolver path mejorado (para bind mounts) */
+vfs_node_t *vfs_resolve_path(const char *path, uint32_t flags,
+                             vfs_superblock_t **out_sb,
+                             const char **out_relpath) {
+  if (!path || !out_sb || !out_relpath) {
+    return NULL;
+  }
+
+  char normalized[VFS_PATH_MAX];
+  if (vfs_normalize_path(path, normalized, VFS_PATH_MAX) != VFS_OK) {
+    return NULL;
+  }
+
+  // Buscar el mejor mount point
+  vfs_mount_info_t *best_mount = NULL;
+  int best_len = -1;
+  const char *best_relpath = NULL;
+
+  vfs_mount_info_t *current = mount_list;
+  while (current) {
+    char normalized_mount[VFS_PATH_MAX];
+    if (vfs_normalize_path(current->mountpoint, normalized_mount,
+                           VFS_PATH_MAX) != VFS_OK) {
+      current = current->next;
+      continue;
+    }
+
+    int mount_len = strlen(normalized_mount);
+
+    // Comparación exacta o prefijo
+    if (strcmp(normalized_mount, "/") == 0) {
+      // Root mount siempre coincide
+      if (best_len == -1) {
+        best_mount = current;
+        best_len = 0;
+        best_relpath = normalized + 1;
+        if (*best_relpath == '\0')
+          best_relpath = "";
+      }
+    } else if (strncmp(normalized, normalized_mount, mount_len) == 0 &&
+               (normalized[mount_len] == '\0' ||
+                normalized[mount_len] == '/')) {
+      if (mount_len > best_len) {
+        best_mount = current;
+        best_len = mount_len;
+        best_relpath = normalized + mount_len;
+        if (*best_relpath == '/')
+          best_relpath++;
+        if (*best_relpath == '\0')
+          best_relpath = "";
+      }
+    }
+
+    current = current->next;
+  }
+
+  if (!best_mount) {
+    return NULL;
+  }
+
+  *out_sb = best_mount->sb;
+  *out_relpath = best_relpath;
+
+  // Si es un bind mount, resolver dentro del source
+  if (best_mount->sb->flags & VFS_MOUNT_BIND) {
+    // Construir path completo en el source
+    if (best_relpath[0] == '\0') {
+      // Apuntar directamente al directorio bindeado
+      best_mount->sb->root->refcount++;
+      return best_mount->sb->root;
+    } else {
+      // Resolver path relativo dentro del source
+      char full_source_path[VFS_PATH_MAX];
+      snprintf(full_source_path, VFS_PATH_MAX, "%s/%s",
+               best_mount->sb->bind_path, best_relpath);
+      return resolve_path_to_vnode(best_mount->sb->bind_source,
+                                   full_source_path);
+    }
+  }
+
+  // Montaje normal
+  return resolve_path_to_vnode(best_mount->sb, best_relpath);
+}
+
+/* Funciones stub para compatibilidad */
+int vfs_umount(const char *mountpoint, int flags) {
+  (void)flags; // No usado por ahora
+  return vfs_unmount(mountpoint);
+}
+
+int vfs_stat(const char *path, vfs_dirent_t *statbuf) {
+  // Implementación simple - solo para compatibilidad
+  if (!path || !statbuf)
+    return VFS_ERR;
+
+  const char *rel;
+  vfs_superblock_t *sb = find_mount_for_path(path, &rel);
+  if (!sb)
+    return VFS_ERR;
+
+  vfs_node_t *node = resolve_path_to_vnode(sb, rel);
+  if (!node)
+    return VFS_ERR;
+
+  memset(statbuf, 0, sizeof(vfs_dirent_t));
+  statbuf->type = node->type;
+  // Nota: El tamaño no se implementa aquí
+
+  node->refcount--;
+  if (node->refcount == 0 && node->ops->release) {
+    node->ops->release(node);
+  }
+
+  return VFS_OK;
+}
+
+int vfs_lstat(const char *path, vfs_dirent_t *statbuf) {
+  // Por ahora, igual que vfs_stat (no seguimos symlinks en stat)
+  return vfs_stat(path, statbuf);
 }

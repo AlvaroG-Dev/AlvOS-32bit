@@ -1187,9 +1187,9 @@ disk_err_t disk_write_dispatch(disk_t *disk, uint64_t lba, uint32_t count,
       return DISK_ERR_LBA_OUT_OF_RANGE;
     }
 
-    terminal_printf(&main_terminal,
-                    "DISK: Partition write - offset: %llu, actual LBA: %llu\n",
-                    disk->partition_lba_offset, actual_lba);
+    // terminal_printf(&main_terminal,
+    //                 "DISK: Partition write - offset: %llu, actual LBA:
+    //                 %llu\n", disk->partition_lba_offset, actual_lba);
 
     // Si es partición, usar el disco físico para verificar límites globales
     if (disk->physical_disk) {
@@ -1381,23 +1381,25 @@ ide_write_path:
   int retries = DISK_RETRIES;
   char error_msg[64];
 
-  terminal_printf(&main_terminal,
-                  "DISK: Starting IDE write loop (retries=%d)\n", retries);
+  // terminal_printf(&main_terminal,
+  //                 "DISK: Starting IDE write loop (retries=%d)\n", retries);
 
   while (retries-- > 0 && sectors_done < count) {
     uint32_t sectors_to_process = count - sectors_done;
     if (sectors_to_process > 255)
       sectors_to_process = 255;
 
-    terminal_printf(&main_terminal, "DISK: Attempt %d - sectors %u-%u of %u\n",
-                    DISK_RETRIES - retries, sectors_done,
-                    sectors_done + sectors_to_process - 1, count);
+    // terminal_printf(&main_terminal, "DISK: Attempt %d - sectors %u-%u of
+    // %u\n",
+    //                 DISK_RETRIES - retries, sectors_done,
+    //                 sectors_done + sectors_to_process - 1, count);
 
     uint8_t cmd = disk->supports_lba48 ? ATA_CMD_WRITE_SECTORS_EXT
                                        : ATA_CMD_WRITE_SECTORS;
 
-    terminal_printf(&main_terminal, "DISK: Using command 0x%02X (LBA48=%d)\n",
-                    cmd, disk->supports_lba48);
+    // terminal_printf(&main_terminal, "DISK: Using command 0x%02X
+    // (LBA48=%d)\n",
+    //                 cmd, disk->supports_lba48);
 
     if (disk_prepare_command(disk, actual_lba + sectors_done,
                              sectors_to_process, cmd) != 0) {
@@ -1408,8 +1410,8 @@ ide_write_path:
     }
 
     for (uint32_t sector = 0; sector < sectors_to_process; sector++) {
-      terminal_printf(&main_terminal, "DISK: Writing sector %llu\n",
-                      actual_lba + sectors_done + sector);
+      // terminal_printf(&main_terminal, "DISK: Writing sector %llu\n",
+      //                 actual_lba + sectors_done + sector);
 
       if (disk_wait_drq(disk, ticks_since_boot) != 0) {
         terminal_puts(&main_terminal, "DISK: DRQ wait failed, resetting\n");

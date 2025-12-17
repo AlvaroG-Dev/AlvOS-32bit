@@ -2,6 +2,7 @@
 #include "acpi.h"
 #include "ahci.h"
 #include "apic.h"
+#include "cpuid.h"
 #include "disk.h"
 #include "disk_io_daemon.h"
 #include "dma.h"
@@ -14,10 +15,10 @@
 #include "kernel.h"
 #include "log.h"
 #include "memory.h"
-
 #include "mini_parser.h"
 #include "mmu.h"
 #include "module_loader.h"
+#include "partition.h"
 #include "partition_manager.h"
 #include "pci.h"
 #include "sata_disk.h"
@@ -31,7 +32,6 @@
 extern vfs_file_t *fd_table[VFS_MAX_FDS];
 extern vfs_superblock_t *mount_table[VFS_MAX_MOUNTS];
 extern char mount_points[VFS_MAX_MOUNTS][VFS_PATH_MAX];
-extern int mount_count;
 extern ahci_controller_t ahci_controller;
 
 // Tabla de colores ANSI (índice 0-15)
@@ -487,6 +487,130 @@ void circular_buffer_clear(CircularBuffer *cb) {
 // =================================================================
 // FUNCIONES DEL TERMINAL
 // =================================================================
+
+void print_mount_callback(const char *mountpoint, const char *fs_name,
+                          void *arg) {
+  Terminal *t = (Terminal *)arg;
+  terminal_printf(t, "  %s -> %s\r\n", mountpoint, fs_name);
+}
+
+// Función callback para buscar filesystems montados en este disco
+struct disk_fs_info {
+  Terminal *term;
+  disk_t *main_disk;
+  int fs_found;
+} fs_info = {&main_terminal, &main_disk, 0};
+
+void find_fs_callback(const char *mountpoint, const char *fs_name, void *arg) {
+  struct disk_fs_info *info = (struct disk_fs_info *)arg;
+
+  // Encontrar el superblock para este mount point
+  const char *rel;
+  vfs_superblock_t *sb = find_mount_for_path(mountpoint, &rel);
+  if (!sb)
+    return;
+
+  disk_t *mount_disk = (disk_t *)sb->backing_device;
+  if (!mount_disk)
+    return;
+
+  // Verificar si este disco o partición pertenece al disco principal
+  disk_t *target_disk = mount_disk;
+  if (mount_disk->is_partition && mount_disk->physical_disk) {
+    target_disk = mount_disk->physical_disk;
+  }
+
+  if (target_disk != info->main_disk)
+    return;
+
+  info->fs_found = 1;
+
+  // Mostrar información básica del mount
+  terminal_printf(info->term, "Mount: %s -> %s\r\n", mountpoint, fs_name);
+  terminal_printf(info->term, "Filesystem: %s\r\n", sb->fs_name);
+
+  // Si es una partición, mostrar información de offset LBA
+  if (mount_disk->is_partition) {
+    terminal_printf(info->term, "Mounted on Partition:\r\n");
+    terminal_printf(info->term, "  LBA Offset: %llu\r\n",
+                    mount_disk->partition_lba_offset);
+    terminal_printf(info->term, "  Partition Sector Count: %llu\r\n",
+                    mount_disk->sector_count);
+
+    // Nota: La información específica de la partición (type, etc.)
+    // debe obtenerse del partition manager o MBR directamente
+    terminal_printf(info->term,
+                    "  (Para ver detalles de partición use: part info)\r\n");
+  }
+
+  // Información específica del sistema de archivos
+  if (strcmp(sb->fs_name, "fat32") == 0 && sb->private) {
+    fat32_fs_t *fs = (fat32_fs_t *)sb->private;
+
+    terminal_printf(info->term, "FAT32 Details:\r\n");
+    terminal_printf(info->term, "  Bytes per Sector: %u\r\n",
+                    fs->boot_sector.bytes_per_sector);
+    terminal_printf(info->term, "  Sectors per Cluster: %u\r\n",
+                    fs->boot_sector.sectors_per_cluster);
+
+    // Calcular cluster size
+    uint32_t cluster_size =
+        fs->boot_sector.bytes_per_sector * fs->boot_sector.sectors_per_cluster;
+    terminal_printf(info->term, "  Cluster Size: %u bytes\r\n", cluster_size);
+
+    // Mostrar información del volumen si está disponible
+    if (fs->boot_sector.volume_label[0] != ' ' &&
+        fs->boot_sector.volume_label[0] != 0) {
+      char label[12] = {0};
+      // Copiar label asegurando terminación nula
+      for (int i = 0; i < 11; i++) {
+        label[i] = fs->boot_sector.volume_label[i];
+        if (label[i] == ' ' || label[i] == 0) {
+          label[i] = 0;
+          break;
+        }
+      }
+      terminal_printf(info->term, "  Volume Label: %s\r\n", label);
+    }
+
+    // Mostrar tipo de sistema de archivos
+    if (fs->boot_sector.fs_type[0] != 0) {
+      char fstype[9] = {0};
+      strncpy(fstype, (char *)fs->boot_sector.fs_type, 8);
+      terminal_printf(info->term, "  FS Type Field: %s\r\n", fstype);
+    }
+
+    // Intentar calcular espacio si tenemos la información necesaria
+    if (fs->boot_sector.sectors_per_fat_32 > 0 &&
+        fs->boot_sector.total_sectors_32 > 0) {
+      // Cálculo aproximado de espacio
+      uint32_t data_sectors =
+          fs->boot_sector.total_sectors_32 - fs->boot_sector.reserved_sectors -
+          (fs->boot_sector.num_fats * fs->boot_sector.sectors_per_fat_32);
+
+      uint32_t clusters = data_sectors / fs->boot_sector.sectors_per_cluster;
+
+      if (clusters > 0) {
+        uint64_t total_bytes = (uint64_t)clusters * cluster_size;
+        terminal_printf(info->term, "  Approximate Capacity: %llu bytes\r\n",
+                        total_bytes);
+      }
+    }
+
+  } else {
+    // Para otros sistemas de archivos, mostrar información básica
+    terminal_printf(info->term, "Filesystem Details:\r\n");
+    terminal_printf(info->term, "  Type: %s\r\n", sb->fs_name);
+
+    if (sb->flags & VFS_MOUNT_RDONLY) {
+      terminal_printf(info->term, "  Access: Read-Only\r\n");
+    } else {
+      terminal_printf(info->term, "  Access: Read-Write\r\n");
+    }
+  }
+
+  terminal_printf(info->term, "----------------------------------------\r\n");
+}
 
 static void resolve_relative_path(Terminal *term, const char *input,
                                   char *full_path) {
@@ -1328,55 +1452,12 @@ static void cmd_disk_info(Terminal *term, const char *args) {
   // Información del sistema de archivos montado
   terminal_printf(term, "\n=== FILESYSTEM INFORMATION ===\r\n");
 
-  int fs_found = 0;
-  unsigned int flags = vfs_lock_disable_irq();
+  vfs_list_mounts(find_fs_callback, &fs_info);
 
-  for (int i = 0; i < VFS_MAX_MOUNTS; i++) {
-    if (mount_table[i]) {
-      disk_t *mount_disk = (disk_t *)mount_table[i]->backing_device;
-      if (mount_disk == &main_disk ||
-          (mount_disk->is_partition &&
-           mount_disk->physical_disk == &main_disk)) {
-
-        vfs_superblock_t *sb = mount_table[i];
-        fat32_fs_t *fs = (fat32_fs_t *)sb->private;
-
-        terminal_printf(term, "Mount Point: %s\r\n", mount_points[i]);
-        terminal_printf(term, "Filesystem: %s\r\n", sb->fs_name);
-
-        // Si es una partición, mostrar info adicional
-        if (mount_disk->is_partition) {
-          terminal_printf(term, "Mounted on Partition:\r\n");
-          terminal_printf(term, "  LBA Offset: %llu\r\n",
-                          mount_disk->partition_lba_offset);
-          terminal_printf(term, "  Partition Sector Count: %llu\r\n",
-                          mount_disk->sector_count);
-        }
-
-        if (strcmp(sb->fs_name, "fat32") == 0 && fs) {
-          // Información específica de FAT32 (código existente)
-          terminal_printf(term, "FAT32 Details:\r\n");
-          terminal_printf(term, "  Cluster Size: %u bytes\r\n",
-                          fs->cluster_size);
-          terminal_printf(term, "  Total Clusters: %u\r\n", fs->total_clusters);
-          terminal_printf(term, "  Root Cluster: %u\r\n", fs->root_dir_cluster);
-          terminal_printf(term, "  Space Usage: %u / %u clusters\r\n",
-                          fs->total_clusters - fs->fsinfo.free_clusters,
-                          fs->total_clusters);
-        }
-        fs_found = 1;
-        break; // Solo mostramos el primer sistema de archivos encontrado para
-               // este disco
-      }
-    }
-  }
-
-  vfs_unlock_restore_irq(flags);
-
-  if (!fs_found) {
+  if (!fs_info.fs_found) {
     terminal_printf(term, "No filesystem mounted on this disk\r\n");
 
-    // Mostrar información de partición si está disponible (código existente)
+    // Mostrar información de partición si está disponible
     terminal_printf(term, "\n=== PARTITION INFORMATION ===\r\n");
     terminal_printf(term, "Partition Table: MBR (Master Boot Record)\r\n");
 
@@ -1417,11 +1498,15 @@ static void cmd_disk_info(Terminal *term, const char *args) {
 
   // Información de caché del disco (si está disponible)
   terminal_printf(term, "\n=== CACHE INFORMATION ===\r\n");
-  terminal_printf(term, "FAT Cache: %s\r\n",
-                  (total_io_ticks > 0) ? "ACTIVE" : "INACTIVE");
-  terminal_printf(term, "I/O Efficiency: %.2f cycles/tick\r\n",
-                  total_io_ticks > 0 ? (double)total_io_cycles / total_io_ticks
-                                     : 0.0);
+
+  if (total_io_ticks > 0) {
+    terminal_printf(term, "FAT Cache: ACTIVE\r\n");
+    terminal_printf(term, "I/O Efficiency: %.2f cycles/tick\r\n",
+                    (double)total_io_cycles / total_io_ticks);
+  } else {
+    terminal_printf(term, "FAT Cache: INACTIVE\r\n");
+    terminal_printf(term, "I/O Efficiency: 0.0 cycles/tick\r\n");
+  }
 
   terminal_printf(term, "================================\r\n");
 }
@@ -1844,6 +1929,12 @@ void terminal_execute(Terminal *term, const char *cmd) {
                       "Disco formateado como FAT32 exitosamente\n");
     } else {
       terminal_printf(&main_terminal, "Error formateando disco: %d\n", result);
+    }
+  } else if (strcmp(command, "cpuinfo") == 0) {
+    if (argc > 1 && strcmp(argv[1], "detailed") == 0) {
+      cmd_cpuinfo_detailed(term, "");
+    } else {
+      cmd_cpuinfo(term, "");
     }
   } else if (strcmp(command, "cpufreq") == 0) {
     // Asegurarse de que las interrupciones estén habilitadas
@@ -2307,9 +2398,7 @@ void terminal_execute(Terminal *term, const char *cmd) {
 
     terminal_printf(term, "mkdir: Created directory %s\r\n", full_path);
     log_message(LOG_INFO, "mkdir created %s\n", full_path);
-  }
-
-  else if (strcmp(command, "umount") == 0) {
+  } else if (strcmp(command, "umount") == 0) {
     if (args[0] == '\0') {
       terminal_puts(term, "Error: Usage: umount <mountpoint>\r\n");
       return;
@@ -2322,38 +2411,7 @@ void terminal_execute(Terminal *term, const char *cmd) {
       return;
     }
 
-    // Buscar el superblock para el mountpoint
-    unsigned int f = vfs_lock_disable_irq();
-    int found = -1;
-    for (int i = 0; i < VFS_MAX_MOUNTS; i++) {
-      if (mount_table[i] && strcmp(mount_points[i], normalized) == 0) {
-        found = i;
-        break;
-      }
-    }
-    vfs_unlock_restore_irq(f);
-
-    if (found == -1) {
-      terminal_printf(term, "umount: Mountpoint %s not found\r\n", normalized);
-      return;
-    }
-
-    vfs_superblock_t *sb = mount_table[found];
-    if (!sb) {
-      terminal_printf(term, "umount: Invalid superblock for %s\r\n",
-                      normalized);
-      return;
-    }
-
-    // Cerrar todos los FDs asociados al superblock
-    if (close_fds_for_mount(sb) != VFS_OK) {
-      terminal_printf(term,
-                      "umount: Cannot close open file descriptors for %s\r\n",
-                      normalized);
-      return;
-    }
-
-    // Llamar a vfs_unmount
+    // Llamar directamente a vfs_unmount (ya maneja la búsqueda)
     int ret = vfs_unmount(normalized);
     if (ret != VFS_OK) {
       terminal_printf(term, "umount: Failed to unmount %s (error %d)\r\n",

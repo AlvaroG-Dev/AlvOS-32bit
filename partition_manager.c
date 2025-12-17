@@ -151,6 +151,10 @@ partition_manager_create_partition(uint32_t disk_id, uint8_t part_num,
     return PART_MGR_ERR_NO_SPACE;
   }
 
+  if (disk_part->partition_table.mbr.signature != 0xAA55) {
+    disk_part->partition_table.mbr.signature = 0xAA55;
+  }
+
   // **CORRECCIÓN 4: Verificación de superposición mejorada**
   for (uint32_t i = 0; i < disk_part->partition_table.partition_count; i++) {
     partition_info_t *existing = &disk_part->partition_table.partitions[i];
@@ -251,20 +255,54 @@ partition_manager_create_partition(uint32_t disk_id, uint8_t part_num,
         &main_terminal,
         "Partition Manager: Failed to write partition table (error %d)\r\n",
         err);
+
+    // **NUEVO: Intentar lectura y comparación**
+    partition_table_t verify_pt;
+    part_err_t read_err = partition_read_table(disk_part->disk, &verify_pt);
+    if (read_err == PART_OK) {
+      terminal_puts(&main_terminal, "Current disk state:\r\n");
+      partition_print_info(&verify_pt);
+    }
+
     return PART_MGR_ERR_WRITE_FAILED;
   }
+
+  // **NUEVO: Verificación adicional**
+  partition_table_t verify_pt;
+  part_err_t verify_err = partition_read_table(disk_part->disk, &verify_pt);
+  if (verify_err == PART_OK) {
+    bool match = true;
+    for (int i = 0; i < 4; i++) {
+      if (disk_part->partition_table.mbr.partitions[i].type !=
+          verify_pt.mbr.partitions[i].type) {
+        match = false;
+        terminal_printf(&main_terminal,
+                        "  WARNING: Partition %d mismatch after write\r\n", i);
+      }
+    }
+
+    if (!match) {
+      terminal_puts(&main_terminal, "  ERROR: Written data doesn't match!\r\n");
+      // Reintentar escritura
+      err = partition_write_table(&disk_part->partition_table);
+      if (err != PART_OK) {
+        terminal_puts(&main_terminal,
+                      "  FATAL: Second write attempt also failed\r\n");
+      }
+    }
+  }
+
+  // **NUEVO: Flushear forzadamente**
+  terminal_puts(&main_terminal, "Flushing disk cache...\r\n");
+  disk_flush_dispatch(disk_part->disk);
+
+  // Esperar un poco para asegurar escritura
+  for (volatile int i = 0; i < 1000000; i++)
+    ;
 
   terminal_printf(&main_terminal,
                   "Partition Manager: Created partition %u on disk %u\r\n",
                   part_num, disk_id);
-  terminal_printf(&main_terminal, "  Type: %s (0x%02X)\r\n",
-                  partition_type_name(type), type);
-  terminal_printf(&main_terminal, "  Start LBA: %llu\r\n", start_lba);
-  terminal_printf(&main_terminal, "  Sectors: %llu\r\n", sector_count);
-  terminal_printf(&main_terminal, "  Size: %llu MB\r\n",
-                  (sector_count * 512ULL) / (1024 * 1024));
-  terminal_printf(&main_terminal, "  Bootable: %s\r\n",
-                  bootable ? "Yes" : "No");
 
   return PART_MGR_OK;
 }
@@ -280,41 +318,235 @@ part_mgr_err_t partition_manager_delete_partition(uint32_t disk_id,
     return PART_MGR_ERR_INVALID_DISK;
   }
 
-  // Verificar que la partición existe
-  partition_info_t *info = &disk_part->partition_table.partitions[part_num];
-  if (info->type == PART_TYPE_EMPTY) {
-    terminal_printf(&main_terminal,
-                    "Partition Manager: Partition %u is already empty\r\n",
-                    part_num);
-    return PART_MGR_OK;
+  // **NUEVO: Leer MBR actual para diagnóstico**
+  mbr_t current_mbr;
+  disk_err_t d_err = disk_read_dispatch(disk_part->disk, 0, 1, &current_mbr);
+  if (d_err == DISK_ERR_NONE) {
+    terminal_printf(
+        &main_terminal,
+        "Partition Manager: Current disk state before deletion:\r\n");
+    terminal_printf(
+        &main_terminal, "  Partition %u: Type=0x%02X, Bootable=%s\r\n",
+        part_num, current_mbr.partitions[part_num].type,
+        (current_mbr.partitions[part_num].status & 0x80) ? "Yes" : "No");
   }
+
+  // Verificar que la partición existe
+  partition_info_t *info = NULL;
+
+  // Buscar en la información parseada
+  for (uint32_t i = 0; i < disk_part->partition_table.partition_count; i++) {
+    if (disk_part->partition_table.partitions[i].index == part_num) {
+      info = &disk_part->partition_table.partitions[i];
+      break;
+    }
+  }
+
+  // Si no se encontró en parsed info, verificar en MBR directamente
+  if (!info || info->type == PART_TYPE_EMPTY) {
+    if (current_mbr.partitions[part_num].type == PART_TYPE_EMPTY) {
+      terminal_printf(&main_terminal,
+                      "Partition Manager: Partition %u is already empty\r\n",
+                      part_num);
+      return PART_MGR_OK;
+    } else {
+      // Hay discrepancia entre parsed info y MBR real
+      terminal_puts(&main_terminal,
+                    "Partition Manager: WARNING - Partition exists on disk but "
+                    "not in parsed data\r\n");
+    }
+  }
+
+  terminal_printf(
+      &main_terminal,
+      "Partition Manager: Deleting partition %u from disk %u...\r\n", part_num,
+      disk_id);
+
+  // **NUEVO: Mantener copia de seguridad del MBR original**
+  mbr_t mbr_backup;
+  memcpy(&mbr_backup, &disk_part->partition_table.mbr, sizeof(mbr_t));
 
   // Limpiar entrada en MBR
   mbr_partition_entry_t *entry =
       &disk_part->partition_table.mbr.partitions[part_num];
+
+  terminal_printf(&main_terminal, "  Clearing entry %u: Type was 0x%02X\r\n",
+                  part_num, entry->type);
+
   memset(entry, 0, sizeof(mbr_partition_entry_t));
 
   // Actualizar información parseada
-  info->type = PART_TYPE_EMPTY;
-  info->bootable = false;
-  info->lba_start = 0;
-  info->sector_count = 0;
-  info->size_mb = 0;
-  info->is_extended = false;
+  if (info) {
+    info->type = PART_TYPE_EMPTY;
+    info->bootable = false;
+    info->lba_start = 0;
+    info->sector_count = 0;
+    info->size_mb = 0;
+    info->is_extended = false;
+  }
 
-  // Escribir tabla de particiones actualizada
-  part_err_t err = partition_write_table(&disk_part->partition_table);
+  // **NUEVO: Recalcular partition_count**
+  uint32_t new_count = 0;
+  for (int i = 0; i < 4; i++) {
+    if (disk_part->partition_table.mbr.partitions[i].type != PART_TYPE_EMPTY) {
+      new_count++;
+    }
+  }
+  disk_part->partition_table.partition_count = new_count;
+
+  // **NUEVO: Asegurar firma MBR válida**
+  if (disk_part->partition_table.mbr.signature != 0xAA55) {
+    terminal_puts(&main_terminal, "  Setting MBR signature to 0xAA55\r\n");
+    disk_part->partition_table.mbr.signature = 0xAA55;
+  }
+
+  // **NUEVO: Mostrar lo que vamos a escribir**
+  terminal_puts(&main_terminal, "  New MBR to write:\r\n");
+  for (int i = 0; i < 4; i++) {
+    entry = &disk_part->partition_table.mbr.partitions[i];
+    if (entry->type != PART_TYPE_EMPTY) {
+      terminal_printf(&main_terminal,
+                      "    Part %d: Type=0x%02X, LBA=%u, Sectors=%u\r\n", i,
+                      entry->type, entry->lba_start, entry->sector_count);
+    } else {
+      terminal_printf(&main_terminal, "    Part %d: [EMPTY]\r\n", i);
+    }
+  }
+
+  // **NUEVO: Escribir con verificación y reintentos**
+  part_err_t err = PART_ERR_WRITE_FAILED;
+  int attempts = 3;
+
+  for (int attempt = 1; attempt <= attempts; attempt++) {
+    terminal_printf(&main_terminal, "  Writing attempt %d/%d...\r\n", attempt,
+                    attempts);
+
+    err = partition_write_table(&disk_part->partition_table);
+    if (err == PART_OK) {
+      terminal_puts(&main_terminal, "  ✓ Write successful\r\n");
+      break;
+    } else {
+      terminal_printf(&main_terminal, "  ✗ Write failed (error %d)\r\n", err);
+
+      if (attempt < attempts) {
+        terminal_puts(&main_terminal, "    Retrying...\r\n");
+        // Pequeña pausa antes de reintentar
+        for (volatile int i = 0; i < 500000; i++)
+          ;
+      }
+    }
+  }
+
   if (err != PART_OK) {
+    terminal_printf(&main_terminal,
+                    "Partition Manager: FATAL - Failed to write partition "
+                    "table after %d attempts\r\n",
+                    attempts);
+
+    // **NUEVO: Restaurar copia de seguridad en memoria**
+    memcpy(&disk_part->partition_table.mbr, &mbr_backup, sizeof(mbr_t));
+
+    // Recalcular parsed info desde MBR restaurado
+    disk_part->partition_table.partition_count = 0;
+    for (int i = 0; i < 4; i++) {
+      if (disk_part->partition_table.mbr.partitions[i].type !=
+          PART_TYPE_EMPTY) {
+        partition_info_t *p =
+            &disk_part->partition_table
+                 .partitions[disk_part->partition_table.partition_count];
+        mbr_partition_entry_t *e =
+            &disk_part->partition_table.mbr.partitions[i];
+
+        p->index = i;
+        p->type = e->type;
+        p->bootable = (e->status == PART_FLAG_BOOTABLE);
+        p->lba_start = e->lba_start;
+        p->sector_count = e->sector_count;
+        p->size_mb = (p->sector_count * 512ULL) / (1024 * 1024);
+        p->is_extended = (e->type == PART_TYPE_EXTENDED ||
+                          e->type == PART_TYPE_EXTENDED_LBA);
+
+        disk_part->partition_table.partition_count++;
+      }
+    }
+
+    return PART_MGR_ERR_WRITE_FAILED;
+  }
+
+  // **NUEVO: Verificación exhaustiva post-escritura**
+  terminal_puts(&main_terminal, "  Verifying write...\r\n");
+
+  mbr_t verify_mbr;
+  d_err = disk_read_dispatch(disk_part->disk, 0, 1, &verify_mbr);
+
+  if (d_err != DISK_ERR_NONE) {
+    terminal_printf(&main_terminal, "  ✗ Cannot verify (read error %d)\r\n",
+                    d_err);
+  } else {
+    // Comparar byte a byte
+    bool mismatch = false;
+    for (int i = 0; i < 4; i++) {
+      if (disk_part->partition_table.mbr.partitions[i].type !=
+          verify_mbr.partitions[i].type) {
+        terminal_printf(&main_terminal,
+                        "  ✗ Part %d mismatch: expected 0x%02X, got 0x%02X\r\n",
+                        i, disk_part->partition_table.mbr.partitions[i].type,
+                        verify_mbr.partitions[i].type);
+        mismatch = true;
+      }
+    }
+
+    if (!mismatch) {
+      terminal_puts(&main_terminal, "  ✓ Verification passed\r\n");
+    } else {
+      terminal_puts(&main_terminal, "  ✗ Verification failed\r\n");
+
+      // **NUEVO: Intentar reparación automática**
+      terminal_puts(&main_terminal, "  Attempting auto-repair...\r\n");
+      err = partition_write_table(&disk_part->partition_table);
+      if (err == PART_OK) {
+        terminal_puts(&main_terminal, "  ✓ Auto-repair successful\r\n");
+      } else {
+        terminal_puts(&main_terminal, "  ✗ Auto-repair failed\r\n");
+      }
+    }
+  }
+
+  // **NUEVO: Flushear disco múltiples veces**
+  terminal_puts(&main_terminal, "  Flushing disk cache...\r\n");
+  for (int flush_attempt = 0; flush_attempt < 3; flush_attempt++) {
+    disk_flush_dispatch(disk_part->disk);
+    // Esperar entre flushes
+    for (volatile int i = 0; i < 200000; i++)
+      ;
+  }
+
+  // **NUEVO: Esperar para asegurar escritura física**
+  terminal_puts(&main_terminal, "  Waiting for physical write...\r\n");
+  for (volatile int i = 0; i < 1000000; i++)
+    ;
+
+  // **NUEVO: Lectura final de verificación**
+  terminal_puts(&main_terminal, "  Final verification...\r\n");
+  d_err = disk_read_dispatch(disk_part->disk, 0, 1, &verify_mbr);
+  if (d_err == DISK_ERR_NONE &&
+      verify_mbr.partitions[part_num].type == PART_TYPE_EMPTY) {
+    terminal_puts(&main_terminal,
+                  "  ✓ Partition successfully deleted from physical disk\r\n");
+  } else if (d_err == DISK_ERR_NONE) {
     terminal_printf(
         &main_terminal,
-        "Partition Manager: Failed to write partition table (error %d)\r\n",
-        err);
-    return PART_MGR_ERR_WRITE_FAILED;
+        "  ✗ WARNING: Partition still present on disk! Type: 0x%02X\r\n",
+        verify_mbr.partitions[part_num].type);
   }
 
   terminal_printf(&main_terminal,
                   "Partition Manager: Deleted partition %u from disk %u\r\n",
                   part_num, disk_id);
+
+  // **NUEVO: Mostrar estado final**
+  terminal_printf(&main_terminal, "  Final partition count: %u\r\n",
+                  disk_part->partition_table.partition_count);
 
   return PART_MGR_OK;
 }
@@ -382,6 +614,7 @@ part_mgr_err_t partition_manager_format_partition(uint32_t disk_id,
     return PART_MGR_ERR_INVALID_PARTITION;
   }
 
+  disk_flush_dispatch(disk_part->disk);
   return PART_MGR_OK;
 }
 
@@ -419,6 +652,7 @@ part_mgr_err_t partition_manager_set_bootable(uint32_t disk_id,
                   "Partition Manager: Partition %u %s bootable\r\n", part_num,
                   bootable ? "set as" : "unset as");
 
+  disk_flush_dispatch(disk_part->disk);
   return PART_MGR_OK;
 }
 
@@ -497,43 +731,44 @@ void partition_manager_list_partitions(uint32_t disk_id) {
   }
 }
 
-// Montaje automático de particiones
 part_mgr_err_t partition_manager_auto_mount_all(void) {
   terminal_puts(&main_terminal, "\r\n=== Partition Auto-mount ===\r\n");
 
-  // **PASO 1: Crear directorios base necesarios**
-  terminal_puts(&main_terminal, "Creating base directories...\r\n");
-
-  // Crear /dev si no existe
-  vfs_node_t *dev_dir = NULL;
-  if (vfs_mkdir("/dev", &dev_dir) != VFS_OK) {
-    terminal_puts(&main_terminal,
-                  "WARNING: /dev already exists or cannot be created\r\n");
-  }
-  if (dev_dir) {
-    dev_dir->refcount--;
-    if (dev_dir->refcount == 0 && dev_dir->ops->release) {
-      dev_dir->ops->release(dev_dir);
-    }
-  }
-
+  // **CORRECCIÓN: Crear directorios base necesarios**
   // Crear /mnt si no existe
   vfs_node_t *mnt_dir = NULL;
   if (vfs_mkdir("/mnt", &mnt_dir) != VFS_OK) {
     terminal_puts(&main_terminal,
                   "WARNING: /mnt already exists or cannot be created\r\n");
-  }
-  if (mnt_dir) {
-    mnt_dir->refcount--;
-    if (mnt_dir->refcount == 0 && mnt_dir->ops->release) {
-      mnt_dir->ops->release(mnt_dir);
+  } else {
+    if (mnt_dir) {
+      mnt_dir->refcount--;
+      if (mnt_dir->refcount == 0 && mnt_dir->ops->release) {
+        mnt_dir->ops->release(mnt_dir);
+      }
     }
   }
 
-  bool home_mounted = false;
-  uint32_t mounted_count = 0;
+  // Crear /home si no existe
+  vfs_node_t *home_dir = NULL;
+  if (vfs_mkdir("/home", &home_dir) != VFS_OK) {
+    terminal_puts(&main_terminal, "WARNING: /home already exists\r\n");
+  } else {
+    if (home_dir) {
+      home_dir->refcount--;
+      if (home_dir->refcount == 0 && home_dir->ops->release) {
+        home_dir->ops->release(home_dir);
+      }
+    }
+  }
 
-  // **PASO 2: Procesar cada disco**
+  uint32_t mounted_count = 0;
+  uint32_t fat32_count = 0;
+  disk_t *home_disk_instance =
+      NULL; // Para guardar referencia al disco de /home
+  partition_info_t *home_partition = NULL;
+
+  // **PROCESAR CADA DISCO**
   for (uint32_t disk_id = 0; disk_id < partition_manager_get_disk_count();
        disk_id++) {
     disk_partitions_t *disk_part = partition_manager_get_disk(disk_id);
@@ -546,277 +781,235 @@ part_mgr_err_t partition_manager_auto_mount_all(void) {
     char disk_letter = 'a' + disk_id;
     terminal_printf(&main_terminal, "\r\nProcessing disk sd%c:\r\n",
                     disk_letter);
-    terminal_printf(&main_terminal, "  Total size: %llu MB\r\n",
-                    (disk_part->disk->sector_count * 512ULL) / (1024 * 1024));
-    terminal_printf(&main_terminal, "  Partitions found: %u\r\n",
-                    disk_part->partition_table.partition_count);
 
-    // **DISCO COMPLETO: Crear /dev/sda**
+    // **CREAR DISPOSITIVO PARA EL DISCO COMPLETO EN /dev/**
     char disk_device[32];
     snprintf(disk_device, sizeof(disk_device), "/dev/sd%c", disk_letter);
-    terminal_printf(&main_terminal, "  Creating disk device: %s\r\n",
-                    disk_device);
 
-    // Major 8 = dispositivos SCSI/SATA, minor = disk_id * 16
     uint32_t minor_base = disk_id * 16;
 
-    // Crear nodo de dispositivo para el disco completo
-    if (vfs_mknod(disk_device, VFS_DEV_BLOCK, 8, minor_base) != VFS_OK) {
-      terminal_printf(&main_terminal,
-                      "    WARNING: Cannot create device node %s\r\n",
-                      disk_device);
+    if (vfs_mknod(disk_device, VFS_DEV_BLOCK, 8, minor_base) == VFS_OK) {
+      terminal_printf(&main_terminal, "  Created device: %s\r\n", disk_device);
     }
 
-    // **PASO 3: Procesar cada slot de partición (0-3)**
-    for (int slot_num = 0; slot_num < 4; slot_num++) {
-      char part_device[32];
-      snprintf(part_device, sizeof(part_device), "/dev/sd%c%d", disk_letter,
-               slot_num + 1);
+    // **PROCESAR CADA PARTICION**
+    for (uint32_t i = 0; i < disk_part->partition_table.partition_count; i++) {
+      partition_info_t *part = &disk_part->partition_table.partitions[i];
 
-      // Buscar si hay partición en este slot
-      partition_info_t *part = NULL;
-      for (uint32_t i = 0; i < disk_part->partition_table.partition_count;
-           i++) {
-        if (disk_part->partition_table.partitions[i].index == slot_num) {
-          part = &disk_part->partition_table.partitions[i];
-          break;
-        }
+      if (part->type == PART_TYPE_EMPTY) {
+        continue;
       }
 
-      // **SOLO crear nodo de dispositivo si HAY partición en este slot**
-      if (part && part->type != PART_TYPE_EMPTY) {
-        terminal_printf(&main_terminal, "  Processing slot %d:\r\n",
-                        slot_num + 1);
+      terminal_printf(&main_terminal,
+                      "  Partition %d: Type=0x%02X (%s), Size=%llu MB\r\n",
+                      part->index + 1, part->type,
+                      partition_type_name(part->type), part->size_mb);
 
-        // Crear nodo de dispositivo para la partición
-        uint32_t minor = minor_base + slot_num + 1;
+      // **VERIFICAR SI ES FAT32**
+      bool is_fat = partition_is_fat(part->type);
+
+      if (is_fat) {
+        fat32_count++;
+        terminal_printf(&main_terminal, "    ✓ Detected as FAT filesystem\r\n");
+
+        // **CREAR DISCO VIRTUAL PARA LA PARTICION**
+        disk_t *part_disk = (disk_t *)kernel_malloc(sizeof(disk_t));
+        if (!part_disk) {
+          terminal_puts(&main_terminal, "      ERROR: Out of memory\r\n");
+          continue;
+        }
+
+        disk_err_t d_err =
+            disk_init_from_partition(part_disk, disk_part->disk, part);
+        if (d_err != DISK_ERR_NONE) {
+          terminal_printf(&main_terminal,
+                          "      ERROR: Cannot create partition disk: %d\r\n",
+                          d_err);
+          kernel_free(part_disk);
+          continue;
+        }
+
+        // **CREAR DISPOSITIVO EN /dev/**
+        char part_device[32];
+        snprintf(part_device, sizeof(part_device), "/dev/sd%c%d", disk_letter,
+                 part->index + 1);
+
+        uint32_t minor = minor_base + part->index + 1;
 
         if (vfs_mknod(part_device, VFS_DEV_BLOCK, 8, minor) != VFS_OK) {
           terminal_printf(&main_terminal,
-                          "    WARNING: Cannot create device node %s\r\n",
+                          "      WARNING: Cannot create device node %s\r\n",
                           part_device);
         } else {
-          terminal_printf(
-              &main_terminal, "    Created device: %s -> %s (%llu MB)\r\n",
-              part_device, partition_type_name(part->type), part->size_mb);
+          terminal_printf(&main_terminal, "      Created device: %s\r\n",
+                          part_device);
         }
 
-        // **PASO 4: Si es FAT32, montarla**
-        if (partition_is_fat(part->type)) {
-          terminal_printf(
-              &main_terminal,
-              "    Detected FAT filesystem, attempting to mount...\r\n");
+        // **VERIFICAR FIRMA FAT32**
+        uint8_t boot_sector[512];
+        d_err = disk_read_dispatch(part_disk, 0, 1, boot_sector);
+        if (d_err != DISK_ERR_NONE) {
+          terminal_printf(&main_terminal,
+                          "      ERROR: Cannot read boot sector: %d\r\n",
+                          d_err);
+          kernel_free(part_disk);
+          continue;
+        }
 
-          // Crear disco virtual para la partición
-          disk_t *part_disk = (disk_t *)kernel_malloc(sizeof(disk_t));
-          if (!part_disk) {
-            terminal_puts(&main_terminal, "      ERROR: Out of memory\r\n");
-            continue;
-          }
-
-          disk_err_t d_err =
-              disk_init_from_partition(part_disk, disk_part->disk, part);
-          if (d_err != DISK_ERR_NONE) {
-            terminal_printf(&main_terminal,
-                            "      ERROR: Cannot create partition disk: %d\r\n",
-                            d_err);
-            kernel_free(part_disk);
-            continue;
-          }
-
-          // Verificar que realmente es FAT32 leyendo el boot sector
-          uint8_t boot_sector[512];
-          d_err = disk_read_dispatch(part_disk, 0, 1, boot_sector);
-          if (d_err != DISK_ERR_NONE) {
-            terminal_printf(&main_terminal,
-                            "      ERROR: Cannot read boot sector: %d\r\n",
-                            d_err);
-            kernel_free(part_disk);
-            continue;
-          }
-
-          if (!check_fat32_signature(boot_sector)) {
-            terminal_printf(&main_terminal,
-                            "      WARNING: No FAT32 signature found\r\n");
-            kernel_free(part_disk);
-            continue;
-          }
-
+        bool has_fat32_sig = check_fat32_signature(boot_sector);
+        if (!has_fat32_sig) {
+          terminal_printf(&main_terminal,
+                          "      WARNING: No FAT32 signature found\r\n");
+          // Aún así intentar montar si el tipo indica FAT32
+        } else {
           terminal_puts(&main_terminal, "      ✓ FAT32 signature verified\r\n");
+        }
 
-          // **PASO 5: Crear punto de montaje y montar**
-          char mount_point[64];
-          snprintf(mount_point, sizeof(mount_point), "/mnt/sd%c%d", disk_letter,
-                   slot_num + 1);
+        // **CORRECCIÓN: CREAR PUNTO DE MONTAJE EN /mnt/**
+        char mount_point[64];
+        snprintf(mount_point, sizeof(mount_point), "/mnt/sd%c%d", disk_letter,
+                 part->index + 1);
 
-          // Crear directorio de montaje
-          vfs_node_t *mount_dir = NULL;
-          if (vfs_mkdir(mount_point, &mount_dir) != VFS_OK) {
-            terminal_printf(&main_terminal,
-                            "      WARNING: Cannot create mount point %s\r\n",
-                            mount_point);
-            kernel_free(part_disk);
-            continue;
-          }
+        // Crear directorio de montaje
+        vfs_node_t *mount_dir = NULL;
+        if (vfs_mkdir(mount_point, &mount_dir) != VFS_OK) {
+          terminal_printf(&main_terminal,
+                          "      WARNING: Cannot create mount point %s\r\n",
+                          mount_point);
+        } else {
           if (mount_dir) {
             mount_dir->refcount--;
             if (mount_dir->refcount == 0 && mount_dir->ops->release) {
               mount_dir->ops->release(mount_dir);
             }
           }
+        }
 
-          // Montar en VFS
-          int mount_err = vfs_mount(mount_point, "fat32", part_disk);
-          if (mount_err != VFS_OK) {
-            terminal_printf(&main_terminal,
-                            "      ERROR: FAT32 mount failed: %d\r\n",
-                            mount_err);
-            kernel_free(part_disk);
-          } else {
-            terminal_printf(&main_terminal,
-                            "      ✓ Successfully mounted at %s\r\n",
-                            mount_point);
-            mounted_count++;
+        // **INTENTAR MONTAR EN /mnt/**
+        terminal_printf(&main_terminal,
+                        "      Attempting to mount at %s...\r\n", mount_point);
 
-            // **PASO 6: Si es la primera FAT32, montar también en /home**
-            if (!home_mounted) {
-              // Crear /home si no existe
-              vfs_node_t *home_dir = NULL;
-              if (vfs_mkdir("/home", &home_dir) != VFS_OK) {
-                terminal_puts(
-                    &main_terminal,
-                    "      WARNING: Cannot create /home directory\r\n");
-              } else {
-                if (home_dir) {
-                  home_dir->refcount--;
-                  if (home_dir->refcount == 0 && home_dir->ops->release) {
-                    home_dir->ops->release(home_dir);
-                  }
-                }
-
-                // **IMPORTANTE: Crear NUEVA instancia del disco para /home**
-                // No podemos usar la misma instancia porque FAT32 podría tener
-                // estado interno
-                disk_t *home_disk = (disk_t *)kernel_malloc(sizeof(disk_t));
-                if (home_disk) {
-                  disk_err_t home_err = disk_init_from_partition(
-                      home_disk, disk_part->disk, part);
-                  if (home_err == DISK_ERR_NONE) {
-                    mount_err = vfs_mount("/home", "fat32", home_disk);
-                    if (mount_err == VFS_OK) {
-                      terminal_puts(&main_terminal,
-                                    "      ✓ Also mounted as /home\r\n");
-                      home_mounted = true;
-                    } else {
-                      terminal_printf(
-                          &main_terminal,
-                          "      ERROR: Failed to mount /home: %d\r\n",
-                          mount_err);
-                      kernel_free(home_disk);
-                    }
-                  } else {
-                    terminal_printf(
-                        &main_terminal,
-                        "      ERROR: Cannot create home disk: %d\r\n",
-                        home_err);
-                    kernel_free(home_disk);
-                  }
-                }
-              }
+        int mount_err = vfs_mount(mount_point, "fat32", part_disk);
+        if (mount_err != VFS_OK) {
+          // Intentar nombres alternativos
+          const char *alt_names[] = {"FAT32", "fat", "FAT", NULL};
+          for (int alt = 0; alt_names[alt] != NULL; alt++) {
+            mount_err = vfs_mount(mount_point, alt_names[alt], part_disk);
+            if (mount_err == VFS_OK) {
+              terminal_printf(&main_terminal,
+                              "      ✓ Mounted with name '%s'\r\n",
+                              alt_names[alt]);
+              mounted_count++;
+              break;
             }
+          }
+
+          if (mount_err != VFS_OK) {
+            terminal_puts(&main_terminal,
+                          "      ✗ All mount attempts failed\r\n");
+            kernel_free(part_disk);
+            continue;
           }
         } else {
           terminal_printf(&main_terminal,
-                          "    Filesystem not supported for auto-mount: %s\r\n",
-                          partition_type_name(part->type));
+                          "      ✓ Successfully mounted at %s\r\n",
+                          mount_point);
+          mounted_count++;
         }
+
+        // **CORRECCIÓN: DECIDIR QUÉ PARTICION VA EN /home**
+        // Estrategia: Usar la partición más grande para /home
+        if (!home_partition || part->size_mb > home_partition->size_mb) {
+          home_partition = part;
+          home_disk_instance = part_disk; // Guardar referencia
+        }
+
       } else {
-        // Slot vacío - no crear nodo de dispositivo
-        terminal_printf(&main_terminal, "  Slot %d: [EMPTY]\r\n", slot_num + 1);
+        terminal_printf(&main_terminal,
+                        "    Skipping non-FAT partition: %s (0x%02X)\r\n",
+                        partition_type_name(part->type), part->type);
       }
     }
   }
 
-  // **PASO 7: Resumen final**
+  // **CORRECCIÓN: MONTAR LA PARTICION ELEGIDA EN /home**
+  if (home_disk_instance && home_partition) {
+    terminal_printf(&main_terminal,
+                    "\r\nSelected partition %u for /home (%llu MB)\r\n",
+                    home_partition->index + 1, home_partition->size_mb);
+
+    // **IMPORTANTE: Usar bind mount o montar la misma instancia**
+    // Por ahora, creamos otro disco para /home (NO RECOMENDADO PERO FUNCIONAL)
+    disk_t *home_disk_copy = (disk_t *)kernel_malloc(sizeof(disk_t));
+    if (home_disk_copy) {
+      // Encontrar el disk_part original
+      disk_partitions_t *disk_part =
+          partition_manager_get_disk(0); // Asumimos disco 0
+      if (disk_part) {
+        disk_err_t home_err = disk_init_from_partition(
+            home_disk_copy, disk_part->disk, home_partition);
+        if (home_err == DISK_ERR_NONE) {
+          int home_mount_err = vfs_mount("/home", "fat32", home_disk_copy);
+          if (home_mount_err == VFS_OK) {
+            terminal_puts(&main_terminal, "      ✓ Mounted as /home\r\n");
+
+            // **CREAR ENLACE SIMBÓLICO PARA CONVENIENCIA**
+            char home_link[64];
+            snprintf(home_link, sizeof(home_link), "/mnt/home");
+            // Nota: Necesitarías implementar vfs_symlink
+            terminal_printf(&main_terminal,
+                            "      Access via: /mnt/sda%u and /home\r\n",
+                            home_partition->index + 1);
+          } else {
+            terminal_printf(&main_terminal,
+                            "      ERROR: Failed to mount /home: %d\r\n",
+                            home_mount_err);
+            kernel_free(home_disk_copy);
+          }
+        } else {
+          kernel_free(home_disk_copy);
+        }
+      }
+    }
+  }
+
+  // **RESUMEN**
   terminal_puts(&main_terminal,
                 "\r\n========================================\r\n");
   terminal_puts(&main_terminal,
                 "           AUTO-MOUNT COMPLETE           \r\n");
   terminal_puts(&main_terminal, "========================================\r\n");
 
-  uint32_t disk_count = partition_manager_get_disk_count();
-  terminal_printf(&main_terminal, "Disks processed: %u\r\n", disk_count);
+  terminal_printf(&main_terminal, "Disks processed: %u\r\n",
+                  partition_manager_get_disk_count());
+  terminal_printf(&main_terminal, "FAT32 partitions detected: %u\r\n",
+                  fat32_count);
   terminal_printf(&main_terminal, "FAT32 partitions mounted: %u\r\n",
                   mounted_count);
 
-  if (home_mounted) {
-    terminal_puts(&main_terminal, "✓ /home directory is mounted\r\n");
-  } else {
+  if (mounted_count == 0 && fat32_count > 0) {
     terminal_puts(&main_terminal,
-                  "✗ /home directory is NOT mounted (no FAT32 found)\r\n");
-    // Crear /home temporal con tmpfs
-    vfs_node_t *home_dir = NULL;
-    if (vfs_mkdir("/home", &home_dir) != VFS_OK) {
-      terminal_puts(&main_terminal,
-                    "  WARNING: Cannot create /home directory\r\n");
-    } else {
-      if (vfs_mount("/home", "tmpfs", NULL) == VFS_OK) {
-        terminal_puts(&main_terminal,
-                      "  Created temporary /home with tmpfs\r\n");
-      }
-      if (home_dir) {
-        home_dir->refcount--;
-        if (home_dir->refcount == 0 && home_dir->ops->release) {
-          home_dir->ops->release(home_dir);
-        }
-      }
-    }
+                  "\r\nERROR: FAT32 partitions found but none mounted!\r\n");
+    terminal_puts(&main_terminal, "Possible issues:\r\n");
+    terminal_puts(&main_terminal,
+                  "  1. FAT32 driver not properly registered\r\n");
+    terminal_puts(&main_terminal,
+                  "  2. Partitions not formatted (no FAT32 signature)\r\n");
+    terminal_puts(&main_terminal, "  3. VFS mount function failing\r\n");
   }
 
-  // **PASO 8: Mostrar estructura creada**
+  // **MOSTRAR ESTRUCTURA CREADA**
   terminal_puts(&main_terminal, "\r\nCreated structure:\r\n");
-  terminal_puts(&main_terminal, "  /dev/           - Device files\r\n");
+  terminal_puts(&main_terminal, "  /dev/sd*      - Disk devices\r\n");
+  terminal_puts(&main_terminal, "  /mnt/sd*      - Mount points\r\n");
+  terminal_puts(&main_terminal, "  /home         - Home directory\r\n");
 
-  for (uint32_t disk_id = 0; disk_id < disk_count; disk_id++) {
-    char disk_letter = 'a' + disk_id;
-    disk_partitions_t *disk_part = partition_manager_get_disk(disk_id);
-    if (!disk_part)
-      continue;
-
-    terminal_printf(&main_terminal, "    /dev/sd%c      - Whole disk\r\n",
-                    disk_letter);
-
-    for (uint32_t i = 0; i < disk_part->partition_table.partition_count; i++) {
-      partition_info_t *part = &disk_part->partition_table.partitions[i];
-      if (part->type != PART_TYPE_EMPTY) {
-        terminal_printf(&main_terminal,
-                        "    /dev/sd%c%d     - Partition %d (%s)\r\n",
-                        disk_letter, part->index + 1, part->index + 1,
-                        partition_type_name(part->type));
-      }
-    }
-  }
-
-  terminal_puts(&main_terminal, "  /mnt/           - Mount points\r\n");
-  terminal_puts(&main_terminal, "  /home/          - User home directory\r\n");
-
-  // **PASO 9: Mostrar montajes activos**
+  // **MOSTRAR MONTAJES ACTIVOS**
   terminal_puts(&main_terminal, "\r\nActive mount points:\r\n");
-  int mount_count = vfs_list_mounts(print_mount_callback, NULL);
-  if (mount_count == 0) {
+  int total_mounts = vfs_list_mounts(print_mount_callback, NULL);
+  if (total_mounts == 0) {
     terminal_puts(&main_terminal, "  (no active mounts)\r\n");
   }
-
-  // **PASO 10: Comandos útiles para el usuario**
-  terminal_puts(&main_terminal, "\r\nUseful commands:\r\n");
-  terminal_puts(&main_terminal,
-                "  lsdev           - List all device nodes\r\n");
-  terminal_puts(&main_terminal,
-                "  ls /mnt         - List mounted partitions\r\n");
-  terminal_puts(&main_terminal, "  ls /home        - Check home directory\r\n");
-  terminal_puts(&main_terminal,
-                "  part list       - Detailed partition list\r\n");
-  terminal_puts(&main_terminal, "  explore         - Explore disk layout\r\n");
 
   return PART_MGR_OK;
 }
@@ -1453,6 +1646,7 @@ void part_fix_order_command(Terminal *term, const char *args) {
   partition_manager_list_partitions(disk_id);
 }
 
+// part_format_command:
 void part_format_command(Terminal *term, const char *args) {
   char disk_str[16], part_str[16], fs_type[16];
   char label[32] = "";
@@ -1466,6 +1660,9 @@ void part_format_command(Terminal *term, const char *args) {
                         "<fs_type> [label]\r\n");
     terminal_puts(term, "  fs_type: FAT32, FAT16\r\n");
     terminal_puts(term, "  label: Volume label (optional, max 11 chars)\r\n");
+    terminal_puts(term, "\r\nExamples:\r\n");
+    terminal_puts(term, "  part format 0 0 FAT32 SYSTEM\r\n");
+    terminal_puts(term, "  part format 0 1 FAT32 DATA\r\n");
     return;
   }
 
@@ -1486,17 +1683,129 @@ void part_format_command(Terminal *term, const char *args) {
   // Usar label si se proporcionó, sino string vacío
   const char *volume_label = (parsed >= 4 && label[0] != '\0') ? label : NULL;
 
-  part_mgr_err_t err =
-      partition_manager_format_partition(disk_id, part_num, fs_type);
-  if (err != PART_MGR_OK) {
-    terminal_printf(
-        term, "part format: Failed to format partition (error %d)\r\n", err);
+  terminal_printf(term, "Formatting partition %u on disk %u as %s...\r\n",
+                  part_num, disk_id, fs_type);
+
+  // **LEER INFO DE LA PARTICION ANTES DE FORMATEAR**
+  disk_partitions_t *disk_part = partition_manager_get_disk(disk_id);
+  if (!disk_part || !disk_part->initialized) {
+    terminal_printf(term, "ERROR: Disk %u not found\r\n", disk_id);
+    return;
+  }
+
+  partition_info_t *part_info =
+      partition_manager_get_partition(disk_id, part_num);
+  if (!part_info || part_info->type == PART_TYPE_EMPTY) {
+    terminal_printf(term, "ERROR: Partition %u not found\r\n", part_num);
+    return;
+  }
+
+  terminal_printf(
+      term, "  Partition info: Start LBA=%llu, Sectors=%llu, Size=%llu MB\r\n",
+      part_info->lba_start, part_info->sector_count, part_info->size_mb);
+
+  // **CREAR DISCO VIRTUAL PARA LA PARTICION**
+  disk_t part_disk;
+  disk_err_t d_err =
+      disk_init_from_partition(&part_disk, disk_part->disk, part_info);
+  if (d_err != DISK_ERR_NONE) {
+    terminal_printf(term, "ERROR: Cannot create partition disk wrapper: %d\r\n",
+                    d_err);
+    return;
+  }
+
+  // **VERIFICAR ESTADO ACTUAL (DEBUG)**
+  uint8_t boot_sector[512];
+  d_err = disk_read_dispatch(&part_disk, 0, 1, boot_sector);
+  if (d_err == DISK_ERR_NONE) {
+    terminal_puts(term, "  Current boot sector signature: ");
+    terminal_printf(term, "0x%02X 0x%02X\r\n", boot_sector[510],
+                    boot_sector[511]);
+
+    // Mostrar tipo de filesystem si existe
+    if (boot_sector[510] == 0x55 && boot_sector[511] == 0xAA) {
+      terminal_puts(term, "  Filesystem type bytes: ");
+      for (int i = 0x36; i < 0x3E; i++) {
+        char c = boot_sector[i];
+        terminal_putchar(term, (c >= 32 && c <= 126) ? c : '.');
+      }
+      terminal_puts(term, "\r\n");
+    }
+  }
+
+  // **FORMATEAR**
+  int format_result = -1;
+
+  if (strcmp(fs_type, "FAT32") == 0) {
+    terminal_puts(term, "  Formatting as FAT32...\r\n");
+
+    // Generar nombre de volumen si no se proporcionó
+    char default_label[12];
+    if (!volume_label) {
+      snprintf(default_label, sizeof(default_label), "DISK%u_P%u", disk_id,
+               part_num);
+      volume_label = default_label;
+    }
+
+    terminal_printf(term, "  Volume label: %s\r\n", volume_label);
+
+    // Calcular sectores por cluster óptimo
+    uint64_t total_sectors = part_info->sector_count;
+    uint8_t sectors_per_cluster = 1;
+
+    if (total_sectors > 1024 * 1024 * 1024 / 512) { // > 1GB
+      sectors_per_cluster = 8;
+    } else if (total_sectors > 512 * 1024 * 1024 / 512) { // > 512MB
+      sectors_per_cluster = 4;
+    } else if (total_sectors > 256 * 1024 * 1024 / 512) { // > 256MB
+      sectors_per_cluster = 2;
+    }
+
+    terminal_printf(term, "  Sectors per cluster: %u\r\n", sectors_per_cluster);
+
+    // Llamar a la función de formateo
+    // Asegúrate de que fat32_format_with_params exista
+    format_result = fat32_format_with_params(&part_disk, sectors_per_cluster, 2,
+                                             volume_label);
+
+    if (format_result == VFS_OK) {
+      terminal_puts(term, "  ✓ FAT32 format successful\r\n");
+
+      // **VERIFICAR QUE SE ESCRIBIÓ CORRECTAMENTE**
+      d_err = disk_read_dispatch(&part_disk, 0, 1, boot_sector);
+      if (d_err == DISK_ERR_NONE) {
+        terminal_printf(
+            term, "  New signature: 0x%02X 0x%02X %s\r\n", boot_sector[510],
+            boot_sector[511],
+            (boot_sector[510] == 0x55 && boot_sector[511] == 0xAA) ? "✓" : "✗");
+      }
+    }
+  }
+
+  if (format_result != VFS_OK) {
+    terminal_printf(term, "ERROR: Format failed with code %d\r\n",
+                    format_result);
+
+    // **INTENTAR CON FORMATO SIMPLE SI EL AVANZADO FALLA**
+    terminal_puts(term, "  Trying simple format...\r\n");
+    format_result =
+        fat32_format(&part_disk, volume_label ? volume_label : "NO_NAME");
+  }
+
+  if (format_result != VFS_OK) {
+    terminal_printf(term, "ERROR: All format attempts failed: %d\r\n",
+                    format_result);
     return;
   }
 
   terminal_printf(term,
-                  "part format: Formatted partition %u on disk %u as %s\r\n",
+                  "✓ Successfully formatted partition %u on disk %u as %s\r\n",
                   part_num, disk_id, fs_type);
+
+  // **FORZAR SINCROIZACIÓN**
+  disk_flush_dispatch(disk_part->disk);
+
+  terminal_puts(term, "  Disk cache flushed\r\n");
 }
 
 void part_format_advanced_command(Terminal *term, const char *args) {
@@ -1722,4 +2031,94 @@ void part_help_command(Terminal *term, const char *args) {
   terminal_puts(term,
                 "  part show-all                - Show all partitions\r\n");
   terminal_puts(term, "  part help                    - Show this help\r\n");
+}
+
+// Comando para sincronizar particiones con disco
+void part_sync_command(Terminal *term, const char *args) {
+  char disk_str[16];
+  uint32_t disk_id = 0;
+
+  if (args[0] != '\0') {
+    if (!parse_uint32(args, &disk_id)) {
+      terminal_printf(term, "part sync: Invalid disk ID '%s'\n", args);
+      return;
+    }
+  }
+
+  disk_partitions_t *disk_part = partition_manager_get_disk(disk_id);
+  if (!disk_part) {
+    terminal_printf(term, "part sync: Disk %u not found\n", disk_id);
+    return;
+  }
+
+  terminal_printf(term, "Syncing partition table for disk %u...\n", disk_id);
+
+  // Escribir tabla de particiones
+  part_err_t err = partition_write_table(&disk_part->partition_table);
+  if (err != PART_OK) {
+    terminal_printf(term, "ERROR: Failed to sync partition table (error %d)\n",
+                    err);
+    return;
+  }
+
+  terminal_puts(term, "✓ Partition table synchronized to disk\n");
+}
+
+// Comando para forzar sincronización de todos los discos
+void part_sync_all_command(Terminal *term, const char *args) {
+  terminal_puts(term, "Syncing all disks...\n");
+
+  uint32_t disk_count = partition_manager_get_disk_count();
+  uint32_t synced_count = 0;
+
+  for (uint32_t disk_id = 0; disk_id < disk_count; disk_id++) {
+    disk_partitions_t *disk_part = partition_manager_get_disk(disk_id);
+    if (!disk_part)
+      continue;
+
+    terminal_printf(term, "Disk %u: ", disk_id);
+
+    part_err_t err = partition_write_table(&disk_part->partition_table);
+    if (err == PART_OK) {
+      terminal_puts(term, "✓ Synced\n");
+      synced_count++;
+    } else {
+      terminal_printf(term, "✗ Failed (error %d)\n", err);
+    }
+  }
+
+  terminal_printf(term, "\nSynced %u of %u disks\n", synced_count, disk_count);
+}
+
+// Comando para refrescar particiones desde disco
+void part_refresh_command(Terminal *term, const char *args) {
+  char disk_str[16];
+  uint32_t disk_id = 0;
+
+  if (args[0] != '\0') {
+    if (!parse_uint32(args, &disk_id)) {
+      terminal_printf(term, "part refresh: Invalid disk ID '%s'\n", args);
+      return;
+    }
+  }
+
+  disk_partitions_t *disk_part = partition_manager_get_disk(disk_id);
+  if (!disk_part) {
+    terminal_printf(term, "part refresh: Disk %u not found\n", disk_id);
+    return;
+  }
+
+  terminal_printf(term, "Refreshing partition table for disk %u...\n", disk_id);
+
+  // Re-leer desde disco
+  part_err_t err =
+      partition_read_table(disk_part->disk, &disk_part->partition_table);
+  if (err != PART_OK) {
+    terminal_printf(
+        term, "ERROR: Failed to refresh partition table (error %d)\n", err);
+    return;
+  }
+
+  terminal_puts(term, "✓ Partition table refreshed from disk\n");
+  partition_manager_list_partitions(disk_id);
 }

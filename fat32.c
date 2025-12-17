@@ -2569,28 +2569,123 @@ static int fat32_write_zero_sector(fat32_fs_t *fs, uint64_t sector,
 }
 
 bool check_fat32_signature(uint8_t *boot_sector) {
-  // Verificar signature del boot sector
-  if (boot_sector[510] != 0x55 || boot_sector[511] != 0xAA) {
+  if (!boot_sector) {
+    terminal_printf(&main_terminal, "FAT32: No boot sector\n");
     return false;
   }
 
-  // Verificar que sea FAT32 (OEM name típico)
-  if (boot_sector[82] == 'F' && boot_sector[83] == 'A' &&
-      boot_sector[84] == 'T' && boot_sector[85] == '3' &&
-      boot_sector[86] == '2') {
-    return true;
+  // **PRIMERO: Verificar firma de boot sector**
+  terminal_printf(&main_terminal,
+                  "FAT32: Checking boot signature: 0x%02X 0x%02X\n",
+                  boot_sector[510], boot_sector[511]);
+
+  if (boot_sector[510] != 0x55 || boot_sector[511] != 0xAA) {
+    terminal_printf(&main_terminal, "FAT32: Invalid boot signature\n");
+    return false;
   }
 
-  // Verificar otros indicadores FAT32
+  terminal_puts(&main_terminal, "FAT32: ✓ Boot signature OK\n");
+
+  // **SEGUNDO: Mostrar información del sector para diagnóstico**
   uint16_t bytes_per_sector = *(uint16_t *)&boot_sector[11];
   uint8_t sectors_per_cluster = boot_sector[13];
   uint16_t reserved_sectors = *(uint16_t *)&boot_sector[14];
   uint8_t num_fats = boot_sector[16];
-  uint32_t sectors_per_fat = *(uint32_t *)&boot_sector[36];
+  uint16_t root_entries = *(uint16_t *)&boot_sector[17];
+  uint16_t total_sectors_16 = *(uint16_t *)&boot_sector[19];
+  uint16_t sectors_per_fat_16 = *(uint16_t *)&boot_sector[22];
+  uint32_t total_sectors_32 = *(uint32_t *)&boot_sector[32];
+  uint32_t sectors_per_fat_32 = *(uint32_t *)&boot_sector[36];
+  uint32_t root_cluster = *(uint32_t *)&boot_sector[44];
 
-  // Validaciones básicas FAT32
-  return (bytes_per_sector == 512 && sectors_per_cluster > 0 &&
-          reserved_sectors > 0 && num_fats > 0 && sectors_per_fat > 0);
+  terminal_printf(&main_terminal, "FAT32: BPB Information:\n");
+  terminal_printf(&main_terminal, "  Bytes per sector: %u\n", bytes_per_sector);
+  terminal_printf(&main_terminal, "  Sectors per cluster: %u\n",
+                  sectors_per_cluster);
+  terminal_printf(&main_terminal, "  Reserved sectors: %u\n", reserved_sectors);
+  terminal_printf(&main_terminal, "  Number of FATs: %u\n", num_fats);
+  terminal_printf(&main_terminal, "  Root entries: %u (0 for FAT32)\n",
+                  root_entries);
+  terminal_printf(&main_terminal, "  Total sectors (16): %u (0 for FAT32)\n",
+                  total_sectors_16);
+  terminal_printf(&main_terminal, "  Sectors per FAT (16): %u (0 for FAT32)\n",
+                  sectors_per_fat_16);
+  terminal_printf(&main_terminal, "  Total sectors (32): %u\n",
+                  total_sectors_32);
+  terminal_printf(&main_terminal, "  Sectors per FAT (32): %u\n",
+                  sectors_per_fat_32);
+  terminal_printf(&main_terminal, "  Root cluster: %u\n", root_cluster);
+
+  // **TERCERO: Verificar campos de sistema de archivos**
+  terminal_printf(&main_terminal, "FAT32: Filesystem type at offset 54: ");
+  for (int i = 54; i < 62; i++) {
+    terminal_printf(&main_terminal, "%c",
+                    boot_sector[i] >= 32 ? boot_sector[i] : '.');
+  }
+  terminal_puts(&main_terminal, "");
+
+  terminal_printf(&main_terminal, "FAT32: Filesystem type at offset 82: ");
+  for (int i = 82; i < 90; i++) {
+    terminal_printf(&main_terminal, "%c",
+                    boot_sector[i] >= 32 ? boot_sector[i] : '.');
+  }
+  terminal_puts(&main_terminal, "");
+
+  // **CUARTO: Verificaciones específicas de FAT32**
+  bool is_fat32 = false;
+
+  // Método 1: Por campos BPB
+  if (bytes_per_sector == 512 && sectors_per_cluster > 0 &&
+      reserved_sectors > 0 && num_fats > 0 && root_entries == 0 &&
+      total_sectors_16 == 0 && sectors_per_fat_16 == 0 &&
+      sectors_per_fat_32 > 0) {
+    terminal_puts(&main_terminal, "FAT32: ✓ Detected by BPB fields\n");
+    is_fat32 = true;
+  }
+
+  // Método 2: Por cadena "FAT32"
+  if (memcmp(&boot_sector[54], "FAT32   ", 8) == 0 ||
+      memcmp(&boot_sector[82], "FAT32   ", 8) == 0) {
+    terminal_puts(&main_terminal, "FAT32: ✓ Detected by filesystem string\n");
+    is_fat32 = true;
+  }
+
+  // Método 3: Por OEM name (algunas implementaciones)
+  terminal_printf(&main_terminal, "FAT32: OEM name: ");
+  for (int i = 3; i < 11; i++) {
+    terminal_printf(&main_terminal, "%c",
+                    boot_sector[i] >= 32 ? boot_sector[i] : '.');
+  }
+  terminal_puts(&main_terminal, "");
+
+  if (is_fat32) {
+    terminal_puts(&main_terminal, "FAT32: ✓ Confirmed as FAT32 filesystem\n");
+    return true;
+  }
+
+  // **QUINTO: Posibles problemas**
+  if (bytes_per_sector != 512) {
+    terminal_printf(&main_terminal,
+                    "FAT32: Warning: Unusual bytes per sector: %u\n",
+                    bytes_per_sector);
+  }
+
+  if (root_entries != 0) {
+    terminal_printf(&main_terminal,
+                    "FAT32: Warning: root_entries=%u (expected 0 for FAT32)\n",
+                    root_entries);
+    // Esto podría ser FAT16
+  }
+
+  if (sectors_per_fat_16 != 0) {
+    terminal_printf(
+        &main_terminal,
+        "FAT32: Warning: sectors_per_fat_16=%u (expected 0 for FAT32)\n",
+        sectors_per_fat_16);
+  }
+
+  terminal_puts(&main_terminal, "FAT32: ✗ Not identified as FAT32\n");
+  return false;
 }
 
 int fat32_parse_short_name(const char *name, uint8_t *fat_name) {

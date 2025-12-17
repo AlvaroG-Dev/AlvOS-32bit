@@ -44,6 +44,7 @@ compile "memory.c"     "$GCC $GCC_OPTS -c memory.c -o build/memory.o"
 compile "mmu.c"        "$GCC $GCC_OPTS -c mmu.c -o build/mmu.o"
 compile "memutils.c"   "$GCC $GCC_OPTS -c memutils.c -o build/memutils.o"
 compile "string.c"     "$GCC $GCC_OPTS -c string.c -o build/string.o"
+compile "cpuid.c" "$GCC $GCC_OPTS -c cpuid.c -o build/cpuid.o"
 compile "math_utils.c" "$GCC $GCC_OPTS -c math_utils.c -o build/math_utils.o"
 compile "keyboard.c"   "$GCC $GCC_OPTS -c keyboard.c -o build/keyboard.o"
 compile "drawing.c"    "$GCC $GCC_OPTS -c drawing.c -o build/drawing.o"
@@ -89,7 +90,7 @@ echo -e "${GREEN}Enlazando kernel.bin...${RESET}"
 ld -m elf_i386 -T linker.ld -o build/kernel.bin \
     build/boot.o build/kernel.o build/gdt_flush.o build/gdt.o build/idt.o \
     build/isr.o build/idt_load.o build/isr_asm.o build/irq.o build/irq_asm.o \
-    build/memory.o build/mmu.o build/memutils.o build/string.o \
+    build/memory.o build/cpuid.o build/mmu.o build/memutils.o build/string.o \
     build/keyboard.o build/drawing.o build/math_utils.o build/terminal.o \
     build/disk.o build/disk_io_daemon.o build/task.o build/task_switch.o build/task_utils.o \
     build/task_test.o build/serial.o build/vfs.o build/tmpfs.o build/fat32.o build/log.o \
@@ -159,12 +160,12 @@ gcc -m32 -ffreestanding -nostdlib -fno-pie -fno-stack-protector \
 ld -m elf_i386 -Ttext 0x0 --oformat binary -e main \
     hello.o -o hello.bin
 
-#dd if=/dev/zero of=disk.img bs=1M count=1000
-#parted disk.img --script mklabel msdos
-#parted disk.img --script mkpart primary fat32 1MiB 100%
-#sudo losetup -fP disk.img
+#dd if=/dev/zero of=~/osdisk/disk.img bs=1M count=1000
+#parted ~/osdisk/disk.img --script mklabel msdos
+#parted ~/osdisk/disk.img --script mkpart primary fat32 1MiB 100%
+#sudo losetup -fP ~/osdisk/disk.img
 #sudo mkfs.vfat -F 32 /dev/loop0p1 -n MYDISK
 #sudo losetup -d /dev/loop0
 
-#dd if=/dev/zero of=disk.img bs=1M count=1000
-#sudo mkfs.vfat -F 32 disk.img
+#dd if=/dev/zero of=~/osdisk/disk.img bs=1M count=1000
+#sudo mkfs.vfat -F 32 ~/osdisk/disk.img

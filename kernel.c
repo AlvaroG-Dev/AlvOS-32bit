@@ -3,6 +3,7 @@
 #include "apic.h"
 #include "atapi.h"
 #include "boot_log.h"
+#include "cpuid.h"
 #include "disk.h"
 #include "disk_io_daemon.h"
 #include "dma.h"
@@ -56,6 +57,23 @@ install_options_t options = {.mode = INSTALL_MODE_FULL,
 void keyboard_terminal_handler(int key);
 static void main_loop_task(void *arg);
 
+// Necesitamos una función para listar montajes - usar vfs_list_mounts
+// Primero creamos un callback para desmontar
+struct unmount_callback_data {
+  int count;
+  int errors;
+} unmount_data = {0, 0};
+
+// Función auxiliar para callback
+void unmount_callback(const char *mountpoint, const char *fs_name, void *arg) {
+  struct unmount_callback_data *data = (struct unmount_callback_data *)arg;
+  boot_log_warn("Unmounting %s (%s)\r\n", mountpoint, fs_name);
+  if (vfs_unmount(mountpoint) != VFS_OK) {
+    data->errors++;
+  }
+  data->count++;
+}
+
 // Función de apagado del sistema operativo
 void shutdown(void) {
   terminal_printf(&main_terminal, "\n\nSystem shutdown initiated\r\n");
@@ -94,14 +112,8 @@ void shutdown(void) {
   boot_log_info("Cleaning drivers");
   driver_system_cleanup();
   boot_log_ok();
-  // 5. Desmontar todos los sistemas de archivos
-  for (int i = 0; i < VFS_MAX_MOUNTS; i++) {
-    if (mount_table[i] && mount_points[i][0]) {
-      boot_log_warn("Unmounting %s\r\n", mount_points[i]);
-      close_fds_for_mount(mount_table[i]);
-      vfs_unmount(mount_points[i]);
-    }
-  }
+  // Desmontar usando vfs_list_mounts
+  vfs_list_mounts(unmount_callback, &unmount_data);
   boot_log_ok();
   // 6. Limpiar módulos
   boot_log_info("Cleaning modules");
@@ -179,7 +191,7 @@ void initialize_acpi_pci(void) {
   if (apic_init()) {
     boot_log_info("APIC initialized successfully");
     // Configurar IRQs del I/O APIC
-    irq_setup_apic();
+
     boot_log_ok();
   } else {
     boot_log_info("APIC not available, using legacy PIC");
@@ -249,6 +261,7 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
   boot_log_start("Initializing IDT");
   idt_init();
   boot_log_ok();
+  cpuid_init();
   boot_log_ok();
   boot_log_start("Initializing PIT timer (for calibration)");
   // Inicializar PIT a 100Hz temporalmente
@@ -257,13 +270,16 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
   outb(0x40, (uint8_t)(divisor & 0xFF));
   outb(0x40, (uint8_t)((divisor >> 8) & 0xFF));
   boot_log_ok();
+  initialize_acpi_pci();
+  // NUEVO: Ahora sí inicializar el timer (usará APIC si está disponible)
+  boot_log_start("Initializing timer");
+  __asm__ volatile("cli");
+  pit_init(100); // Esto usará APIC timer si está disponible
+  // 7. Inicializar ACPI/PCI/APIC (MODIFICADO)
+  irq_setup_apic();
   // 3. Inicializar teclado
   boot_log_start("Initializing keyboard");
   keyboard_init();
-  boot_log_ok();
-  // 4. Habilitar interrupciones
-  boot_log_start("Enabling interrupts");
-  asm volatile("sti");
   boot_log_ok();
   // 5. Inicializar serial
   boot_log_start("Initializing serial ports");
@@ -275,13 +291,6 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
   vfs_register_fs(&tmpfs_type);
   vfs_register_fs(&fat32_fs_type);
   boot_log_ok();
-  // 7. Inicializar ACPI/PCI/APIC (MODIFICADO)
-  initialize_acpi_pci();
-  // NUEVO: Ahora sí inicializar el timer (usará APIC si está disponible)
-  boot_log_start("Initializing timer");
-  pit_init(100); // Esto usará APIC timer si está disponible
-  boot_log_ok();
-  // disk_scan_all_buses(); // Moved to later in boot sequence
   // 8. Inicializar SATA/AHCI
   boot_log_start("Initializing SATA/AHCI subsystem");
   bool sata_available = false;
@@ -324,7 +333,7 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
   } else {
     boot_log_error();
   }
-  // Intentar montar disco persistente
+
   // Intentar montar disco persistente
   boot_log_start("Searching for persistent storage");
   bool disk_hardware_initialized = false;
@@ -474,20 +483,8 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
   // Finalizar boot y mostrar mensaje
   boot_log_finish();
   // 12. Inicializar multitarea
+  boot_log_ok();
   task_init();
-  task_t *cleanup =
-      task_create("cleanupd", cleanup_task, NULL, TASK_PRIORITY_LOW);
-  if (cleanup) {
-    boot_log_info("Created cleanup daemon");
-  }
-  // Crear tarea principal del loop
-  task_t *main_loop =
-      task_create("main_loop", main_loop_task, NULL, TASK_PRIORITY_HIGH);
-  if (!main_loop) {
-    terminal_puts(&main_terminal, "FATAL: Failed to create main loop task\n");
-    while (1)
-      __asm__("hlt");
-  }
   // ============================================
   // INICIAR TERMINAL NORMAL
   // ============================================
@@ -506,11 +503,24 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
   terminal_puts(&main_terminal, "Starting scheduler...\n");
   task_profiling_enable();
   message_system_init();
-  disk_io_daemon_init();
+  // disk_io_daemon_init();
   task_t *mem_defrag =
       task_create("Memory Defrag", memory_defrag_task, NULL, TASK_PRIORITY_LOW);
   if (mem_defrag) {
     boot_log_info("Memory Defrag task created (ID: %u)", mem_defrag->task_id);
+  }
+  task_t *cleanup =
+      task_create("cleanupd", cleanup_task, NULL, TASK_PRIORITY_LOW);
+  if (cleanup) {
+    boot_log_info("Created cleanup daemon");
+  }
+  // Crear tarea principal del loop
+  task_t *main_loop =
+      task_create("main_loop", main_loop_task, NULL, TASK_PRIORITY_HIGH);
+  if (!main_loop) {
+    terminal_puts(&main_terminal, "FATAL: Failed to create main loop task\n");
+    while (1)
+      __asm__("hlt");
   }
   // PASO 1: Marcar TODAS las tareas como READY
   terminal_puts(&main_terminal, "Setting all tasks to READY...\n");
@@ -644,6 +654,7 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
   while (1)
     __asm__ volatile("cli; hlt");
 }
+
 static void main_loop_task(void *arg) {
   (void)arg;
   uint32_t last_update = 0;
