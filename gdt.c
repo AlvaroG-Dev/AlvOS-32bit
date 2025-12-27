@@ -1,105 +1,106 @@
+// gdt.c - GDT CON SOPORTE RING 3
+#define GDT_ENTRIES 6
+
 #include "gdt.h"
-#include "memutils.h"
+#include "kernel.h"
+#include "string.h"
 
-#define GDT_ENTRIES 7
-#define TSS_SIZE 104
+// TSS global
+struct tss_entry tss;
 
-static struct gdt_entry gdt[GDT_ENTRIES];
-static struct gdt_ptr gdt_descriptor;
+// GDT global (definitions)
+struct gdt_entry gdt[GDT_ENTRIES];
+struct gdt_ptr gp;
 
+// Funciones externas en assembly
 extern void gdt_flush(uint32_t);
-extern void tss_flush();
-extern char _stack_top;
+extern void tss_flush(void);
 
-// Stack dedicado para double fault (4KB alineado)
-__attribute__((aligned(4096))) uint8_t double_fault_stack[4096];
+// ============================================================================
+// CONFIGURAR ENTRADA DE GDT
+// ============================================================================
 
-// Stack para modo usuario
-__attribute__((aligned(4096))) uint8_t user_mode_stack[4096];
+static void gdt_set_gate(int num, uint32_t base, uint32_t limit, uint8_t access,
+                         uint8_t gran) {
+  gdt[num].base_low = (base & 0xFFFF);
+  gdt[num].base_middle = (base >> 16) & 0xFF;
+  gdt[num].base_high = (base >> 24) & 0xFF;
 
-struct tss_entry tss = {0};
+  gdt[num].limit_low = (limit & 0xFFFF);
+  gdt[num].granularity = (limit >> 16) & 0x0F;
 
-static void set_gdt_entry(int num, uint32_t base, uint32_t limit, uint8_t access, uint8_t gran) {
-    gdt[num].base_low = (base & 0xFFFF);
-    gdt[num].base_middle = (base >> 16) & 0xFF;
-    gdt[num].base_high = (base >> 24) & 0xFF;
-
-    gdt[num].limit_low = (limit & 0xFFFF);
-    gdt[num].granularity = (limit >> 16) & 0x0F;
-    gdt[num].granularity |= gran & 0xF0;
-    gdt[num].access = access;
+  gdt[num].granularity |= gran & 0xF0;
+  gdt[num].access = access;
 }
 
-void gdt_init() {
-    // Configurar descriptor GDT
-    gdt_descriptor.limit = sizeof(struct gdt_entry) * GDT_ENTRIES - 1;
-    gdt_descriptor.base = (uint32_t)&gdt;
+// ============================================================================
+// INICIALIZAR GDT
+// ============================================================================
 
-    // Limpiar toda la GDT primero
-    memset(&gdt, 0, sizeof(gdt));
+void gdt_init(void) {
+  gp.limit = (sizeof(struct gdt_entry) * GDT_ENTRIES) - 1;
+  gp.base = (uint32_t)&gdt;
 
-    // 1. Segmento nulo (obligatorio) - ya está en 0 por memset
-    set_gdt_entry(0, 0, 0, 0, 0);
+  // 0x00: Descriptor nulo
+  gdt_set_gate(0, 0, 0, 0, 0);
 
-    // 2. Segmento de código kernel (0x08) - DPL=0
-    // Access: Present=1, DPL=00, S=1, Type=1010 (Code, Execute/Read)
-    // Gran: G=1, D/B=1, L=0, AVL=0
-    set_gdt_entry(1, 0, 0xFFFFF, 0x9A, 0xCF);
+  // 0x08: Segmento de código del kernel (Ring 0)
+  // Base=0, Limit=4GB, Present, Ring 0, Code, Readable, 32-bit
+  gdt_set_gate(1, 0, 0xFFFFFFFF, 0x9A, 0xCF);
 
-    // 3. Segmento de datos kernel (0x10) - DPL=0
-    // Access: Present=1, DPL=00, S=1, Type=0010 (Data, Read/Write)
-    // Gran: G=1, D/B=1, L=0, AVL=0
-    set_gdt_entry(2, 0, 0xFFFFF, 0x92, 0xCF);
+  // 0x10: Segmento de datos del kernel (Ring 0)
+  // Base=0, Limit=4GB, Present, Ring 0, Data, Writable, 32-bit
+  gdt_set_gate(2, 0, 0xFFFFFFFF, 0x92, 0xCF);
 
-    // 4. Segmento de código usuario (0x18) - DPL=3 (para futuro)
-    // Por ahora no se usa, pero dejamos para compatibilidad
-    set_gdt_entry(3, 0, 0xFFFFF, 0xFA, 0xCF);
+  // 0x18: Segmento de código de usuario (Ring 3)
+  // Base=0, Limit=4GB, Present, Ring 3, Code, Readable, 32-bit
+  // Access: 0xFA = 11111010
+  //   Present=1, DPL=11 (Ring 3), Type=1010 (Code, Readable)
+  gdt_set_gate(3, 0, 0xFFFFFFFF, 0xFA, 0xCF);
 
-    // 5. Segmento de datos usuario (0x20) - DPL=3 (para futuro)
-    // Por ahora no se usa, pero dejamos para compatibilidad
-    set_gdt_entry(4, 0, 0xFFFFF, 0xF2, 0xCF);
+  // 0x20: Segmento de datos de usuario (Ring 3)
+  // Base=0, Limit=4GB, Present, Ring 3, Data, Writable, 32-bit
+  // Access: 0xF2 = 11110010
+  //   Present=1, DPL=11 (Ring 3), Type=0010 (Data, Writable)
+  gdt_set_gate(4, 0, 0xFFFFFFFF, 0xF2, 0xCF);
 
-    // 6. Configurar TSS (0x28)
-    uint32_t tss_base = (uint32_t)&tss;
-    uint32_t tss_limit = sizeof(struct tss_entry) - 1;
-    
-    // Limpiar TSS completamente
-    memset(&tss, 0, sizeof(tss));
-    
-    // Configurar stack kernel para interrupciones
-    tss.esp0 = (uint32_t)(double_fault_stack + sizeof(double_fault_stack));
-    tss.ss0 = 0x10;  // Segmento de datos kernel
-    
-    // CRÍTICO: No configurar CS/DS/etc en el TSS
-    // Estos se cargarán desde el contexto de la tarea
-    // Solo necesitamos SS0 y ESP0 para cambios de privilegio
-    
-    tss.iomap_base = sizeof(tss);
-    
-    // TSS Descriptor
-    // Access: Present=1, DPL=00, Type=1001 (32-bit TSS Available)
-    // Gran: G=0 (byte granularity), otros=0
-    set_gdt_entry(5, tss_base, tss_limit, 0x89, 0x40);
-    
-    // Cargar GDT
-    gdt_flush((uint32_t)&gdt_descriptor);
-    
+  // 0x28: TSS (Task State Segment)
+  // Necesario para cambios de privilegio
+  uint32_t tss_base = (uint32_t)&tss;
+  uint32_t tss_limit = sizeof(struct tss_entry) - 1;
 
-    // Cargar TSS
-    tss_flush();
-    
-    // Verificar que los selectores se cargaron correctamente
-    uint16_t cs, ds, ss;
-    __asm__ volatile("mov %%cs, %0" : "=r"(cs));
-    __asm__ volatile("mov %%ds, %0" : "=r"(ds));
-    __asm__ volatile("mov %%ss, %0" : "=r"(ss));
-    
-    if (cs != 0x08 || ds != 0x10 || ss != 0x10) {
-        //terminal_printf(&main_terminal, "WARNING: Unexpected segment values!\n");
-        while (1)
-        {
-            __asm__ volatile("hlt");
-        }
-        
-    }
+  // Access: 0x89 = 10001001
+  //   Present=1, DPL=00 (Ring 0), Type=1001 (32-bit TSS Available)
+  gdt_set_gate(5, tss_base, tss_limit, 0x89, 0x40);
+
+  // Inicializar TSS
+  memset(&tss, 0, sizeof(struct tss_entry));
+
+  // Configurar stack del kernel para cuando volvemos de Ring 3
+  extern char _stack_top;
+  tss.ss0 = 0x10; // Kernel data segment
+  tss.esp0 = (uint32_t)&_stack_top;
+
+  // IOMAP base al final del TSS (sin mapa de IO)
+  tss.iomap_base = sizeof(struct tss_entry);
+
+  // Cargar GDT
+  gdt_flush((uint32_t)&gp);
+
+  // Cargar TSS
+  tss_flush();
+
+  terminal_puts(&main_terminal, "GDT initialized with Ring 3 support\r\n");
+  terminal_printf(&main_terminal, "  Kernel CS: 0x08, Kernel DS: 0x10\r\n");
+  terminal_printf(&main_terminal, "  User CS:   0x1B, User DS:   0x23\r\n");
+  terminal_printf(&main_terminal, "  TSS:       0x28 (base: 0x%08x)\r\n",
+                  tss_base);
 }
+
+// ============================================================================
+// ACTUALIZAR ESP0 EN TSS (para cambios de tarea)
+// ============================================================================
+
+void tss_set_kernel_stack(uint32_t stack) { tss.esp0 = stack; }
+
+uint32_t tss_get_kernel_stack(void) { return tss.esp0; }

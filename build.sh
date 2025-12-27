@@ -33,6 +33,7 @@ compile "gdt_flush.asm"     "nasm -f elf32 gdt.asm -o build/gdt_flush.o"
 compile "idt.asm"           "nasm -f elf32 idt.asm -o build/idt_load.o"
 compile "isr.asm"           "nasm -f elf32 isr.asm -o build/isr_asm.o"
 compile "irq.asm"           "nasm -f elf32 irq.asm -o build/irq_asm.o"
+compile "syscalls.asm"      "nasm -f elf32 syscalls.asm -o build/syscall_asm.o"
 
 # Compilacion C
 compile "kernel.c"     "$GCC $GCC_OPTS -c kernel.c -o build/kernel.o"
@@ -84,6 +85,7 @@ compile "mouse.c" "$GCC $GCC_OPTS -c mouse.c -o build/mouse.o"
 compile "apic.c" "$GCC $GCC_OPTS -c apic.c -o build/apic.o"
 compile "text_editor.c" "$GCC $GCC_OPTS -c text_editor.c -o build/text_editor.o"
 compile "mini_parser.c" "$GCC $GCC_OPTS -c mini_parser.c -o build/mini_parser.o"
+compile "syscalls.c" "$GCC $GCC_OPTS -c syscalls.c -o build/syscalls.o"
 
 # Enlazado con linker.ld
 echo -e "${GREEN}Enlazando kernel.bin...${RESET}"
@@ -100,7 +102,7 @@ ld -m elf_i386 -T linker.ld -o build/kernel.bin \
     build/uhci.o build/usb_mass_storage.o build/ehci.o build/usb_commands.o \
     build/partition.o build/mbr.o build/installer.o build/boot_log.o \
     build/mouse.o build/partition_manager.o build/apic.o build/mini_parser.o \
- build/text_editor.o
+    build/text_editor.o build/syscalls.o build/syscall_asm.o
     
 
 if [ $? -ne 0 ]; then

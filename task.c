@@ -10,17 +10,13 @@
 #include "task_utils.h"
 #include "terminal.h"
 
-// Instancia global del planificador
+// ============================================================================
+// DECLARACIONES Y VARIABLES GLOBALES
+// ============================================================================
+
 task_scheduler_t scheduler = {0};
-static uint32_t user_task_execution_count = 0;
-static uint32_t last_user_eip = 0;
-static char user_task_output[256] = {0};
-static volatile bool yield_in_progress = false;
 
-// FunciÃ³n de tarea idle
 static void idle_task_func(void *arg);
-
-// Funciones auxiliares internas
 static void task_wrapper(void);
 static task_t *allocate_task(void);
 static void deallocate_task(task_t *task);
@@ -30,9 +26,7 @@ static void remove_task_from_list(task_t *task);
 extern void task_switch_context(cpu_context_t *old_context,
                                 cpu_context_t *new_context);
 extern void task_start_first(cpu_context_t *context);
-static void task_exit_wrapper(void);
-static void task_entry_wrapper(void);
-static void perform_context_switch(task_t *from, task_t *to);
+extern void task_switch_to_user(cpu_context_t *user_context);
 
 // ========================================================================
 // INICIALIZACIÃ“N DEL SISTEMA DE TAREAS
@@ -543,6 +537,278 @@ task_t *scheduler_next_task(void) {
   }
 
   return best;
+}
+
+// ========================================================================
+// MODO USUARIO (RING 3)
+// ========================================================================
+
+// Este wrapper se ejecuta en Ring 0 y luego hace la transición a Ring 3
+static void user_mode_entry_wrapper(void *arg) {
+  (void)arg; // No usamos el argumento directamente
+
+  task_t *current = scheduler.current_task;
+
+  if (!current || !(current->flags & TASK_FLAG_USER_MODE)) {
+    terminal_puts(&main_terminal, "[USER_WRAPPER] ERROR: Not a user task!\r\n");
+    task_exit(-1);
+    return;
+  }
+
+  // Debug: mostrar estado antes del switch
+  terminal_printf(&main_terminal,
+                  "[USER_WRAPPER] Preparing transition to Ring 3:\r\n"
+                  "  Task: %s (ID: %u)\r\n"
+                  "  User code: 0x%08x\r\n"
+                  "  User stack: 0x%08x\r\n",
+                  current->name, current->task_id,
+                  (uint32_t)current->user_entry_point,
+                  (uint32_t)current->user_stack_top);
+
+  // **CRÍTICO**: Verificar mapeo de la página de código
+  uint32_t code_page = (uint32_t)current->user_entry_point & ~0xFFF;
+
+  if (!mmu_is_mapped(code_page)) {
+    terminal_printf(&main_terminal,
+                    "[USER_WRAPPER] ERROR: Code page not mapped at 0x%08x!\r\n",
+                    code_page);
+
+    // Intentar mapear automáticamente
+    terminal_printf(&main_terminal, "  Attempting to map page 0x%08x...\r\n",
+                    code_page);
+
+    if (!mmu_map_page(code_page, code_page,
+                      PAGE_PRESENT | PAGE_RW | PAGE_USER)) {
+      terminal_puts(&main_terminal, "  Mapping failed!\r\n");
+      task_exit(-1);
+      return;
+    }
+
+    terminal_puts(&main_terminal, "  Page mapped successfully.\r\n");
+
+    // Flushear TLB
+    __asm__ volatile("invlpg (%0)" : : "r"(code_page));
+  }
+
+  // Verificar permisos de página
+  uint32_t pd_index = code_page >> 22;
+  uint32_t pt_index = (code_page >> 12) & 0x3FF;
+
+  if (page_directory[pd_index] & PAGE_PRESENT) {
+    uint32_t flags = page_tables[pd_index][pt_index] & 0xFFF;
+    if (!(flags & PAGE_USER)) {
+      terminal_puts(&main_terminal,
+                    "  Adding PAGE_USER flag to code page...\r\n");
+      page_tables[pd_index][pt_index] |= PAGE_USER;
+      __asm__ volatile("invlpg (%0)" : : "r"(code_page));
+    }
+  }
+
+  // **CRÍTICO**: Crear contexto de usuario en tiempo de ejecución
+  cpu_context_t user_ctx = {0};
+
+  // 1. Segmentos de usuario (Ring 3) - ¡IMPORTANTE!
+  user_ctx.cs = 0x1B; // User CS (Ring 3)
+  user_ctx.ds = 0x23; // User DS (Ring 3) - ¡NO DEBE SER 0!
+  user_ctx.es = 0x23; // ¡NO DEBE SER 0!
+  user_ctx.fs = 0x23; // ¡NO DEBE SER 0!
+  user_ctx.gs = 0x23; // ¡NO DEBE SER 0!
+  user_ctx.ss = 0x23; // User SS (Ring 3)
+
+  // 2. Stack y entry point
+  user_ctx.esp = (uint32_t)current->user_stack_top;
+  user_ctx.ebp = (uint32_t)current->user_stack_top;
+  user_ctx.eip = (uint32_t)current->user_entry_point;
+
+  // 3. EFLAGS con IF=1
+  user_ctx.eflags = 0x202;
+
+  // 4. Registros en 0
+  user_ctx.eax = 0;
+  user_ctx.ebx = 0;
+  user_ctx.ecx = 0;
+  user_ctx.edx = 0;
+  user_ctx.esi = 0;
+  user_ctx.edi = 0;
+
+  // Verificar que los segmentos sean de Ring 3
+  if ((user_ctx.cs & 3) != 3) {
+    terminal_printf(
+        &main_terminal,
+        "[USER_WRAPPER] ERROR: CS=0x%04x (RPL=%u), expected RPL=3\r\n",
+        user_ctx.cs, user_ctx.cs & 3);
+    task_exit(-1);
+    return;
+  }
+
+  if ((user_ctx.ss & 3) != 3) {
+    terminal_printf(
+        &main_terminal,
+        "[USER_WRAPPER] ERROR: SS=0x%04x (RPL=%u), expected RPL=3\r\n",
+        user_ctx.ss, user_ctx.ss & 3);
+    task_exit(-1);
+    return;
+  }
+
+  // Debug final con más información
+  terminal_printf(&main_terminal,
+                  "[USER_WRAPPER] Ready for switch:\r\n"
+                  "  CS:EIP = 0x%04x:0x%08x\r\n"
+                  "  SS:ESP = 0x%04x:0x%08x\r\n"
+                  "  DS:ES:FS:GS = 0x%04x:0x%04x:0x%04x:0x%04x\r\n"
+                  "  EFLAGS = 0x%08x\r\n",
+                  user_ctx.cs, user_ctx.eip, user_ctx.ss, user_ctx.esp,
+                  user_ctx.ds, user_ctx.es, user_ctx.fs, user_ctx.gs,
+                  user_ctx.eflags);
+
+  // Deshabilitar interrupciones antes del switch
+  __asm__ volatile("cli");
+
+  // Hacer la transición a Ring 3
+  // Esta función NUNCA retorna
+  task_switch_to_user(&user_ctx);
+
+  // Si por algún milagro retorna, hacer halt
+  terminal_puts(&main_terminal,
+                "[USER_WRAPPER] FATAL: Returned from Ring 3!\r\n");
+  while (1) {
+    __asm__ volatile("cli; hlt");
+  }
+}
+// ============================================================================
+// FUNCIÓN PARA CREAR TAREAS DE USUARIO (COMPLETAMENTE CORREGIDA)
+// ============================================================================
+
+task_t *task_create_user(const char *name, void *user_code_addr, void *arg,
+                         task_priority_t priority) {
+  terminal_printf(&main_terminal,
+                  "[USER_CREATE] Creating user task: %s at 0x%08x\r\n", name,
+                  (uint32_t)user_code_addr);
+
+  // 1. Validar dirección de código
+  if ((uint32_t)user_code_addr < 0x200000 ||
+      (uint32_t)user_code_addr >= 0xC0000000) {
+    terminal_printf(&main_terminal,
+                    "[USER_CREATE] ERROR: Invalid code address 0x%08x\r\n",
+                    (uint32_t)user_code_addr);
+    return NULL;
+  }
+
+  // 2. Verificar que el código esté mapeado con PAGE_USER
+  uint32_t code_page = (uint32_t)user_code_addr & ~0xFFF;
+  uint32_t code_flags = mmu_get_page_flags(code_page);
+
+  if (!(code_flags & PAGE_PRESENT)) {
+    terminal_puts(&main_terminal,
+                  "[USER_CREATE] ERROR: Code page not mapped\r\n");
+    return NULL;
+  }
+
+  if (!(code_flags & PAGE_USER)) {
+    terminal_printf(
+        &main_terminal,
+        "[USER_CREATE] WARNING: Code page missing PAGE_USER (flags=0x%03x)\r\n",
+        code_flags);
+
+    // Intentar corregir
+    if (!mmu_set_page_user(code_page)) {
+      terminal_puts(
+          &main_terminal,
+          "[USER_CREATE] ERROR: Cannot set PAGE_USER on code page\r\n");
+      return NULL;
+    }
+
+    terminal_puts(&main_terminal,
+                  "[USER_CREATE] PAGE_USER added to code page\r\n");
+  }
+
+  // 3. Asignar stack de usuario
+  void *user_stack = kernel_malloc(USER_STACK_SIZE);
+  if (!user_stack) {
+    terminal_puts(&main_terminal,
+                  "[USER_CREATE] ERROR: Cannot allocate user stack\r\n");
+    return NULL;
+  }
+  memset(user_stack, 0, USER_STACK_SIZE);
+
+  // 4. **CRÍTICO**: Mapear CADA PÁGINA del stack con PAGE_USER
+  uint32_t stack_start = (uint32_t)user_stack;
+  uint32_t stack_end = stack_start + USER_STACK_SIZE;
+
+  terminal_printf(&main_terminal,
+                  "[USER_CREATE] Mapping user stack: 0x%08x - 0x%08x\r\n",
+                  stack_start, stack_end);
+
+  for (uint32_t page = stack_start; page < stack_end; page += 0x1000) {
+    uint32_t phys = mmu_virtual_to_physical(page);
+
+    if (!phys) {
+      // No está mapeada, mapear ahora
+      if (!mmu_map_page(page, page, PAGE_PRESENT | PAGE_RW | PAGE_USER)) {
+        terminal_printf(
+            &main_terminal,
+            "[USER_CREATE] ERROR: Failed to map stack page 0x%08x\r\n", page);
+        kernel_free(user_stack);
+        return NULL;
+      }
+    } else {
+      // Ya está mapeada, asegurar PAGE_USER
+      if (!mmu_set_page_user(page)) {
+        terminal_printf(&main_terminal,
+                        "[USER_CREATE] ERROR: Failed to set PAGE_USER on stack "
+                        "page 0x%08x\r\n",
+                        page);
+        kernel_free(user_stack);
+        return NULL;
+      }
+    }
+  }
+
+  // 5. Calcular top del stack (alineado a 16 bytes)
+  uint32_t stack_top = stack_end & ~0xF;
+
+  // 6. Crear tarea usando el wrapper de kernel
+  task_t *task = task_create(name, user_mode_entry_wrapper, arg, priority);
+  if (!task) {
+    terminal_puts(&main_terminal,
+                  "[USER_CREATE] ERROR: task_create() failed\r\n");
+    kernel_free(user_stack);
+    return NULL;
+  }
+
+  // 7. Configurar información de usuario
+  task->user_stack_base = user_stack;
+  task->user_stack_top = (void *)stack_top;
+  task->user_stack_size = USER_STACK_SIZE;
+  task->user_entry_point = user_code_addr;
+  task->user_code_base = user_code_addr;
+  task->user_code_size = 4096;
+  task->flags |= TASK_FLAG_USER_MODE;
+
+  // 8. Verificar que el contexto de kernel esté correcto
+  if (task->context.eip != (uint32_t)user_mode_entry_wrapper) {
+    terminal_printf(&main_terminal,
+                    "[USER_CREATE] WARNING: Fixing EIP: 0x%08x -> 0x%08x\r\n",
+                    task->context.eip, (uint32_t)user_mode_entry_wrapper);
+    task->context.eip = (uint32_t)user_mode_entry_wrapper;
+  }
+
+  terminal_printf(&main_terminal,
+                  "[USER_CREATE] User task created successfully!\r\n"
+                  "  Task ID: %u\r\n"
+                  "  Kernel entry (wrapper): 0x%08x\r\n"
+                  "  User entry point: 0x%08x\r\n"
+                  "  Kernel stack: 0x%08x -> 0x%08x\r\n"
+                  "  User stack: 0x%08x -> 0x%08x\r\n"
+                  "  Kernel segments: CS=0x%04x, DS=0x%04x, SS=0x%04x\r\n"
+                  "  User segments: CS=0x%04x, DS=0x%04x, SS=0x%04x\r\n",
+                  task->task_id, (uint32_t)user_mode_entry_wrapper,
+                  (uint32_t)user_code_addr, (uint32_t)task->stack_base,
+                  (uint32_t)task->stack_top, (uint32_t)user_stack, stack_top,
+                  task->context.cs, task->context.ds, task->context.ss, 0x1B,
+                  0x23, 0x23);
+
+  return task;
 }
 
 // ========================================================================

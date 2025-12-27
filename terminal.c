@@ -8,6 +8,7 @@
 #include "dma.h"
 #include "driver_system.h"
 #include "fat32.h"
+#include "gdt.h"
 #include "idt.h"
 #include "installer.h"
 #include "io.h"
@@ -24,6 +25,7 @@
 #include "sata_disk.h"
 #include "serial.h"
 #include "string.h"
+#include "syscalls.h"
 #include "task.h"
 #include "task_utils.h"
 #include "text_editor.h"
@@ -34,25 +36,45 @@ extern vfs_superblock_t *mount_table[VFS_MAX_MOUNTS];
 extern char mount_points[VFS_MAX_MOUNTS][VFS_PATH_MAX];
 extern ahci_controller_t ahci_controller;
 
-// Tabla de colores ANSI (índice 0-15)
-static const uint32_t ansi_colors[16] = {
-    COLOR_BLACK,     // 0
-    COLOR_RED,       // 1
-    COLOR_GREEN,     // 2
-    COLOR_YELLOW,    // 3
-    COLOR_BLUE,      // 4
-    COLOR_MAGENTA,   // 5
-    COLOR_CYAN,      // 6
-    COLOR_WHITE,     // 7
-    COLOR_DARK_GRAY, // 8
-    COLOR_RED,       // 9 (bright red)
-    COLOR_GREEN,     // 10 (bright green)
-    COLOR_YELLOW,    // 11 (bright yellow)
-    COLOR_BLUE,      // 12 (bright blue)
-    COLOR_MAGENTA,   // 13 (bright magenta)
-    COLOR_CYAN,      // 14 (bright cyan)
-    COLOR_WHITE      // 15 (bright white)
-};
+// Decodifica un color ANSI a color RGB
+uint32_t ansi_to_color(uint8_t ansi_code, uint8_t is_bright) {
+  static const uint32_t ansi_colors_basic[16] = {
+      COLOR_BLACK,         // 0
+      COLOR_RED,           // 1
+      COLOR_GREEN,         // 2
+      COLOR_YELLOW,        // 3
+      COLOR_BLUE,          // 4
+      COLOR_MAGENTA,       // 5
+      COLOR_CYAN,          // 6
+      COLOR_WHITE,         // 7
+      COLOR_DARK_GRAY,     // 8 (bright black)
+      COLOR_LIGHT_RED,     // 9 (bright red)
+      COLOR_LIGHT_GREEN,   // 10 (bright green)
+      COLOR_LIGHT_YELLOW,  // 11 (bright yellow)
+      COLOR_LIGHT_BLUE,    // 12 (bright blue)
+      COLOR_LIGHT_MAGENTA, // 13 (bright magenta)
+      COLOR_LIGHT_CYAN,    // 14 (bright cyan)
+      COLOR_WHITE          // 15 (bright white)
+  };
+
+  if (ansi_code < 16) {
+    return ansi_colors_basic[ansi_code];
+  }
+  return COLOR_WHITE; // Por defecto
+}
+
+// Función para extraer números de secuencias ANSI
+static int parse_ansi_number(const char *str, int *value) {
+  *value = 0;
+  int i = 0;
+
+  while (str[i] >= '0' && str[i] <= '9') {
+    *value = *value * 10 + (str[i] - '0');
+    i++;
+  }
+
+  return i;
+}
 
 // =================================================================
 // FUNCIONES DE CÁLCULO DE DIMENSIONES DE TERMINAL
@@ -246,6 +268,21 @@ int circular_buffer_init(CircularBuffer *cb, uint32_t width,
     return 0;
   }
 
+  // Asignar memoria para los colores de caracteres
+  cb->char_colors = (uint32_t *)kernel_malloc(cb->size * sizeof(uint32_t));
+  if (!cb->char_colors) {
+    kernel_free(cb->line_attrs);
+    cb->line_attrs = NULL;
+    kernel_free(cb->data);
+    cb->data = NULL;
+    return 0;
+  }
+
+  // Inicializar colores a blanco por defecto (o el color que corresponda)
+  for (uint32_t i = 0; i < cb->size; i++) {
+    cb->char_colors[i] = COLOR_WHITE;
+  }
+
   // Inicializar el buffer con espacios
   terminal_safe_memset(cb->data, ' ', cb->size);
   memset(cb->line_attrs, 0, buffer_lines * sizeof(uint32_t));
@@ -274,6 +311,11 @@ void circular_buffer_destroy(CircularBuffer *cb) {
     cb->line_attrs = NULL;
   }
 
+  if (cb->char_colors) {
+    kernel_free(cb->char_colors);
+    cb->char_colors = NULL;
+  }
+
   cb->size = 0;
   cb->lines = 0;
   cb->width = 0;
@@ -291,6 +333,7 @@ int circular_buffer_resize(CircularBuffer *cb, uint32_t new_width,
   // Salvar datos existentes si los hay
   char *old_data = cb->data;
   uint32_t *old_line_attrs = cb->line_attrs;
+  uint32_t *old_char_colors = cb->char_colors;
   uint32_t old_width = cb->width;
   uint32_t old_lines = cb->lines;
   uint32_t old_count = cb->count;
@@ -312,9 +355,22 @@ int circular_buffer_resize(CircularBuffer *cb, uint32_t new_width,
     return 0;
   }
 
+  uint32_t *new_char_colors =
+      (uint32_t *)kernel_malloc(new_size * sizeof(uint32_t));
+  if (!new_char_colors) {
+    kernel_free(new_line_attrs);
+    kernel_free(new_data);
+    return 0;
+  }
+
   // Inicializar nuevo buffer
   terminal_safe_memset(new_data, ' ', new_size);
   memset(new_line_attrs, 0, new_buffer_lines * sizeof(uint32_t));
+
+  // Inicializar nuevos colores
+  for (uint32_t i = 0; i < new_size; i++) {
+    new_char_colors[i] = COLOR_WHITE;
+  }
 
   // Copiar datos existentes si hay alguno
   if (old_data && old_count > 0) {
@@ -340,6 +396,18 @@ int circular_buffer_resize(CircularBuffer *cb, uint32_t new_width,
 
       // Copiar atributos
       new_line_attrs[i] = old_line_attrs[old_line_idx];
+
+      // Copiar colores de caracteres
+      uint32_t *old_colors_start = old_char_colors + (old_line_idx * old_width);
+      uint32_t *new_colors_start = new_char_colors + (i * new_width);
+      // Copiar lo que quepa
+      for (uint32_t k = 0; k < chars_to_copy_per_line; k++) {
+        new_colors_start[k] = old_colors_start[k];
+      }
+      // Rellenar el resto con blanco
+      for (uint32_t k = chars_to_copy_per_line; k < new_width; k++) {
+        new_colors_start[k] = COLOR_WHITE;
+      }
     }
 
     // Actualizar estado del buffer
@@ -357,6 +425,7 @@ int circular_buffer_resize(CircularBuffer *cb, uint32_t new_width,
   // Actualizar buffer
   cb->data = new_data;
   cb->line_attrs = new_line_attrs;
+  cb->char_colors = new_char_colors;
   cb->size = new_size;
   cb->lines = new_buffer_lines;
   cb->width = new_width;
@@ -367,6 +436,12 @@ int circular_buffer_resize(CircularBuffer *cb, uint32_t new_width,
   }
   if (old_line_attrs) {
     kernel_free(old_line_attrs);
+  }
+
+  // ERROR FIX: Free the OLD buffer, not the one we just assigned to cb!
+  // old_char_colors was captured at the start of the function.
+  if (old_char_colors) {
+    kernel_free(old_char_colors);
   }
 
   return 1;
@@ -385,6 +460,11 @@ int circular_buffer_add_line(CircularBuffer *cb) {
   // Limpiar la nueva línea
   uint32_t line_start = cb->head * cb->width;
   terminal_safe_memset(&cb->data[line_start], ' ', cb->width);
+  // Inicializar colores de la nueva línea a blanco (o default)
+  for (uint32_t i = 0; i < cb->width; i++) {
+    cb->char_colors[line_start + i] = COLOR_WHITE;
+  }
+
   cb->line_attrs[cb->head] = 0;
 
   // Avanzar head
@@ -466,6 +546,30 @@ int circular_buffer_is_valid_line(CircularBuffer *cb, uint32_t line_offset) {
   return line_offset < cb->count;
 }
 
+uint32_t *circular_buffer_get_colors(CircularBuffer *cb, uint32_t line_offset) {
+  if (!cb || !cb->char_colors)
+    return NULL;
+
+  if (line_offset >= cb->count)
+    return NULL;
+
+  uint32_t actual_line;
+  if (cb->wrapped) {
+    actual_line = (cb->tail + line_offset) % cb->lines;
+  } else {
+    actual_line = line_offset;
+  }
+
+  // Verificar acceso a la memoria
+  // Reusamos la verificación que usa el offset del buffer
+  if (!terminal_verify_memory_access(
+          (Terminal *)((char *)cb - offsetof(Terminal, buffer)), actual_line)) {
+    return NULL;
+  }
+
+  return &cb->char_colors[actual_line * cb->width];
+}
+
 void circular_buffer_clear(CircularBuffer *cb) {
   if (!cb)
     return;
@@ -476,6 +580,13 @@ void circular_buffer_clear(CircularBuffer *cb) {
 
   if (cb->line_attrs) {
     memset(cb->line_attrs, 0, cb->lines * sizeof(uint32_t));
+  }
+
+  if (cb->char_colors) {
+    // Reset colors to White
+    for (uint32_t i = 0; i < cb->size; i++) {
+      cb->char_colors[i] = COLOR_WHITE;
+    }
   }
 
   cb->head = 0;
@@ -642,6 +753,10 @@ static void terminal_update_prompt(Terminal *term) {
   term->echo = 1;
   terminal_puts(term, prompt);
   term->echo = old_echo;
+
+  // Resetear colores después del prompt para que el input del usuario sea
+  // normal
+  terminal_reset_colors(term);
 }
 
 static void mounts_callback(const char *mountpoint, const char *fs_name,
@@ -669,6 +784,14 @@ static void terminal_clear_current_line(Terminal *term) {
     char *line = circular_buffer_get_line(&term->buffer, buffer_line);
     if (line) {
       terminal_safe_memset(line, ' ', term->width);
+
+      // Limpiar colores también
+      uint32_t *colors = circular_buffer_get_colors(&term->buffer, buffer_line);
+      if (colors) {
+        for (uint32_t i = 0; i < term->width; i++) {
+          colors[i] = term->bg_color; // O COLOR_WHITE? Mejor el bg para borrar
+        }
+      }
 
       // También limpiar atributos si es necesario
       circular_buffer_set_line_attrs(&term->buffer, buffer_line, 0);
@@ -794,11 +917,30 @@ void terminal_init(Terminal *term) {
   term->cursor_state_changed = 1;
   term->view_offset = 0;
   term->view_start_line = 0;
+  term->view_offset = 0;
+  term->view_start_line = 0;
+
   strcpy(term->cwd, "/home");
+  strcpy(term->prompt_info.username, "user");
 
   // Estadísticas
   term->total_lines_written = 0;
   term->page_faults_avoided = 0;
+
+  // Inicializar atributos de texto
+  term->current_attrs.fg_color = COLOR_WHITE;
+  term->current_attrs.bg_color = COLOR_BLACK;
+
+  // Configurar prompt
+  term->show_time_in_prompt = 0;
+  term->show_user_in_prompt = 1;
+  term->show_path_in_prompt = 1;
+  term->last_exit_code = 0;
+
+  term->last_exit_code = 0;
+
+  // Username ya configurado arriba
+  strcpy(term->prompt_info.hostname, "microkernel");
 
   // Agregar la primera línea al buffer
   circular_buffer_add_line(&term->buffer);
@@ -900,6 +1042,9 @@ void terminal_putchar(Terminal *term, char c) {
     return;
   }
 
+  // IMPORTANTE: Establecer los colores antes de dibujar cada carácter
+  set_colors(term->current_attrs.fg_color, term->current_attrs.bg_color);
+
   if (c == '\n') {
     // Agregar nueva línea al buffer circular
     if (!circular_buffer_add_line(&term->buffer)) {
@@ -944,6 +1089,14 @@ void terminal_putchar(Terminal *term, char c) {
     char *line = circular_buffer_get_line(&term->buffer, current_buffer_line);
     if (line && term->cursor_x < term->width) {
       line[term->cursor_x] = c;
+
+      // Guardar color actual en per-character buffer
+      uint32_t *colors =
+          circular_buffer_get_colors(&term->buffer, current_buffer_line);
+      if (colors) {
+        colors[term->cursor_x] = term->current_attrs.fg_color;
+      }
+
       if (term->cursor_y < term->height) {
         term->dirty_lines[term->cursor_y] = 1;
       }
@@ -956,28 +1109,60 @@ void terminal_putchar(Terminal *term, char c) {
   }
 }
 
+void terminal_reset_colors(Terminal *term) {
+  if (!term)
+    return;
+
+  // Restablecer a colores por defecto
+  term->current_attrs.fg_color = term->default_fg;
+  term->current_attrs.bg_color = term->default_bg;
+  set_colors(term->default_fg, term->default_bg);
+}
+
+void terminal_set_foreground_color(Terminal *term, uint32_t color) {
+  if (!term)
+    return;
+
+  term->current_attrs.fg_color = color;
+  set_colors(color, term->current_attrs.bg_color);
+}
+
+void terminal_set_background_color(Terminal *term, uint32_t color) {
+  if (!term)
+    return;
+
+  term->current_attrs.bg_color = color;
+  set_colors(term->current_attrs.fg_color, color);
+}
+
 void terminal_draw_line(Terminal *term, uint32_t screen_y) {
   if (!term || screen_y >= term->height)
     return;
 
   uint32_t buffer_line = term->view_start_line + screen_y;
 
-  // Borrar línea completa
+  // Borrar línea completa con color de fondo actual
   fill_rect(0, screen_y * g_current_font.height,
             term->width * (g_current_font.width + g_current_font.spacing),
-            g_current_font.height, term->bg_color);
+            g_current_font.height,
+            term->current_attrs.bg_color); // Usar bg_color actual
 
   // Dibujar contenido si la línea existe en el buffer
   if (buffer_line < term->buffer.count) {
     char *line = circular_buffer_get_line(&term->buffer, buffer_line);
-    if (line) {
+    uint32_t *colors = circular_buffer_get_colors(&term->buffer, buffer_line);
+
+    if (line && colors) {
+      // No necesitamos set_colors global aquí porque usamos per-char color
+
       for (uint32_t x = 0; x < term->width; x++) {
         char c = line[x];
         if (c != ' ' && c != '\0') {
           draw_char_with_shadow(
               x * (g_current_font.width + g_current_font.spacing),
-              screen_y * g_current_font.height, c, term->fg_color,
-              term->bg_color, COLOR_DARK_GRAY, 0);
+              screen_y * g_current_font.height, c,
+              colors[x], // Usar color guardado
+              term->current_attrs.bg_color, COLOR_DARK_GRAY, 0);
         }
       }
     }
@@ -988,7 +1173,8 @@ void terminal_draw_line(Terminal *term, uint32_t screen_y) {
       term->cursor_x < term->width) {
     fill_rect(term->cursor_x * (g_current_font.width + g_current_font.spacing),
               screen_y * g_current_font.height, g_current_font.width,
-              g_current_font.height, term->fg_color);
+              g_current_font.height,
+              term->current_attrs.fg_color); // Usar fg_color para cursor
   }
 
   term->dirty_lines[screen_y] = 0;
@@ -999,6 +1185,29 @@ void terminal_puts(Terminal *term, const char *str) {
     return;
 
   while (*str) {
+    // Si encontramos una secuencia de escape ANSI
+    if (*str == 0x1B && *(str + 1) == '[') {
+      // Saltar el escape y el '['
+      str += 2;
+
+      // Procesar la secuencia ANSI
+      char ansi_seq[32] = {0};
+      int i = 0;
+
+      // Copiar hasta encontrar 'm' (final de secuencia color)
+      while (*str && *str != 'm' && i < sizeof(ansi_seq) - 1) {
+        ansi_seq[i++] = *str++;
+      }
+
+      if (*str == 'm') {
+        str++; // Saltar la 'm'
+        // Procesar la secuencia ANSI
+        terminal_process_ansi_sequence(term, ansi_seq);
+      }
+      continue;
+    }
+
+    // Carácter normal
     terminal_putchar(term, *str++);
   }
   terminal_draw(term);
@@ -1264,7 +1473,8 @@ void terminal_handle_key(Terminal *term, int key) {
                 g_current_font.height, term->bg_color);
     }
 
-    terminal_update_prompt(term);
+    // Usar el nuevo prompt mejorado
+    terminal_show_enhanced_prompt(term);
   } else if (key == '\b' || key == 127) { // Backspace or DEL
     if (term->input_pos > 0) {
       term->input_pos--;
@@ -1305,7 +1515,7 @@ void terminal_handle_key(Terminal *term, int key) {
     }
     memset(term->input_buffer, 0, sizeof(term->input_buffer));
     term->in_history_mode = 0;
-  } else if (key >= 32 && key <= 255) { // Printable chars, including Latin-1
+  } else if (key >= 32 && key <= 255) { // Printable chars
     if (term->input_pos < sizeof(term->input_buffer) - 1) {
       if (term->in_history_mode) {
         term->in_history_mode = 0;
@@ -1314,6 +1524,8 @@ void terminal_handle_key(Terminal *term, int key) {
       term->input_buffer[term->input_pos] = '\0';
 
       if (term->echo) {
+        // Usar terminal_putchar normal (no terminal_putchar_with_attrs por
+        // ahora)
         terminal_putchar(term, (char)key);
       }
     }
@@ -1368,6 +1580,95 @@ void terminal_printf(Terminal *term, const char *format, ...) {
   }
 }
 
+void terminal_putchar_with_attrs(Terminal *term, char c) {
+  if (!term)
+    return;
+
+  // Si es el inicio de una secuencia de escape ANSI
+  if (c == 0x1B && term->ansi_parser_state == ANSI_STATE_NORMAL) {
+    term->ansi_parser_state = ANSI_STATE_ESCAPE;
+    term->ansi_buffer_pos = 0;
+    return;
+  }
+
+  // Procesar según el estado del parser ANSI
+  switch (term->ansi_parser_state) {
+  case ANSI_STATE_ESCAPE:
+    if (c == '[') {
+      term->ansi_parser_state = ANSI_STATE_CSI;
+    } else if (c == ']') {
+      term->ansi_parser_state = ANSI_STATE_OSC;
+    } else {
+      // Secuencia desconocida, volver al estado normal
+      term->ansi_parser_state = ANSI_STATE_NORMAL;
+    }
+    break;
+
+  case ANSI_STATE_CSI:
+    if (c >= '0' && c <= '9' || c == ';') {
+      if (term->ansi_buffer_pos < sizeof(term->ansi_buffer) - 1) {
+        term->ansi_buffer[term->ansi_buffer_pos++] = c;
+      }
+    } else if (c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z') {
+      // Fin de secuencia CSI
+      term->ansi_buffer[term->ansi_buffer_pos] = '\0';
+      terminal_process_ansi_sequence(term, term->ansi_buffer);
+      term->ansi_parser_state = ANSI_STATE_NORMAL;
+    } else {
+      // Carácter inválido, resetear
+      term->ansi_parser_state = ANSI_STATE_NORMAL;
+    }
+    break;
+
+  case ANSI_STATE_OSC:
+    // Por simplicidad, ignoramos OSC por ahora
+    if (c == 0x07 || c == 0x1B) { // BEL o ESC
+      term->ansi_parser_state = ANSI_STATE_NORMAL;
+    }
+    break;
+
+  case ANSI_STATE_NORMAL:
+  default:
+    // Carácter normal
+    if (c == '\n') {
+      terminal_putchar(term, c);
+    } else if (c == '\b') {
+      // Manejar backspace
+      if (term->input_pos > 0) {
+        term->input_pos--;
+        term->input_buffer[term->input_pos] = '\0';
+
+        if (term->echo) {
+          terminal_putchar(term, '\b');
+          terminal_putchar(term, ' ');
+          terminal_putchar(term, '\b');
+        }
+      }
+    } else if (c >= 32 && c <= 126) { // Caracteres imprimibles
+      if (term->input_pos < sizeof(term->input_buffer) - 1) {
+        term->input_buffer[term->input_pos++] = c;
+        term->input_buffer[term->input_pos] = '\0';
+
+        if (term->echo) {
+          // Aplicar atributos actuales antes de dibujar
+          uint32_t old_fg = term->fg_color;
+          uint32_t old_bg = term->bg_color;
+
+          term->fg_color = term->current_attrs.fg_color;
+          term->bg_color = term->current_attrs.bg_color;
+
+          terminal_putchar(term, c);
+
+          // Restaurar colores (aunque putchar ya los usa)
+          term->fg_color = old_fg;
+          term->bg_color = old_bg;
+        }
+      }
+    }
+    break;
+  }
+}
+
 void terminal_get_stats(Terminal *term, uint32_t *total_lines,
                         uint32_t *valid_lines, uint32_t *buffer_usage) {
   if (!term)
@@ -1380,6 +1681,320 @@ void terminal_get_stats(Terminal *term, uint32_t *total_lines,
   if (buffer_usage) {
     *buffer_usage = (term->buffer.count * 100) / term->buffer.lines;
   }
+}
+
+// =================================================================
+// FUNCIONES DE MANEJO DE COLORES ANSI
+// =================================================================
+
+void terminal_apply_ansi_code(Terminal *term, int code) {
+  switch (code) {
+  case 0: // Reset
+    term->current_attrs.fg_color = term->default_fg;
+    term->current_attrs.bg_color = term->default_bg;
+    term->current_attrs.bold = 0;
+    term->current_attrs.underline = 0;
+    term->current_attrs.blink = 0;
+    term->current_attrs.reverse = 0;
+    term->current_attrs.conceal = 0;
+    break;
+
+  case 1: // Bold/intense
+    term->current_attrs.bold = 1;
+    break;
+
+  case 2: // Faint
+    term->current_attrs.bold = 0;
+    break;
+
+  case 4: // Underline
+    term->current_attrs.underline = 1;
+    break;
+
+  case 5: // Blink slow
+  case 6: // Blink rapid
+    term->current_attrs.blink = 1;
+    break;
+
+  case 7: // Reverse video
+    term->current_attrs.reverse = 1;
+    break;
+
+  case 8: // Conceal
+    term->current_attrs.conceal = 1;
+    break;
+
+  case 22: // Normal intensity
+    term->current_attrs.bold = 0;
+    break;
+
+  case 24: // Underline off
+    term->current_attrs.underline = 0;
+    break;
+
+  case 25: // Blink off
+    term->current_attrs.blink = 0;
+    break;
+
+  case 27: // Reverse off
+    term->current_attrs.reverse = 0;
+    break;
+
+  case 28: // Reveal (conceal off)
+    term->current_attrs.conceal = 0;
+    break;
+
+  // Colores de primer plano (30-37)
+  case 30:
+  case 31:
+  case 32:
+  case 33:
+  case 34:
+  case 35:
+  case 36:
+  case 37:
+    term->current_attrs.fg_color = ansi_to_color(code - 30, 0);
+    break;
+
+  // Colores de primer plano brillantes (90-97)
+  case 90:
+  case 91:
+  case 92:
+  case 93:
+  case 94:
+  case 95:
+  case 96:
+  case 97:
+    term->current_attrs.fg_color = ansi_to_color(code - 90 + 8, 1);
+    break;
+
+  // Colores de fondo (40-47)
+  case 40:
+  case 41:
+  case 42:
+  case 43:
+  case 44:
+  case 45:
+  case 46:
+  case 47:
+    term->current_attrs.bg_color = ansi_to_color(code - 40, 0);
+    break;
+
+  // Colores de fondo brillantes (100-107)
+  case 100:
+  case 101:
+  case 102:
+  case 103:
+  case 104:
+  case 105:
+  case 106:
+  case 107:
+    term->current_attrs.bg_color = ansi_to_color(code - 100 + 8, 1);
+    break;
+  }
+
+  // Aplicar negrita como color más brillante
+  if (term->current_attrs.bold) {
+    // Para simplificar, hacemos los colores más brillantes
+    if (term->current_attrs.fg_color == COLOR_RED)
+      term->current_attrs.fg_color = COLOR_LIGHT_RED;
+    else if (term->current_attrs.fg_color == COLOR_GREEN)
+      term->current_attrs.fg_color = COLOR_LIGHT_GREEN;
+    else if (term->current_attrs.fg_color == COLOR_BLUE)
+      term->current_attrs.fg_color = COLOR_LIGHT_BLUE;
+    else if (term->current_attrs.fg_color == COLOR_YELLOW)
+      term->current_attrs.fg_color = COLOR_LIGHT_YELLOW;
+    else if (term->current_attrs.fg_color == COLOR_CYAN)
+      term->current_attrs.fg_color = COLOR_LIGHT_CYAN;
+    else if (term->current_attrs.fg_color == COLOR_MAGENTA)
+      term->current_attrs.fg_color = COLOR_LIGHT_MAGENTA;
+    else if (term->current_attrs.fg_color == COLOR_WHITE)
+      term->current_attrs.fg_color = COLOR_WHITE;
+    else if (term->current_attrs.fg_color == COLOR_BLACK)
+      term->current_attrs.fg_color = COLOR_DARK_GRAY;
+  }
+
+  // Aplicar colores invertidos si reverse está activado
+  if (term->current_attrs.reverse) {
+    uint32_t temp = term->current_attrs.fg_color;
+    term->current_attrs.fg_color = term->current_attrs.bg_color;
+    term->current_attrs.bg_color = temp;
+  }
+}
+
+void terminal_process_ansi_sequence(Terminal *term, const char *seq) {
+  int codes[16] = {0};
+  int code_count = 0;
+  int i = 0;
+
+  // Parsear códigos separados por ;
+  while (seq[i] && code_count < 16) {
+    if (seq[i] == ';') {
+      code_count++;
+      i++;
+    } else if (seq[i] >= '0' && seq[i] <= '9') {
+      int parsed = parse_ansi_number(&seq[i], &codes[code_count]);
+      i += parsed;
+    } else {
+      break;
+    }
+  }
+
+  if (code_count == 0 && codes[0] == 0) {
+    codes[0] = 0; // Reset por defecto
+    code_count = 1;
+  } else {
+    code_count++; // Ajustar para el último código
+  }
+
+  // Aplicar códigos
+  for (int j = 0; j < code_count; j++) {
+    terminal_apply_ansi_code(term, codes[j]);
+  }
+}
+
+// =================================================================
+// FUNCIONES DE PROMPT MEJORADO
+// =================================================================
+
+void terminal_update_prompt_info(Terminal *term) {
+  // Actualizar información del sistema para el prompt
+  strncpy(term->prompt_info.current_dir, term->cwd, VFS_PATH_MAX);
+
+  // Determinar si somos root (simplificado)
+  term->prompt_info.is_root = (strcmp(term->cwd, "/") == 0) ? 1 : 0;
+}
+
+const char *terminal_get_prompt_color(Terminal *term, uint8_t is_error) {
+  if (is_error && term->last_exit_code != 0) {
+    return "\033[31m"; // Rojo para error
+  } else if (term->prompt_info.is_root) {
+    return "\033[31m"; // Rojo para root
+  } else {
+    return "\033[32m"; // Verde para usuario normal
+  }
+}
+
+void terminal_render_prompt(Terminal *term) {
+  char prompt[256] = {0};
+  char time_str[32] = {0};
+
+  // Si tenemos información de tiempo y está habilitado
+  if (term->show_time_in_prompt) {
+    // Aquí podrías obtener la hora real del sistema
+    snprintf(time_str, sizeof(time_str), "%u ", ticks_since_boot / 100);
+    strncat(prompt, time_str, sizeof(prompt) - strlen(prompt) - 1);
+  }
+
+  // Usuario@hostname (simplificado)
+  if (term->show_user_in_prompt) {
+    strncat(prompt, "user@microkernel", sizeof(prompt) - strlen(prompt) - 1);
+  }
+
+  // Directorio actual
+  if (term->show_path_in_prompt) {
+    // Acortar path largo
+    char display_path[VFS_PATH_MAX];
+    char *home_pos = strstr(term->cwd, "/home");
+
+    if (home_pos && strlen(term->cwd) > 20) {
+      // Mostrar ~ para directorio home
+      snprintf(display_path, sizeof(display_path), "~%s", home_pos + 5);
+    } else {
+      strncpy(display_path, term->cwd, sizeof(display_path));
+    }
+
+    // Limitar longitud
+    if (strlen(display_path) > 30) {
+      char shortened[40];
+      snprintf(shortened, sizeof(shortened), "...%s",
+               display_path + strlen(display_path) - 27);
+      strncpy(display_path, shortened, sizeof(display_path));
+    }
+
+    if (strlen(prompt) > 0) {
+      strncat(prompt, ":", sizeof(prompt) - strlen(prompt) - 1);
+    }
+    strncat(prompt, display_path, sizeof(prompt) - strlen(prompt) - 1);
+  }
+
+  // Indicador de root/error
+  if (term->last_exit_code != 0) {
+    strncat(prompt, " ✗", sizeof(prompt) - strlen(prompt) - 1);
+  } else if (term->prompt_info.is_root) {
+    strncat(prompt, " #", sizeof(prompt) - strlen(prompt) - 1);
+  } else {
+    strncat(prompt, " $", sizeof(prompt) - strlen(prompt) - 1);
+  }
+
+  // Espacio final
+  strncat(prompt, " ", sizeof(prompt) - strlen(prompt) - 1);
+
+  // Guardar prompt renderizado
+  strncpy(term->prompt_buffer, prompt, sizeof(term->prompt_buffer));
+  term->prompt_length = strlen(term->prompt_buffer); // ¡Esto estaba faltando!
+}
+
+void terminal_show_enhanced_prompt(Terminal *term) {
+  if (!term)
+    return;
+
+  // Construir prompt
+  char prompt[256] = {0};
+
+  // Usuario@hostname
+  if (term->show_user_in_prompt) {
+    strncat(prompt, "user@microkernel", sizeof(prompt) - strlen(prompt) - 1);
+  }
+
+  // Directorio actual
+  if (term->show_path_in_prompt) {
+    char display_path[VFS_PATH_MAX];
+    strncpy(display_path, term->cwd, sizeof(display_path));
+
+    // Acortar si es muy largo
+    if (strlen(display_path) > 30) {
+      char shortened[40];
+      snprintf(shortened, sizeof(shortened), "...%s",
+               display_path + strlen(display_path) - 27);
+      strncpy(display_path, shortened, sizeof(display_path));
+    }
+
+    if (strlen(prompt) > 0) {
+      strncat(prompt, ":", sizeof(prompt) - strlen(prompt) - 1);
+    }
+    strncat(prompt, display_path, sizeof(prompt) - strlen(prompt) - 1);
+  }
+
+  // Indicador
+  if (term->last_exit_code != 0) {
+    strncat(prompt, " ✗ ", sizeof(prompt) - strlen(prompt) - 1);
+  } else if (strcmp(term->cwd, "/") == 0) {
+    strncat(prompt, " # ", sizeof(prompt) - strlen(prompt) - 1);
+  } else {
+    strncat(prompt, " $ ", sizeof(prompt) - strlen(prompt) - 1);
+  }
+
+  // Guardar longitud
+  term->prompt_length = strlen(prompt);
+
+  // Aplicar color basado en el estado - ¡NO RESTAURAR DESPUÉS!
+  if (term->last_exit_code != 0) {
+    // Rojo para error
+    terminal_set_foreground_color(term, COLOR_RED);
+  } else if (strcmp(term->cwd, "/") == 0) {
+    // Rojo para root
+    terminal_set_foreground_color(term, COLOR_RED);
+  } else {
+    // Verde para usuario normal
+    terminal_set_foreground_color(term, COLOR_GREEN);
+  }
+
+  // Mostrar prompt
+  terminal_puts(term, prompt);
+
+  // Restaurar colores para la entrada del usuario
+  terminal_reset_colors(term);
 }
 
 // =================================================================
@@ -1545,6 +2160,304 @@ void cmd_edit(const char *args) {
   // Restaurar terminal
   terminal_clear(&main_terminal);
   terminal_printf(&main_terminal, "Editor cerrado.\r\n");
+}
+
+// Función que se ejecutará en modo usuario
+static void test_user_program(void *arg) {
+  (void)arg; // No usar el argumento por ahora
+
+  // Esta función se ejecuta en Ring 3
+  // Solo puede usar syscalls para interactuar
+
+  const char *msg = "Hello from user mode via syscall!\n";
+
+  // Syscall WRITE (INT 0x80)
+  __asm__ volatile("movl $1, %%eax\n" // SYS_WRITE = 1
+                   "movl $1, %%ebx\n" // fd = STDOUT
+                   "movl %0, %%ecx\n" // buffer
+                   "movl %1, %%edx\n" // length
+                   "int $0x80\n"
+                   :
+                   : "r"(msg), "r"(32)
+                   : "eax", "ebx", "ecx", "edx", "memory");
+
+  // Syscall EXIT
+  __asm__ volatile("movl $0, %%eax\n"  // SYS_EXIT = 0
+                   "movl $42, %%ebx\n" // exit code
+                   "int $0x80\n"
+                   :
+                   :
+                   : "eax", "ebx", "memory");
+
+  // Nunca debería llegar aquí
+  while (1)
+    ;
+}
+
+// Añade estas funciones si no las tienes
+
+void verify_page_permissions(uint32_t vaddr) {
+  uint32_t page_start = vaddr & ~0xFFF;
+  uint32_t pd_index = page_start >> 22;
+  uint32_t pt_index = (page_start >> 12) & 0x3FF;
+
+  terminal_printf(&main_terminal, "Checking page 0x%08x...\r\n", page_start);
+
+  if (!(page_directory[pd_index] & PAGE_PRESENT)) {
+    terminal_puts(&main_terminal, "  Page directory entry not present\r\n");
+    return;
+  }
+
+  if (page_directory[pd_index] & PAGE_4MB) {
+    terminal_puts(&main_terminal, "  4MB page\r\n");
+    uint32_t entry = page_directory[pd_index];
+    terminal_printf(&main_terminal,
+                    "  Flags: 0x%03x\r\n"
+                    "    Present: %u\r\n"
+                    "    RW: %u\r\n"
+                    "    User: %u\r\n",
+                    entry & 0xFFF, (entry & PAGE_PRESENT) ? 1 : 0,
+                    (entry & PAGE_RW) ? 1 : 0, (entry & PAGE_USER) ? 1 : 0);
+    return;
+  }
+
+  uint32_t pt_entry = page_tables[pd_index][pt_index];
+
+  terminal_printf(&main_terminal,
+                  "  Page table entry: 0x%08x\r\n"
+                  "  Flags: 0x%03x\r\n"
+                  "    Present: %u\r\n"
+                  "    RW: %u\r\n"
+                  "    User: %u\r\n",
+                  pt_entry, pt_entry & 0xFFF, (pt_entry & PAGE_PRESENT) ? 1 : 0,
+                  (pt_entry & PAGE_RW) ? 1 : 0, (pt_entry & PAGE_USER) ? 1 : 0);
+}
+
+void verify_user_segments(void) {
+  terminal_puts(&main_terminal, "\r\n=== User Segment Verification ===\r\n");
+
+  extern struct gdt_entry gdt[6];
+
+  // Entry 3 (User CS)
+  uint8_t user_cs_type = gdt[3].access & 0x1F;
+  uint8_t user_cs_dpl = (gdt[3].access >> 5) & 3;
+
+  terminal_printf(&main_terminal,
+                  "  Entry 3 (User CS): Type=0x%02x, DPL=%u %s\r\n",
+                  user_cs_type, user_cs_dpl,
+                  (user_cs_type == 0xFA && user_cs_dpl == 3) ? "✓" : "✗");
+
+  // Entry 4 (User DS)
+  uint8_t user_ds_type = gdt[4].access & 0x1F;
+  uint8_t user_ds_dpl = (gdt[4].access >> 5) & 3;
+
+  terminal_printf(&main_terminal,
+                  "  Entry 4 (User DS): Type=0x%02x, DPL=%u %s\r\n",
+                  user_ds_type, user_ds_dpl,
+                  (user_ds_type == 0xF2 && user_ds_dpl == 3) ? "✓" : "✗");
+}
+
+void test_user_mode_simple(void);
+// Comando para probar modo usuario
+void cmd_test_usermode(void) {
+  terminal_puts(&main_terminal, "\r\n=== User Mode Test Suite ===\r\n");
+
+  // 1. Primero verificar configuración de segmentos
+  verify_user_segments();
+
+  // 2. Dirección de prueba
+  uint32_t test_addr = 0x200000;
+  uint32_t page_start = test_addr & ~0xFFF;
+
+  terminal_printf(&main_terminal, "\r\n--- Page Mapping Check ---\r\n");
+  terminal_printf(&main_terminal, "Virtual address: 0x%08x\r\n", test_addr);
+  terminal_printf(&main_terminal, "Page start:      0x%08x\r\n", page_start);
+
+  // 3. Verificar mapeo
+  uint32_t phys = mmu_virtual_to_physical(test_addr);
+  terminal_printf(&main_terminal, "Current mapping: 0x%08x -> 0x%08x\r\n",
+                  test_addr, phys);
+
+  if (!phys) {
+    terminal_puts(&main_terminal, "Page not mapped! Mapping now...\r\n");
+
+    if (!mmu_map_page(page_start, page_start,
+                      PAGE_PRESENT | PAGE_RW | PAGE_USER)) {
+      terminal_puts(&main_terminal, "ERROR: Failed to map page!\r\n");
+      return;
+    }
+
+    terminal_puts(&main_terminal, "Page mapped successfully.\r\n");
+
+    // Verificar nuevamente
+    phys = mmu_virtual_to_physical(test_addr);
+    terminal_printf(&main_terminal, "New mapping: 0x%08x -> 0x%08x\r\n",
+                    test_addr, phys);
+  }
+
+  // 4. Verificar permisos específicos
+  terminal_puts(&main_terminal, "\r\n--- Page Permissions Check ---\r\n");
+  verify_page_permissions(test_addr);
+
+  // 5. Ejecutar prueba
+  terminal_puts(&main_terminal, "\r\n--- Starting User Mode Test ---\r\n");
+  test_user_mode_simple();
+
+  terminal_puts(&main_terminal, "\r\n=== Test Suite Complete ===\r\n");
+}
+
+__attribute__((section(".user_code"))) __attribute__((aligned(4096)))
+__attribute__((used)) static const uint8_t user_test_program[] = {
+    // ==== CÓDIGO SIMPLE (25 bytes) ====
+
+    // push ebp
+    0x55, // 0x00
+
+    // mov ebp, esp
+    0x89, 0xE5, // 0x01-0x02
+
+    // WRITE syscall (manejo de argumentos en registros)
+    0xB8, 0x01, 0x00, 0x00, 0x00, // 0x03: mov eax, 1 (SYS_WRITE)
+    0xBB, 0x01, 0x00, 0x00, 0x00, // 0x08: mov ebx, 1 (stdout)
+    0xB9, 0x00, 0x00, 0x00, 0x00, // 0x0D: mov ecx, msg (AJUSTAR)
+    0xBA, 0x1E, 0x00, 0x00, 0x00, // 0x12: mov edx, 30 (length)
+    0xCD, 0x80,                   // 0x17: int 0x80
+
+    // EXIT syscall
+    0xB8, 0x00, 0x00, 0x00, 0x00, // 0x19: mov eax, 0 (SYS_EXIT)
+    0xBB, 0x2A, 0x00, 0x00, 0x00, // 0x1E: mov ebx, 42 (exit code)
+    0xCD, 0x80,                   // 0x23: int 0x80
+
+    // ==== DATOS (mensaje) ====
+    // Comienza en offset 0x25 (37 bytes desde el inicio)
+    'H', 'e', 'l', 'l', 'o', ' ', 'f', 'r', 'o', 'm', ' ', 'u', 's', 'e', 'r',
+    ' ', 's', 'p', 'a', 'c', 'e', '!', '\n',
+    0x00 // null terminator
+};
+
+void test_user_mode_simple(void) {
+  terminal_puts(&main_terminal, "\r\n=== User Mode Simple Test ===\r\n");
+
+  // 1. Verificar segmentos actuales
+  uint16_t cs, ds;
+  __asm__ volatile("mov %%cs, %0\nmov %%ds, %1" : "=r"(cs), "=r"(ds));
+
+  terminal_printf(
+      &main_terminal,
+      "Current segments: CS=0x%04x (RPL=%u), DS=0x%04x (RPL=%u)\r\n", cs,
+      cs & 3, ds, ds & 3);
+
+  // 2. Dirección para código de usuario (DEBE estar fuera del kernel)
+  uint32_t user_code_addr = 0x200000; // 2MB
+  uint32_t code_page = user_code_addr & ~0xFFF;
+
+  // 3. Programa de usuario ULTRA simple (solo syscall EXIT)
+  static const uint8_t simple_user_code[] = {
+      0xB8, 0x00, 0x00, 0x00, 0x00, // mov eax, 0 (SYS_EXIT)
+      0xBB, 0x2A, 0x00, 0x00, 0x00, // mov ebx, 42 (exit code)
+      0xCD, 0x80,                   // int 0x80
+      0xEB, 0xFE                    // jmp $ (por si acaso)
+  };
+
+  terminal_printf(&main_terminal,
+                  "Preparing user code at 0x%08x (page 0x%08x)...\r\n",
+                  user_code_addr, code_page);
+
+  // 4. **CRÍTICO**: Mapear página CON verificación
+  bool page_ready = false;
+
+  if (!mmu_is_mapped(code_page)) {
+    terminal_puts(&main_terminal, "Page not mapped, mapping now...\r\n");
+
+    if (!mmu_map_page(code_page, code_page,
+                      PAGE_PRESENT | PAGE_RW | PAGE_USER)) {
+      terminal_puts(&main_terminal, "ERROR: mmu_map_page failed!\r\n");
+      return;
+    }
+
+    page_ready = true;
+  } else {
+    terminal_puts(&main_terminal, "Page already mapped, verifying...\r\n");
+
+    // Verificar flags usando la función segura
+    uint32_t flags = mmu_get_page_flags(code_page);
+    terminal_printf(&main_terminal, "  Current flags: 0x%03x\r\n", flags);
+
+    if (!(flags & PAGE_USER)) {
+      terminal_puts(&main_terminal, "  Missing PAGE_USER, fixing...\r\n");
+
+      if (!mmu_set_page_user(code_page)) {
+        terminal_puts(&main_terminal, "ERROR: Failed to set PAGE_USER!\r\n");
+        return;
+      }
+
+      terminal_puts(&main_terminal, "  PAGE_USER flag added.\r\n");
+    }
+
+    page_ready = true;
+  }
+
+  if (!page_ready) {
+    terminal_puts(&main_terminal, "ERROR: Page not ready for user mode!\r\n");
+    return;
+  }
+
+  // 5. Verificar flags finales
+  uint32_t final_flags = mmu_get_page_flags(code_page);
+  terminal_printf(
+      &main_terminal, "Final page flags: 0x%03x (P=%u, RW=%u, U=%u)\r\n",
+      final_flags, (final_flags & PAGE_PRESENT) ? 1 : 0,
+      (final_flags & PAGE_RW) ? 1 : 0, (final_flags & PAGE_USER) ? 1 : 0);
+
+  if (!(final_flags & PAGE_USER)) {
+    terminal_puts(&main_terminal,
+                  "ERROR: PAGE_USER still not set after fix!\r\n");
+    return;
+  }
+
+  // 6. Copiar código
+  terminal_puts(&main_terminal, "Copying user code...\r\n");
+  uint8_t *dest = (uint8_t *)user_code_addr;
+  memcpy(dest, simple_user_code, sizeof(simple_user_code));
+
+  // 7. Verificar copia
+  bool copy_ok = true;
+  for (size_t i = 0; i < sizeof(simple_user_code); i++) {
+    if (dest[i] != simple_user_code[i]) {
+      terminal_printf(
+          &main_terminal,
+          "ERROR: Byte %u mismatch: expected 0x%02x, got 0x%02x\r\n", i,
+          simple_user_code[i], dest[i]);
+      copy_ok = false;
+      break;
+    }
+  }
+
+  if (!copy_ok) {
+    terminal_puts(&main_terminal, "Code verification failed!\r\n");
+    return;
+  }
+
+  terminal_puts(&main_terminal, "Code copied and verified.\r\n");
+
+  // 8. Crear tarea de usuario
+  terminal_printf(&main_terminal, "Creating user task at 0x%08x...\r\n",
+                  user_code_addr);
+
+  task_t *user_task = task_create_user("simple_user", (void *)user_code_addr,
+                                       NULL, TASK_PRIORITY_NORMAL);
+
+  if (user_task) {
+    terminal_printf(&main_terminal,
+                    "User task created successfully!\r\n"
+                    "  Task ID: %u\r\n"
+                    "  Will execute at: CS:0x%1B:EIP:0x%08x\r\n"
+                    "  With stack: SS:0x23:ESP=0x%08x\r\n\r\n",
+                    user_task->task_id, user_code_addr,
+                    (uint32_t)user_task->user_stack_top);
+  } else {
+    terminal_puts(&main_terminal, "Failed to create user task!\r\n");
+  }
 }
 
 // Tarea dedicada al editor (opcional, para ejecutar en background)
@@ -1850,6 +2763,8 @@ void terminal_execute(Terminal *term, const char *cmd) {
     terminal_puts(term, "setbg   - Set background color (hex)\r\n");
     terminal_puts(term, "heap    - Show heap memory status\r\n");
     terminal_puts(term, "mounts  - Show current FS mounts\r\n");
+    terminal_puts(term, "whoami  - Show current user\r\n");
+    terminal_puts(term, "su      - Switch user\r\n");
   } else if (strcmp(command, "clear") == 0) {
     terminal_clear(term);
   }
@@ -1891,6 +2806,8 @@ void terminal_execute(Terminal *term, const char *cmd) {
     terminal_clear(term);
   } else if (strcmp(cmd, "lspci") == 0) {
     cmd_lspci();
+  } else if (strcmp(cmd, "usert") == 0) {
+    cmd_test_usermode();
   } else if (strcmp(cmd, "acpi") == 0) {
     cmd_acpi_info();
   } else if (strcmp(cmd, "reboot") == 0) {
@@ -2420,6 +3337,28 @@ void terminal_execute(Terminal *term, const char *cmd) {
     }
 
     terminal_printf(term, "umount: Successfully unmounted %s\r\n", normalized);
+  } else if (strcmp(command, "umount") == 0) {
+    if (args[0] == '\0') {
+      terminal_puts(term, "Error: Usage: umount <mountpoint>\r\n");
+      return;
+    }
+
+    // Normalizar el mountpoint
+    char normalized[VFS_PATH_MAX];
+    if (vfs_normalize_path(args, normalized, VFS_PATH_MAX) != VFS_OK) {
+      terminal_printf(term, "umount: Invalid mountpoint path %s\r\n", args);
+      return;
+    }
+
+    // Llamar directamente a vfs_unmount (ya maneja la búsqueda)
+    int ret = vfs_unmount(normalized);
+    if (ret != VFS_OK) {
+      terminal_printf(term, "umount: Failed to unmount %s (error %d)\r\n",
+                      normalized, ret);
+      return;
+    }
+
+    terminal_printf(term, "umount: Successfully unmounted %s\r\n", normalized);
   }
   if (strcmp(command, "part") == 0) {
     handle_part_command(term, argc, argv);
@@ -2552,8 +3491,51 @@ void terminal_execute(Terminal *term, const char *cmd) {
       }
     }
   } else {
-    char msg[256];
-    snprintf(msg, sizeof(msg), "Command not found: %s\r\n", command);
-    terminal_puts(term, msg);
+    // Intento de buscar en el PATH
+    bool found = false;
+
+    // Si tiene /, es un camino explícito
+    if (strchr(command, '/')) {
+      terminal_printf(
+          term, "bash: %s: command not found (execution not implemented)\r\n",
+          command);
+      found = true;
+    } else {
+      // Buscar en PATH
+      char path_copy[512];
+      strncpy(path_copy, term->path, 511);
+      char *saveptr_path;
+      char *dir = strtok_r(path_copy, ":", &saveptr_path);
+
+      while (dir) {
+        char full_path[VFS_PATH_MAX];
+        snprintf(full_path, VFS_PATH_MAX, "%s/%s", dir, command);
+
+        // Verificar si existe y es un archivo
+        // Nota: resolve_path_to_vnode puede fallar si el directorio no está
+        // montado o no existe Para simplificar, asumimos que funciona para
+        // paths normales En un sistema real usaríamos stat()
+
+        /* Implementación futura de chequeo:
+       vfs_node_t* node = resolve_path_to_vnode(NULL, full_path);
+       if (node) {
+           if (node->type == VFS_NODE_FILE) {
+              terminal_printf(term, "bash: %s: execution not implemented yet
+       (found at %s)\r\n", command, full_path); found = true;
+           }
+           if (node->ops && node->ops->release) node->ops->release(node);
+           else if (node->refcount > 0) node->refcount--;
+
+           if (found) break;
+       }
+       */
+
+        dir = strtok_r(NULL, ":", &saveptr_path);
+      }
+    }
+
+    if (!found) {
+      terminal_printf(term, "Unknown command: %s\r\n", command);
+    }
   }
 }

@@ -18,7 +18,28 @@
 #define COLOR_DARK_GRAY     0x404040
 #define COLOR_ORANGE        0xFFA500
 #define COLOR_TRANSPARENT   0xFFFFFFFF
-#define COLOR_DARK_BLUE     0x000080
+#define COLOR_LIGHT_RED     0xFF6666
+#define COLOR_LIGHT_GREEN   0x66FF66
+#define COLOR_LIGHT_BLUE    0x6666FF
+#define COLOR_LIGHT_YELLOW  0xFFFF66
+#define COLOR_LIGHT_CYAN    0x66FFFF
+#define COLOR_LIGHT_MAGENTA 0xFF66FF
+#define COLOR_DARK_RED      0x660000
+#define COLOR_DARK_GREEN    0x006600
+#define COLOR_DARK_BLUE     0x000066
+#define COLOR_DARK_YELLOW   0x666600
+#define COLOR_DARK_CYAN     0x006666
+#define COLOR_DARK_MAGENTA  0x660066
+#define COLOR_BROWN         0x996633
+#define COLOR_OLIVE         0x808000
+#define COLOR_PURPLE        0x800080
+#define COLOR_TEAL          0x008080
+#define COLOR_NAVY          0x000080
+#define COLOR_MAROON        0x800000
+#define COLOR_LIME          0x00FF00
+#define COLOR_AQUA          0x00FFFF
+#define COLOR_FUCHSIA       0xFF00FF
+#define COLOR_SILVER        0xC0C0C0
 
 // Estructura para píxeles en formato 24bpp
 typedef struct {

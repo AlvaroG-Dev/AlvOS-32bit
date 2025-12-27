@@ -28,6 +28,7 @@
 #include "terminal.h"
 #include "tmpfs.h"
 #include "vfs.h"
+#include "syscalls.h"
 
 // Global definition of BootInfo.
 BootInfo boot_info;
@@ -476,6 +477,7 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
   boot_log_start("Auto-mounting partitions");
   partition_manager_auto_mount_all();
   boot_log_ok();
+  syscall_init();
   // 15. Inicializar mouse
   // boot_log_start("Initializing PS/2 mouse");
   // mouse_init(g_screen_width, g_screen_height);

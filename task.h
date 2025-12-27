@@ -30,6 +30,10 @@ typedef enum {
 #define MAX_TASKS           32
 #define TASK_NAME_MAX       32
 
+// Flags para tareas
+#define TASK_FLAG_USER_MODE    0x00000001  // Ejecuta en modo usuario (Ring 3)
+#define TASK_FLAG_USER_STACK   0x00000002  // Tiene stack de usuario asignado
+
 // Contexto de CPU para cambio de tareas
 typedef struct {
     // Registros de propósito general
@@ -64,9 +68,13 @@ typedef struct task {
     void* user_stack_top;
     size_t user_stack_size;
     
-    // **NUEVO: Memoria para código de usuario**
+    // **NUEVO: Flags para la tarea**
+    uint32_t flags;                      // Flags de la tarea
+    
+    // Información de usuario
     void* user_code_base;
     size_t user_code_size;
+    void* user_entry_point;              // <-- NUEVO: Punto de entrada de usuario
     
     // Información de tiempo
     uint32_t time_slice;                 // Quantum de tiempo asignado
@@ -78,7 +86,7 @@ typedef struct task {
     struct task* prev;                   // Tarea anterior
     
     // Función de entrada y datos
-    void (*entry_point)(void*);          // Función principal de la tarea
+    void (*entry_point)(void*);          // Función principal de la tarea (kernel wrapper)
     void* arg;                          // Argumento para la función
     
     // Estadísticas
@@ -133,6 +141,11 @@ void stress_test_task(void* arg);
 static bool validate_task_context(task_t* task);
 void cleanup_task(void* arg);
 
+// USER MODE
+task_t* task_create_user(const char* name, void* user_code_addr,
+                        void* arg, task_priority_t priority);
+void task_setup_user_mode(task_t* task, void (*entry_point)(void*), void* arg,
+                         void* user_stack);
 // Macros útiles
 #define CURRENT_TASK() task_current()
 #define TASK_ID() (task_current() ? task_current()->task_id : 0)
