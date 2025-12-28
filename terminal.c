@@ -9,9 +9,7 @@
 #include "driver_system.h"
 #include "fat32.h"
 #include "gdt.h"
-#include "idt.h"
 #include "installer.h"
-#include "io.h"
 #include "irq.h"
 #include "kernel.h"
 #include "log.h"
@@ -22,6 +20,7 @@
 #include "partition.h"
 #include "partition_manager.h"
 #include "pci.h"
+#include "pmm.h"
 #include "sata_disk.h"
 #include "serial.h"
 #include "string.h"
@@ -2290,7 +2289,7 @@ void test_user_mode_simple(void) {
   uint32_t user_code_addr = 0x300000; // 2MB
   uint32_t code_page = user_code_addr & ~0xFFF;
 
-  // 3. Programa de usuario ULTRA simple (solo syscall EXIT)
+  // 3. Programa de usuario ULTRA simple
   static const uint8_t simple_user_code[] = {
       // ===== Obtener dirección base =====
       0xE8, 0x00, 0x00, 0x00, 0x00, // call next
@@ -2316,6 +2315,10 @@ void test_user_mode_simple(void) {
 
       // ===== SYS_GETPID =====
       0xB8, 0x03, 0x00, 0x00, 0x00, // mov eax, 3
+      0xCD, 0x80,                   // int 0x80
+
+      // ===== Imprimir tiempo =====
+      0xB8, 0x06, 0x00, 0x00, 0x00, // mov eax, 6
       0xCD, 0x80,                   // int 0x80
 
       // ===== SYS_EXIT =====
@@ -2724,6 +2727,123 @@ void terminal_execute(Terminal *term, const char *cmd) {
     }
   }
 
+  // Comandos de memoria visuales
+  else if (strcmp(command, "free") == 0) {
+    uint32_t total_p = pmm_get_total_pages();
+    uint32_t free_p = pmm_get_free_pages();
+    uint32_t used_p = total_p - free_p;
+
+    uint32_t total_mb = (total_p * 4096) / (1024 * 1024);
+    uint32_t used_mb = (used_p * 4096) / (1024 * 1024);
+
+    terminal_printf(term, "\x1B[1;36mMemory Status\x1B[0m\r\n");
+    terminal_printf(term, "Physical: ");
+
+    // Draw Bar
+    int width = 30;
+    int filled = (used_p * width) / total_p;
+    terminal_puts(term, "\x1B[1;37m[");
+    for (int i = 0; i < filled; i++)
+      terminal_puts(term, "\x1B[42m ");
+    terminal_puts(term, "\x1B[0m");
+    for (int i = filled; i < width; i++)
+      terminal_puts(term, "\x1B[1;30m.");
+    terminal_puts(term, "\x1B[0;37m] ");
+
+    terminal_printf(term, "%u%% (%u/%u MB)\x1B[0m\r\n",
+                    (used_p * 100) / total_p, used_mb, total_mb);
+
+    // Heap stats
+    heap_info_t h = heap_stats();
+    uint32_t h_total = (h.used + h.free) / 1024;
+    uint32_t h_used = h.used / 1024;
+
+    terminal_printf(term, "K-Heap:   ");
+    filled = (h.used * width) / (h.used + h.free);
+    terminal_puts(term, "\x1B[1;37m[");
+    for (int i = 0; i < filled; i++)
+      terminal_puts(term, "\x1B[44m#");
+    terminal_puts(term, "\x1B[0m");
+    for (int i = filled; i < width; i++)
+      terminal_puts(term, "\x1B[1;30m.");
+    terminal_puts(term, "\x1B[0;37m] ");
+    terminal_printf(term, "%u%% (%u/%u KB)\x1B[0m\r\n",
+                    (h.used * 100) / (h.used + h.free), h_used, h_total);
+  } else if (strcmp(command, "mmap") == 0) {
+    terminal_printf(
+        term, "\x1B[1;33mVirtual Address Space Overview (4GB):\x1B[0m\r\n");
+    terminal_puts(term, " 0GB             1GB             2GB             3GB  "
+                        "           4GB\r\n");
+    terminal_puts(term, " |---------------|---------------|---------------|----"
+                        "-----------|\r\n");
+
+    extern uint32_t page_directory[1024];
+    terminal_puts(term, "[");
+    for (int i = 0; i < 64; i++) {
+      // Cada bloque representa 64MB (16 entradas del PD)
+      bool kernel = false;
+      bool user = false;
+      bool mapped = false;
+
+      for (int j = 0; j < 16; j++) {
+        uint32_t entry = page_directory[i * 16 + j];
+        if (entry & 0x01) {
+          mapped = true;
+          if (entry & 0x04)
+            user = true;
+          else
+            kernel = true;
+        }
+      }
+
+      if (kernel && user)
+        terminal_puts(term, "\x1B[45m#"); // Mix
+      else if (kernel)
+        terminal_puts(term, "\x1B[41mK"); // Kernel (Red)
+      else if (user)
+        terminal_puts(term, "\x1B[44mU"); // User (Blue)
+      else if (mapped)
+        terminal_puts(term, "\x1B[42mM"); // Mapped other
+      else
+        terminal_puts(term, "\x1B[0m."); // Empty
+    }
+    terminal_puts(term, "\x1B[0m]\r\n");
+    terminal_puts(
+        term, " Legend: \x1B[41m K \x1B[0m Kernel  \x1B[44m U \x1B[0m User  "
+              "\x1B[45m # \x1B[0m Mixed  \x1B[42m M \x1B[0m Mapped\r\n\r\n");
+
+    terminal_printf(term, "\x1B[1;36mMapped Regions (4MB Chunks):\x1B[0m\r\n");
+    terminal_printf(term, "\x1B[1;37m%-23s %-10s %-12s %-10s\x1B[0m\r\n",
+                    "Virt Address Range", "Flags", "Mode", "Type");
+    terminal_printf(
+        term,
+        "------------------------------------------------------------\r\n");
+
+    for (int i = 0; i < 1024; i++) {
+      uint32_t entry = page_directory[i];
+      if (entry & 0x01) { // Present
+        uint32_t start = i << 22;
+        uint32_t end = start + (4 * 1024 * 1024) - 1;
+
+        bool is_user = (entry & 0x04) != 0;
+        const char *color = is_user ? "\x1B[1;34m" : "\x1B[1;31m";
+
+        // Flags con colores individuales
+        char f_p = (entry & 0x01) ? 'P' : '-';
+        char f_w = (entry & 0x02) ? 'W' : '-';
+        char f_u = (entry & 0x04) ? 'U' : '-';
+
+        const char *mode_str = is_user ? "User Mode" : "Kernel Only";
+        const char *type_str = (entry & 0x80) ? "4MB Page" : "Table";
+
+        terminal_printf(term,
+                        "%s0x%08x-0x%08x  \x1B[1;32m[%c %c %c]  "
+                        "\x1B[0;37m%-12s %-10s\x1B[0m\r\n",
+                        color, start, end, f_p, f_w, f_u, mode_str, type_str);
+      }
+    }
+  }
+
   // Comandos básicos
   if (strcmp(command, "help") == 0) {
     terminal_puts(term, "Available commands:\r\n");
@@ -2732,6 +2852,8 @@ void terminal_execute(Terminal *term, const char *cmd) {
     terminal_puts(term, "echo    - Print arguments\r\n");
     terminal_puts(term, "setfg   - Set foreground color (hex)\r\n");
     terminal_puts(term, "setbg   - Set background color (hex)\r\n");
+    terminal_puts(term, "free    - Show memory usage (visual bars)\r\n");
+    terminal_puts(term, "mmap    - Show virtual memory map\r\n");
     terminal_puts(term, "heap    - Show heap memory status\r\n");
     terminal_puts(term, "mounts  - Show current FS mounts\r\n");
     terminal_puts(term, "whoami  - Show current user\r\n");

@@ -21,17 +21,22 @@
 #include "partition.h"
 #include "partition_manager.h"
 #include "pci.h"
+#include "pmm.h"
 #include "sata_disk.h"
 #include "serial.h"
+#include "syscalls.h"
 #include "task.h"
 #include "task_utils.h"
 #include "terminal.h"
 #include "tmpfs.h"
 #include "vfs.h"
-#include "syscalls.h"
 
 // Global definition of BootInfo.
 BootInfo boot_info;
+
+// Definición global del heap del kernel (16MB)
+uint8_t kernel_heap[STATIC_HEAP_SIZE] __attribute__((aligned(PAGE_SIZE)));
+
 uint32_t *g_framebuffer = NULL;
 uint32_t g_pitch_pixels = 0;
 uint32_t g_screen_width = 0;
@@ -239,8 +244,7 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
   g_screen_height = height;
   // 1. Inicializar memoria
   if (boot_info.mmap) {
-    pmem_init(boot_info.mmap);
-    exclude_kernel_heap_from_regions(kernel_heap, STATIC_HEAP_SIZE);
+    pmm_init(boot_info.mmap);
     boot_log_ok();
   } else {
     boot_log_error();
@@ -251,6 +255,10 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
   // ============================================
   size_t heap_size = STATIC_HEAP_SIZE;
   heap_init(kernel_heap, heap_size);
+  pmm_exclude_kernel_heap(kernel_heap, heap_size);
+  boot_log_start("Initializing Virtual Memory Manager");
+  vmm_init();
+  boot_log_ok();
   // Inicializar framebuffer básico
   fb_init(g_framebuffer, width, height, pitch, bpp);
   terminal_init(&main_terminal);

@@ -44,6 +44,11 @@ typedef struct {
 
 // Prototipos de funciones
 void mmu_init(void);
+void mmu_transition_to_higher_half(void);
+void mmu_init_higher_half(void);
+bool mmu_remove_identity_mapping(void);
+void mmu_prepare_higher_half_transition(void);
+void mmu_audit_identity_references(void);
 void mmu_load_cr3(uint32_t pd_phys_addr);
 void mmu_enable_paging(void);
 bool mmu_map_page(uint32_t virtual_addr, uint32_t physical_addr,

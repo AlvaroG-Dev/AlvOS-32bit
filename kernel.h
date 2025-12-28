@@ -1,22 +1,21 @@
 #ifndef KERNEL_H
 #define KERNEL_H
 
-#include <stddef.h>
-#include <stdint.h>
-
-#include "./memutils.h"
 #include "boot_log.h"
 #include "disk.h"
 #include "installer.h"
 #include "memory.h"
+#include "memutils.h"
 #include "multiboot2.h" // Asegúrate de tener este archivo con las definiciones de Multiboot2
 #include "string.h"
 #include "terminal.h"
+#include <stddef.h>
+#include <stdint.h>
 
 // Heap estático de reserva
-#define STATIC_HEAP_SIZE 0x1000000 // 5 MB
-static uint8_t kernel_heap[STATIC_HEAP_SIZE]
-    __attribute__((aligned(PAGE_SIZE)));
+// Heap estático de reserva
+#define STATIC_HEAP_SIZE 0x1000000 // 16 MB
+extern uint8_t kernel_heap[STATIC_HEAP_SIZE];
 
 extern uint32_t *g_framebuffer;
 extern uint32_t g_pitch_pixels;

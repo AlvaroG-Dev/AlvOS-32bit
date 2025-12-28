@@ -423,6 +423,8 @@ void syscall_handler(struct regs *r) {
 
   case SYSCALL_GETTIME:
     result = ticks_since_boot;
+    terminal_printf(&main_terminal, "[SYSCALL_GETTIME] Returned time=%u\r\n",
+                    result);
     break;
 
   case SYSCALL_STAT: {

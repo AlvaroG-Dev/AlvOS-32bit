@@ -41,8 +41,10 @@ compile "gdt.c"        "$GCC $GCC_OPTS -c gdt.c -o build/gdt.o"
 compile "idt.c"        "$GCC $GCC_OPTS -c idt.c -o build/idt.o"
 compile "isr.c"        "$GCC $GCC_OPTS -c isr.c -o build/isr.o"
 compile "irq.c"        "$GCC $GCC_OPTS -c irq.c -o build/irq.o"
+compile "pmm.c"     "$GCC $GCC_OPTS -c pmm.c -o build/pmm.o"
 compile "memory.c"     "$GCC $GCC_OPTS -c memory.c -o build/memory.o"
 compile "mmu.c"        "$GCC $GCC_OPTS -c mmu.c -o build/mmu.o"
+compile "vmm.c"        "$GCC $GCC_OPTS -c vmm.c -o build/vmm.o"
 compile "memutils.c"   "$GCC $GCC_OPTS -c memutils.c -o build/memutils.o"
 compile "string.c"     "$GCC $GCC_OPTS -c string.c -o build/string.o"
 compile "cpuid.c" "$GCC $GCC_OPTS -c cpuid.c -o build/cpuid.o"
@@ -91,8 +93,8 @@ compile "syscalls.c" "$GCC $GCC_OPTS -c syscalls.c -o build/syscalls.o"
 echo -e "${GREEN}Enlazando kernel.bin...${RESET}"
 ld -m elf_i386 -T linker.ld -o build/kernel.bin \
     build/boot.o build/kernel.o build/gdt_flush.o build/gdt.o build/idt.o \
-    build/isr.o build/idt_load.o build/isr_asm.o build/irq.o build/irq_asm.o \
-    build/memory.o build/cpuid.o build/mmu.o build/memutils.o build/string.o \
+    build/isr.o build/idt_load.o build/isr_asm.o build/irq.o build/irq_asm.o build/vmm.o \
+    build/pmm.o build/memory.o build/cpuid.o build/mmu.o build/memutils.o build/string.o \
     build/keyboard.o build/drawing.o build/math_utils.o build/terminal.o \
     build/disk.o build/disk_io_daemon.o build/task.o build/task_switch.o build/task_utils.o \
     build/task_test.o build/serial.o build/vfs.o build/tmpfs.o build/fat32.o build/log.o \

@@ -4,9 +4,12 @@
 #include "memutils.h"
 #include "string.h"
 
+extern char _start;
 extern char _end;
 extern char _stack_bottom;
 extern char _stack_top;
+
+static bool identity_mapping_active = true;
 
 // Estructuras de paginación
 __attribute__((section(".page_tables"), used, aligned(PAGE_SIZE))) uint32_t
@@ -346,23 +349,6 @@ void mmu_init(void) {
   // Heap del kernel (SOLO KERNEL)
   mmu_map_region((uint32_t)kernel_heap, (uint32_t)kernel_heap, STATIC_HEAP_SIZE,
                  PAGE_PRESENT | PAGE_RW); // SIN PAGE_USER!
-
-  // **ESPACIO DE USUARIO: CON PAGE_USER**
-  terminal_puts(&main_terminal,
-                "Mapping user space (0x00000000-0x00400000)...\r\n");
-
-  // Mapear primeros 4MB para usuario
-  // El usuario NO debe tener acceso al kernel en 0x100000
-  for (uint32_t virt = 0x00000000; virt < 0x00400000; virt += PAGE_SIZE) {
-    // Saltar región del kernel (0x100000-0x1FFFFF)
-    if (virt >= 0x100000 && virt < 0x200000) {
-      continue; // ¡NO mapear kernel para usuario!
-    }
-
-    if (!mmu_is_mapped(virt)) {
-      mmu_map_page(virt, virt, PAGE_PRESENT | PAGE_RW | PAGE_USER);
-    }
-  }
 
   // **ÁREA ESPECIAL PARA CÓDIGO DE USUARIO**
   // El usuario necesita su propio código en una dirección diferente

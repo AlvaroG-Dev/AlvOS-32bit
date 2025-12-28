@@ -2,6 +2,7 @@
 #define TASK_H
 
 #include "isr.h"
+#include "memory.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -75,6 +76,7 @@ typedef struct task {
   void *user_code_base;
   size_t user_code_size;
   void *user_entry_point; // <-- NUEVO: Punto de entrada de usuario
+  address_space_t *address_space;
 
   // Información de tiempo
   uint32_t time_slice;  // Quantum de tiempo asignado
