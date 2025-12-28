@@ -74,6 +74,7 @@ bool mmu_copy_kernel_mappings(uint32_t *user_pd);
 uint32_t mmu_get_current_cr3(void);
 uint32_t mmu_get_page_flags(uint32_t virtual_addr);
 bool mmu_set_page_user(uint32_t virtual_addr);
+bool mmu_can_user_access(uint32_t virtual_addr, bool write);
 
 // Variables globales
 extern uint32_t page_directory[PAGE_DIRECTORY_ENTRIES];

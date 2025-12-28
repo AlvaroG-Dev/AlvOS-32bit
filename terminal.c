@@ -2162,38 +2162,6 @@ void cmd_edit(const char *args) {
   terminal_printf(&main_terminal, "Editor cerrado.\r\n");
 }
 
-// Función que se ejecutará en modo usuario
-static void test_user_program(void *arg) {
-  (void)arg; // No usar el argumento por ahora
-
-  // Esta función se ejecuta en Ring 3
-  // Solo puede usar syscalls para interactuar
-
-  const char *msg = "Hello from user mode via syscall!\n";
-
-  // Syscall WRITE (INT 0x80)
-  __asm__ volatile("movl $1, %%eax\n" // SYS_WRITE = 1
-                   "movl $1, %%ebx\n" // fd = STDOUT
-                   "movl %0, %%ecx\n" // buffer
-                   "movl %1, %%edx\n" // length
-                   "int $0x80\n"
-                   :
-                   : "r"(msg), "r"(32)
-                   : "eax", "ebx", "ecx", "edx", "memory");
-
-  // Syscall EXIT
-  __asm__ volatile("movl $0, %%eax\n"  // SYS_EXIT = 0
-                   "movl $42, %%ebx\n" // exit code
-                   "int $0x80\n"
-                   :
-                   :
-                   : "eax", "ebx", "memory");
-
-  // Nunca debería llegar aquí
-  while (1)
-    ;
-}
-
 // Añade estas funciones si no las tienes
 
 void verify_page_permissions(uint32_t vaddr) {
@@ -2266,7 +2234,7 @@ void cmd_test_usermode(void) {
   verify_user_segments();
 
   // 2. Dirección de prueba
-  uint32_t test_addr = 0x200000;
+  uint32_t test_addr = 0x300000;
   uint32_t page_start = test_addr & ~0xFFF;
 
   terminal_printf(&main_terminal, "\r\n--- Page Mapping Check ---\r\n");
@@ -2306,35 +2274,6 @@ void cmd_test_usermode(void) {
   terminal_puts(&main_terminal, "\r\n=== Test Suite Complete ===\r\n");
 }
 
-__attribute__((section(".user_code"))) __attribute__((aligned(4096)))
-__attribute__((used)) static const uint8_t user_test_program[] = {
-    // ==== CÓDIGO SIMPLE (25 bytes) ====
-
-    // push ebp
-    0x55, // 0x00
-
-    // mov ebp, esp
-    0x89, 0xE5, // 0x01-0x02
-
-    // WRITE syscall (manejo de argumentos en registros)
-    0xB8, 0x01, 0x00, 0x00, 0x00, // 0x03: mov eax, 1 (SYS_WRITE)
-    0xBB, 0x01, 0x00, 0x00, 0x00, // 0x08: mov ebx, 1 (stdout)
-    0xB9, 0x00, 0x00, 0x00, 0x00, // 0x0D: mov ecx, msg (AJUSTAR)
-    0xBA, 0x1E, 0x00, 0x00, 0x00, // 0x12: mov edx, 30 (length)
-    0xCD, 0x80,                   // 0x17: int 0x80
-
-    // EXIT syscall
-    0xB8, 0x00, 0x00, 0x00, 0x00, // 0x19: mov eax, 0 (SYS_EXIT)
-    0xBB, 0x2A, 0x00, 0x00, 0x00, // 0x1E: mov ebx, 42 (exit code)
-    0xCD, 0x80,                   // 0x23: int 0x80
-
-    // ==== DATOS (mensaje) ====
-    // Comienza en offset 0x25 (37 bytes desde el inicio)
-    'H', 'e', 'l', 'l', 'o', ' ', 'f', 'r', 'o', 'm', ' ', 'u', 's', 'e', 'r',
-    ' ', 's', 'p', 'a', 'c', 'e', '!', '\n',
-    0x00 // null terminator
-};
-
 void test_user_mode_simple(void) {
   terminal_puts(&main_terminal, "\r\n=== User Mode Simple Test ===\r\n");
 
@@ -2348,16 +2287,48 @@ void test_user_mode_simple(void) {
       cs & 3, ds, ds & 3);
 
   // 2. Dirección para código de usuario (DEBE estar fuera del kernel)
-  uint32_t user_code_addr = 0x200000; // 2MB
+  uint32_t user_code_addr = 0x300000; // 2MB
   uint32_t code_page = user_code_addr & ~0xFFF;
 
   // 3. Programa de usuario ULTRA simple (solo syscall EXIT)
   static const uint8_t simple_user_code[] = {
-      0xB8, 0x00, 0x00, 0x00, 0x00, // mov eax, 0 (SYS_EXIT)
-      0xBB, 0x2A, 0x00, 0x00, 0x00, // mov ebx, 42 (exit code)
+      // ===== Obtener dirección base =====
+      0xE8, 0x00, 0x00, 0x00, 0x00, // call next
+      0x5D,                         // pop ebp ; EBP = base address
+
+      // ===== Calcular dirección del mensaje =====
+      0x8D, 0x8D, 0x42, 0x00, 0x00,
+      0x00, // lea ecx, [ebp+0x42] ; offset al mensaje
+
+      // ===== SYS_WRITE stdout =====
+      0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+      0xBB, 0x01, 0x00, 0x00, 0x00, // mov ebx, 1
+      // ECX ya tiene la dirección
+      0xBA, 0x30, 0x00, 0x00, 0x00, // mov edx, 48
       0xCD, 0x80,                   // int 0x80
-      0xEB, 0xFE                    // jmp $ (por si acaso)
-  };
+
+      // ===== SYS_WRITE stderr =====
+      0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+      0xBB, 0x02, 0x00, 0x00, 0x00, // mov ebx, 2
+      // ECX todavía válido
+      0xBA, 0x30, 0x00, 0x00, 0x00, // mov edx, 48
+      0xCD, 0x80,                   // int 0x80
+
+      // ===== SYS_GETPID =====
+      0xB8, 0x03, 0x00, 0x00, 0x00, // mov eax, 3
+      0xCD, 0x80,                   // int 0x80
+
+      // ===== SYS_EXIT =====
+      0xB8, 0x00, 0x00, 0x00, 0x00, // mov eax, 0
+      0xBB, 0x00, 0x00, 0x00, 0x00, // mov ebx, 0
+      0xCD, 0x80,                   // int 0x80
+
+      // Padding...
+      0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+
+      // Mensaje
+      'P', 'I', 'C', ' ', 'c', 'o', 'd', 'e', ' ', '-', ' ', 'w', 'o', 'r', 'k',
+      's', ' ', 'a', 'n', 'y', 'w', 'h', 'e', 'r', 'e', '!', '\n', 0x00};
 
   terminal_printf(&main_terminal,
                   "Preparing user code at 0x%08x (page 0x%08x)...\r\n",

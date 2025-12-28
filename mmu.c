@@ -106,6 +106,35 @@ bool mmu_map_page(uint32_t virtual_addr, uint32_t physical_addr,
     return true;
   }
 
+  // ✅ VERIFICAR CONFLICTOS DE PERMISOS
+  if ((page_directory[pd_index] & PAGE_PRESENT)) {
+    if (page_directory[pd_index] & PAGE_4MB) {
+      // Página grande existente
+      uint32_t existing_flags = page_directory[pd_index] & 0xFFF;
+
+      // Si los flags son diferentes, puede ser un problema
+      if ((existing_flags & PAGE_USER) != (flags & PAGE_USER)) {
+        terminal_printf(&main_terminal,
+                        "WARNING: Page permission conflict at 0x%08x\n",
+                        virtual_addr);
+        return false;
+      }
+    } else {
+      // Tabla de páginas existente
+      if (page_tables[pd_index][pt_index] & PAGE_PRESENT) {
+        uint32_t existing_flags = page_tables[pd_index][pt_index] & 0xFFF;
+
+        // Verificar conflictos de usuario/kernel
+        if ((existing_flags & PAGE_USER) != (flags & PAGE_USER)) {
+          terminal_printf(&main_terminal,
+                          "ERROR: User/Kernel page conflict at 0x%08x\n",
+                          virtual_addr);
+          return false;
+        }
+      }
+    }
+  }
+
   // Establecer la nueva entrada
   page_tables[pd_index][pt_index] = physical_addr | (flags & 0xFFF);
 
@@ -808,26 +837,48 @@ bool mmu_set_page_user(uint32_t virtual_addr) {
   uint32_t pd_index = virtual_addr >> 22;
   uint32_t pt_index = (virtual_addr >> 12) & 0x3FF;
 
-  if (pd_index >= PAGE_DIRECTORY_ENTRIES)
+  if (pd_index >= PAGE_DIRECTORY_ENTRIES) {
     return false;
+  }
 
+  // ✅ CRÍTICO: Si es una página grande, no podemos modificar
+  if (page_directory[pd_index] & PAGE_4MB) {
+    return false;
+  }
+
+  // ✅ CRÍTICO: Asegurar que la tabla existe
   if (!(page_directory[pd_index] & PAGE_PRESENT)) {
     return false;
   }
 
-  if (page_directory[pd_index] & PAGE_4MB) {
-    // No se puede modificar páginas de 4MB individualmente
+  // ✅ CRÍTICO: Establecer PAGE_USER en el PDE (nivel del directorio)
+  page_directory[pd_index] |= PAGE_USER;
+
+  // ✅ Establecer PAGE_USER en el PTE (nivel de tabla)
+  page_tables[pd_index][pt_index] |= PAGE_USER;
+
+  // Invalidar entrada TLB
+  __asm__ volatile("invlpg (%0)" : : "r"(virtual_addr) : "memory");
+
+  return true;
+}
+
+bool mmu_can_user_access(uint32_t virtual_addr, bool write) {
+  uint32_t flags = mmu_get_page_flags(virtual_addr);
+
+  if (!(flags & PAGE_PRESENT)) {
     return false;
   }
 
-  // Asegurar que el PDE también tenga PAGE_USER
-  page_directory[pd_index] |= PAGE_USER;
+  // Verificar si es página de usuario
+  if (!(flags & PAGE_USER)) {
+    return false; // Página del kernel, usuario no puede acceder
+  }
 
-  // Activar PAGE_USER en el PTE
-  page_tables[pd_index][pt_index] |= PAGE_USER;
-
-  // Invalidar TLB
-  __asm__ volatile("invlpg (%0)" : : "r"(virtual_addr) : "memory");
+  // Si necesita escritura, verificar flag RW
+  if (write && !(flags & PAGE_RW)) {
+    return false; // Página es solo lectura
+  }
 
   return true;
 }

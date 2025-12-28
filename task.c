@@ -710,7 +710,6 @@ task_t *task_create_user(const char *name, void *user_code_addr, void *arg,
         "[USER_CREATE] WARNING: Code page missing PAGE_USER (flags=0x%03x)\r\n",
         code_flags);
 
-    // Intentar corregir
     if (!mmu_set_page_user(code_page)) {
       terminal_puts(
           &main_terminal,
@@ -722,52 +721,183 @@ task_t *task_create_user(const char *name, void *user_code_addr, void *arg,
                   "[USER_CREATE] PAGE_USER added to code page\r\n");
   }
 
-  // 3. Asignar stack de usuario
-  void *user_stack = kernel_malloc(USER_STACK_SIZE);
+  // 3. ✅ CRÍTICO: Asignar stack CORRECTAMENTE alineado
+  size_t aligned_stack_size = (USER_STACK_SIZE + 0xFFF) & ~0xFFF;
+
+  terminal_printf(
+      &main_terminal,
+      "[USER_CREATE] Allocating stack: %u bytes (aligned to 4KB)\r\n",
+      aligned_stack_size);
+
+  void *user_stack = kernel_malloc(aligned_stack_size);
   if (!user_stack) {
     terminal_puts(&main_terminal,
                   "[USER_CREATE] ERROR: Cannot allocate user stack\r\n");
     return NULL;
   }
-  memset(user_stack, 0, USER_STACK_SIZE);
+  memset(user_stack, 0, aligned_stack_size);
 
-  // 4. **CRÍTICO**: Mapear CADA PÁGINA del stack con PAGE_USER
-  uint32_t stack_start = (uint32_t)user_stack;
-  uint32_t stack_end = stack_start + USER_STACK_SIZE;
+  // 4. ✅ CRÍTICO: Calcular correctamente inicio y fin
+  uint32_t stack_base = (uint32_t)user_stack;
+  uint32_t stack_end = stack_base + aligned_stack_size;
+
+  // ⚠️ IMPORTANTE: El stack crece HACIA ABAJO
+  // stack_base es el inicio (dirección más baja)
+  // stack_end es el final (dirección más alta)
+  // ESP debe apuntar al final (stack_end), no al inicio
 
   terminal_printf(&main_terminal,
-                  "[USER_CREATE] Mapping user stack: 0x%08x - 0x%08x\r\n",
-                  stack_start, stack_end);
+                  "[USER_CREATE] Stack region: 0x%08x - 0x%08x (%u bytes)\r\n",
+                  stack_base, stack_end, aligned_stack_size);
 
-  for (uint32_t page = stack_start; page < stack_end; page += 0x1000) {
-    uint32_t phys = mmu_virtual_to_physical(page);
+  // 5. ✅ CRÍTICO: Mapear TODAS las páginas del stack con verificación robusta
+  terminal_puts(&main_terminal, "[USER_CREATE] Mapping stack pages:\r\n");
 
-    if (!phys) {
-      // No está mapeada, mapear ahora
-      if (!mmu_map_page(page, page, PAGE_PRESENT | PAGE_RW | PAGE_USER)) {
+  uint32_t stack_base_aligned = stack_base & ~0xFFF;
+  uint32_t stack_end_aligned = (stack_end + 0xFFF) & ~0xFFF;
+  uint32_t mapped_count = 0;
+
+  for (uint32_t page = stack_base_aligned; page < stack_end_aligned;
+       page += PAGE_SIZE) {
+    // Verificar si ya está mapeada
+    if (mmu_is_mapped(page)) {
+      uint32_t flags = mmu_get_page_flags(page);
+
+      // ✅ CRÍTICO: Verificar que tenga PAGE_USER
+      if (!(flags & PAGE_USER)) {
         terminal_printf(
             &main_terminal,
-            "[USER_CREATE] ERROR: Failed to map stack page 0x%08x\r\n", page);
-        kernel_free(user_stack);
-        return NULL;
+            "[USER_CREATE]   ⚠️ Page 0x%08x missing USER flag, fixing...\r\n",
+            page);
+
+        if (!mmu_set_page_user(page)) {
+          terminal_printf(
+              &main_terminal,
+              "[USER_CREATE] ❌ ERROR: Failed to set PAGE_USER on 0x%08x\r\n",
+              page);
+          kernel_free(user_stack);
+          return NULL;
+        }
+
+        // Verificar después del fix
+        flags = mmu_get_page_flags(page);
+        if (!(flags & PAGE_USER)) {
+          terminal_printf(&main_terminal,
+                          "[USER_CREATE] ❌ ERROR: PAGE_USER still not set on "
+                          "0x%08x after fix!\r\n",
+                          page);
+          kernel_free(user_stack);
+          return NULL;
+        }
       }
+
+      // ✅ Verificar que tenga permisos de escritura
+      if (!(flags & PAGE_RW)) {
+        terminal_printf(
+            &main_terminal,
+            "[USER_CREATE] ⚠️ Page 0x%08x missing RW flag, fixing...\r\n", page);
+
+        if (!mmu_set_flags(page, flags | PAGE_RW)) {
+          terminal_printf(
+              &main_terminal,
+              "[USER_CREATE] ❌ ERROR: Failed to set RW on 0x%08x\r\n", page);
+          kernel_free(user_stack);
+          return NULL;
+        }
+      }
+
+      terminal_printf(
+          &main_terminal,
+          "[USER_CREATE]   ✓ Already mapped 0x%08x [U=%d, W=%d]\r\n", page,
+          (flags & PAGE_USER) ? 1 : 0, (flags & PAGE_RW) ? 1 : 0);
     } else {
-      // Ya está mapeada, asegurar PAGE_USER
-      if (!mmu_set_page_user(page)) {
+      // Mapear nueva página
+      terminal_printf(&main_terminal,
+                      "[USER_CREATE]   🆕 Mapping new page 0x%08x...\r\n",
+                      page);
+
+      // ✅ CRÍTICO: Usar mmu_map_page con flags correctos
+      if (!mmu_map_page(page, page, PAGE_PRESENT | PAGE_RW | PAGE_USER)) {
         terminal_printf(&main_terminal,
-                        "[USER_CREATE] ERROR: Failed to set PAGE_USER on stack "
-                        "page 0x%08x\r\n",
+                        "[USER_CREATE] ❌ ERROR: Failed to map page 0x%08x\r\n",
                         page);
         kernel_free(user_stack);
         return NULL;
       }
+
+      // Verificar que se mapeó correctamente
+      uint32_t mapped_flags = mmu_get_page_flags(page);
+      if (!(mapped_flags & PAGE_USER)) {
+        terminal_printf(&main_terminal,
+                        "[USER_CREATE] ❌ ERROR: New page missing USER flag! "
+                        "(flags=0x%03x)\r\n",
+                        mapped_flags);
+        kernel_free(user_stack);
+        return NULL;
+      }
+
+      terminal_printf(&main_terminal,
+                      "[USER_CREATE]   ✅ Mapped 0x%08x [OK]\r\n", page);
     }
+
+    mapped_count++;
   }
 
-  // 5. Calcular top del stack (alineado a 16 bytes)
-  uint32_t stack_top = stack_end & ~0xF;
+  terminal_printf(&main_terminal, "[USER_CREATE] Total pages mapped: %u\r\n",
+                  mapped_count);
 
-  // 6. Crear tarea usando el wrapper de kernel
+  // 6. ✅ CRÍTICO: Stack top debe estar en el FINAL, con margen de seguridad
+  // Dejar 16 bytes de margen y alinear a 16 bytes
+  uint32_t stack_top = (stack_end - 16) & ~0xF;
+
+  terminal_printf(
+      &main_terminal,
+      "[USER_CREATE] Stack top: 0x%08x (aligned, %u bytes from end)\r\n",
+      stack_top, stack_end - stack_top);
+
+  // 7. ✅ VERIFICACIÓN: Comprobar que el área crítica del stack está mapeada
+  terminal_puts(&main_terminal,
+                "[USER_CREATE] Verifying critical stack area:\r\n");
+
+  // Verificar las direcciones que el código relocatable usará
+  uint32_t test_addrs[] = {stack_top,      // ESP inicial
+                           stack_top - 4,  // Después del primer PUSH (CALL)
+                           stack_top - 8,  // Después del segundo PUSH
+                           stack_top - 16, // Más margen
+                           0};
+
+  for (int i = 0; test_addrs[i] != 0; i++) {
+    uint32_t addr = test_addrs[i];
+    uint32_t page = addr & ~0xFFF;
+
+    if (!mmu_is_mapped(page)) {
+      terminal_printf(
+          &main_terminal,
+          "[USER_CREATE] ❌ ERROR: Address 0x%08x (page 0x%08x) NOT MAPPED\r\n",
+          addr, page);
+      kernel_free(user_stack);
+      return NULL;
+    }
+
+    uint32_t flags = mmu_get_page_flags(page);
+    bool has_user = (flags & PAGE_USER) != 0;
+    bool has_write = (flags & PAGE_RW) != 0;
+
+    if (!has_user || !has_write) {
+      terminal_printf(
+          &main_terminal,
+          "[USER_CREATE] ❌ ERROR: Page 0x%08x has wrong perms (U=%d W=%d)\r\n",
+          page, has_user, has_write);
+      kernel_free(user_stack);
+      return NULL;
+    }
+
+    terminal_printf(&main_terminal,
+                    "[USER_CREATE]   ✅ 0x%08x -> page 0x%08x [OK]\r\n", addr,
+                    page);
+  }
+
+  // 8. Crear tarea usando el wrapper de kernel
   task_t *task = task_create(name, user_mode_entry_wrapper, arg, priority);
   if (!task) {
     terminal_puts(&main_terminal,
@@ -776,16 +906,16 @@ task_t *task_create_user(const char *name, void *user_code_addr, void *arg,
     return NULL;
   }
 
-  // 7. Configurar información de usuario
+  // 9. Configurar información de usuario
   task->user_stack_base = user_stack;
   task->user_stack_top = (void *)stack_top;
-  task->user_stack_size = USER_STACK_SIZE;
+  task->user_stack_size = aligned_stack_size;
   task->user_entry_point = user_code_addr;
   task->user_code_base = user_code_addr;
   task->user_code_size = 4096;
   task->flags |= TASK_FLAG_USER_MODE;
 
-  // 8. Verificar que el contexto de kernel esté correcto
+  // 10. Verificar que el contexto de kernel esté correcto
   if (task->context.eip != (uint32_t)user_mode_entry_wrapper) {
     terminal_printf(&main_terminal,
                     "[USER_CREATE] WARNING: Fixing EIP: 0x%08x -> 0x%08x\r\n",
@@ -794,19 +924,19 @@ task_t *task_create_user(const char *name, void *user_code_addr, void *arg,
   }
 
   terminal_printf(&main_terminal,
-                  "[USER_CREATE] User task created successfully!\r\n"
+                  "[USER_CREATE] ✅ User task created successfully!\r\n"
                   "  Task ID: %u\r\n"
                   "  Kernel entry (wrapper): 0x%08x\r\n"
                   "  User entry point: 0x%08x\r\n"
                   "  Kernel stack: 0x%08x -> 0x%08x\r\n"
-                  "  User stack: 0x%08x -> 0x%08x\r\n"
+                  "  User stack: 0x%08x -> 0x%08x (size=%u, top=0x%08x)\r\n"
                   "  Kernel segments: CS=0x%04x, DS=0x%04x, SS=0x%04x\r\n"
                   "  User segments: CS=0x%04x, DS=0x%04x, SS=0x%04x\r\n",
                   task->task_id, (uint32_t)user_mode_entry_wrapper,
                   (uint32_t)user_code_addr, (uint32_t)task->stack_base,
-                  (uint32_t)task->stack_top, (uint32_t)user_stack, stack_top,
-                  task->context.cs, task->context.ds, task->context.ss, 0x1B,
-                  0x23, 0x23);
+                  (uint32_t)task->stack_top, stack_base, stack_end,
+                  aligned_stack_size, stack_top, task->context.cs,
+                  task->context.ds, task->context.ss, 0x1B, 0x23, 0x23);
 
   return task;
 }
