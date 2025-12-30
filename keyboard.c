@@ -278,3 +278,36 @@ int keyboard_load_layout(const char *filename, const char *layout_name) {
 
   return result;
 }
+
+// Verificar si hay teclas disponibles
+int keyboard_available(void) { return keyboard_buffer_count > 0; }
+
+// Leer tecla sin bloquear (retorna -1 si no hay teclas)
+int keyboard_getkey_nonblock(void) {
+  if (keyboard_buffer_count == 0) {
+    return -1;
+  }
+
+  uint32_t flags;
+  __asm__ __volatile__("pushf\n\tcli\n\tpop %0" : "=r"(flags));
+
+  int key = keyboard_buffer[keyboard_buffer_head];
+  keyboard_buffer_head = (keyboard_buffer_head + 1) % KEYBOARD_BUFFER_SIZE;
+  keyboard_buffer_count--;
+
+  __asm__ __volatile__("push %0\n\tpopf" : : "r"(flags));
+
+  return key;
+}
+
+// Limpiar buffer del teclado
+void keyboard_clear_buffer(void) {
+  uint32_t flags;
+  __asm__ __volatile__("pushf\n\tcli\n\tpop %0" : "=r"(flags));
+
+  keyboard_buffer_head = 0;
+  keyboard_buffer_tail = 0;
+  keyboard_buffer_count = 0;
+
+  __asm__ __volatile__("push %0\n\tpopf" : : "r"(flags));
+}

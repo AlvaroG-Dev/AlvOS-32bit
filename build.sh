@@ -88,6 +88,7 @@ compile "apic.c" "$GCC $GCC_OPTS -c apic.c -o build/apic.o"
 compile "text_editor.c" "$GCC $GCC_OPTS -c text_editor.c -o build/text_editor.o"
 compile "mini_parser.c" "$GCC $GCC_OPTS -c mini_parser.c -o build/mini_parser.o"
 compile "syscalls.c" "$GCC $GCC_OPTS -c syscalls.c -o build/syscalls.o"
+compile "exec.c" "$GCC $GCC_OPTS -c exec.c -o build/exec.o"
 
 # Enlazado con linker.ld
 echo -e "${GREEN}Enlazando kernel.bin...${RESET}"
@@ -104,8 +105,7 @@ ld -m elf_i386 -T linker.ld -o build/kernel.bin \
     build/uhci.o build/usb_mass_storage.o build/ehci.o build/usb_commands.o \
     build/partition.o build/mbr.o build/installer.o build/boot_log.o \
     build/mouse.o build/partition_manager.o build/apic.o build/mini_parser.o \
-    build/text_editor.o build/syscalls.o build/syscall_asm.o
-    
+    build/text_editor.o build/syscalls.o build/syscall_asm.o build/exec.o
 
 if [ $? -ne 0 ]; then
     echo -e "${RED}Error en el enlazado con linker.ld${RESET}"
@@ -158,11 +158,17 @@ echo -e "${BLUE}Creacion de ISO completadas con exito!${RESET}"
 
 echo "Compilando programa de prueba..."
 
-gcc -m32 -ffreestanding -nostdlib -fno-pie -fno-stack-protector \
-    -O0 -c hello.c -o hello.o
+# 1. Primero, compila el objeto
+i386-elf-gcc -m32 -ffreestanding -nostdlib -fno-pie -fno-stack-protector \
+    -O0 -Wall -Wextra -c hello.c -o hello.o
 
-ld -m elf_i386 -Ttext 0x0 --oformat binary -e main \
+# 2. Luego enlázalo como binario plano
+ld -m elf_i386 -Ttext 0x0 --oformat binary -e _start \
     hello.o -o hello.bin
+
+# 3. (OPCIONAL) Verificar el binario resultante
+echo "Tamaño del binario: $(stat -c%s hello.bin) bytes"
+hexdump -C hello.bin | head -20
 
 #dd if=/dev/zero of=~/osdisk/disk.img bs=1M count=1000
 #parted ~/osdisk/disk.img --script mklabel msdos

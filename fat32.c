@@ -8,6 +8,11 @@
 #include "vfs.h"
 
 extern Terminal main_terminal;
+static int fat32_update_dir_entry_size(fat32_fs_t *fs, uint32_t parent_cluster,
+                                       const uint8_t *short_name,
+                                       uint32_t new_size);
+static int fat32_extend_cluster_chain(fat32_fs_t *fs, uint32_t first_cluster,
+                                      uint32_t additional_clusters);
 
 // Update the fat32_vnode_ops structure
 static vnode_ops_t fat32_vnode_ops = {
@@ -79,9 +84,80 @@ static uint32_t fat32_count_clusters_in_chain(fat32_fs_t *fs,
   return count;
 }
 
+static int fat32_extend_and_update(fat32_fs_t *fs, uint32_t first_cluster,
+                                   uint32_t additional_clusters,
+                                   const uint8_t *short_name,
+                                   uint32_t parent_cluster,
+                                   uint32_t new_file_size) {
+  // Primero extender la cadena
+  if (fat32_extend_cluster_chain(fs, first_cluster, additional_clusters) !=
+      VFS_OK) {
+    return VFS_ERR;
+  }
+
+  // Luego actualizar la entrada de directorio si se proporciona
+  if (short_name && parent_cluster >= 2) {
+    uint8_t *cluster_buffer = (uint8_t *)kernel_malloc(fs->cluster_size);
+    if (!cluster_buffer) {
+      return VFS_ERR;
+    }
+
+    uint32_t current_cluster = parent_cluster;
+    while (current_cluster >= 2 && current_cluster < FAT32_EOC) {
+      if (fat32_read_cluster(fs, current_cluster, cluster_buffer) != VFS_OK) {
+        kernel_free(cluster_buffer);
+        return VFS_ERR;
+      }
+
+      fat32_dir_entry_t *entries = (fat32_dir_entry_t *)cluster_buffer;
+      uint32_t entries_per_cluster = fs->cluster_size / FAT32_DIR_ENTRY_SIZE;
+
+      for (uint32_t i = 0; i < entries_per_cluster; i++) {
+        if (entries[i].name[0] == 0x00) {
+          kernel_free(cluster_buffer);
+          return VFS_ERR;
+        }
+
+        if (entries[i].name[0] == 0xE5)
+          continue;
+        if ((entries[i].attributes & FAT32_ATTR_LONG_NAME) ==
+            FAT32_ATTR_LONG_NAME)
+          continue;
+
+        if (memcmp(entries[i].name, short_name, 11) == 0) {
+          // Actualizar tamaño del archivo
+          entries[i].file_size = cpu_to_le32(new_file_size);
+
+          // Actualizar timestamp
+          entries[i].write_date = cpu_to_le16(0x4B85); // 2025-09-03
+          entries[i].write_time = cpu_to_le16(0x3C00); // 11:00 AM
+
+          if (fat32_write_cluster(fs, current_cluster, cluster_buffer) !=
+              VFS_OK) {
+            kernel_free(cluster_buffer);
+            return VFS_ERR;
+          }
+
+          kernel_free(cluster_buffer);
+          serial_printf(COM1_BASE, "FAT32: Updated file size to %u bytes\n",
+                        new_file_size);
+          return VFS_OK;
+        }
+      }
+
+      current_cluster = fat32_get_fat_entry(fs, current_cluster);
+    }
+
+    kernel_free(cluster_buffer);
+  }
+
+  return VFS_OK;
+}
+
 // Nueva función helper para extender cadena de clusters
 static int fat32_extend_cluster_chain(fat32_fs_t *fs, uint32_t first_cluster,
                                       uint32_t additional_clusters) {
+
   if (!fs || first_cluster < 2 || additional_clusters == 0) {
     return VFS_ERR;
   }
@@ -372,7 +448,7 @@ static int fat32_validate_filesystem(fat32_fs_t *fs) {
           if (chain_ok != VFS_OK) {
             serial_printf(COM1_BASE,
                           "FAT32: Invalid cluster chain for %s (length=%u), "
-                          "attempting to truncate\n",
+                          "attempting to repair\n",
                           name, chain_length);
             // Truncar la cadena al último clúster válido
             uint32_t temp_cluster = first_cluster;
@@ -385,7 +461,7 @@ static int fat32_validate_filesystem(fat32_fs_t *fs) {
                   (next < FAT32_EOC &&
                    (next < 2 || next >= fs->total_clusters + 2))) {
                 serial_printf(COM1_BASE,
-                              "FAT32: Truncating chain at cluster %u (invalid "
+                              "FAT32: Repairing chain at cluster %u (invalid "
                               "next=0x%08X)\n",
                               temp_cluster, next);
                 if (fat32_set_fat_entry(fs, last_valid_cluster, FAT32_EOC) !=
@@ -426,20 +502,66 @@ static int fat32_validate_filesystem(fat32_fs_t *fs) {
             }
             chain_length =
                 valid_length; // Actualizar chain_length con la longitud válida
+
+            // ✅ FIX: Si el archivo necesita más clusters que los disponibles,
+            // EXTENDER
             uint32_t max_size = chain_length * fs->cluster_size;
+            uint32_t file_size = le32_to_cpu(entry->file_size);
             if (!(entry->attributes & FAT32_ATTR_DIRECTORY) &&
-                entry->file_size > max_size) {
+                file_size > max_size) {
               terminal_printf(&main_terminal,
-                              "FAT32: File %s size (%u) exceeds cluster chain "
-                              "size (%u), truncating to %u\n",
-                              name, entry->file_size, max_size, max_size);
-              entry->file_size = max_size;
+                              "FAT32: File %s size (%u) exceeds repaired chain "
+                              "size (%u), attempting to EXTEND\n",
+                              name, file_size, max_size);
+
+              // Calcular clusters adicionales necesarios
+              uint32_t required_clusters =
+                  (file_size + fs->cluster_size - 1) / fs->cluster_size;
+              uint32_t additional_needed = required_clusters - chain_length;
+
+              if (additional_needed > 0) {
+                // Intentar extender la cadena reparada
+                if (fat32_extend_and_update(
+                        fs, last_valid_cluster, additional_needed, entry->name,
+                        current_cluster, // cluster del directorio padre
+                        file_size) == VFS_OK) {
+                  terminal_printf(&main_terminal,
+                                  "FAT32: Successfully extended repaired chain "
+                                  "for %s by %u clusters "
+                                  "(now %u clusters total)\n",
+                                  name, additional_needed, required_clusters);
+
+                  // ✅ CRÍTICO: Asegurar que el último cluster tenga EOF
+                  // correctamente marcado
+                  uint32_t last_cluster = last_valid_cluster;
+                  for (uint32_t c = 0; c < additional_needed; c++) {
+                    last_cluster = fat32_get_fat_entry(fs, last_cluster);
+                  }
+
+                  if (fat32_set_fat_entry(fs, last_cluster, FAT32_EOC) !=
+                      VFS_OK) {
+                    terminal_printf(
+                        &main_terminal,
+                        "FAT32: Failed to set EOF on last cluster %u for %s\n",
+                        last_cluster, name);
+                  }
+                } else {
+                  terminal_printf(
+                      &main_terminal,
+                      "FAT32: Could not extend repaired chain for %s, "
+                      "adjusting file size to %u\n",
+                      name, max_size);
+                  // Solo como último recurso, ajustar el tamaño del archivo
+                  entry->file_size = cpu_to_le32(max_size);
+                }
+              }
+
               if (disk_write_dispatch(fs->disk, sector, 1, buffer) !=
                   DISK_ERR_NONE) {
-                terminal_printf(&main_terminal,
-                                "FAT32: Failed to write sector %u after "
-                                "truncating file size\n",
-                                sector);
+                terminal_printf(
+                    &main_terminal,
+                    "FAT32: Failed to write sector %u after chain repair\n",
+                    sector);
                 kernel_free(buffer);
                 fs->has_errors = 1;
                 return VFS_ERR;
@@ -447,26 +569,87 @@ static int fat32_validate_filesystem(fat32_fs_t *fs) {
               invalid_entries++;
             }
           } else {
-            // NUEVO: Verificación para chains válidas
-            // uint32_t max_size = chain_length * fs->cluster_size;
-            // if (!(entry->attributes & FAT32_ATTR_DIRECTORY) &&
-            // entry->file_size > max_size) {
-            //    terminal_printf(&main_terminal, "FAT32: File %s size (%u)
-            //    exceeds valid chain length (%u clusters, max %u bytes),
-            //    truncating\n",
-            //                   name, entry->file_size, chain_length,
-            //                   max_size);
-            //    entry->file_size = max_size;
-            //    if (disk_write_dispatch(fs->disk, sector, 1, buffer) !=
-            //    DISK_ERR_NONE) {
-            //        terminal_printf(&main_terminal, "FAT32: Failed to write
-            //        sector %u after truncating size\n", sector);
-            //        kernel_free(buffer);
-            //        fs->has_errors = 1;
-            //        return VFS_ERR;
-            //    }
-            //    invalid_entries++;
-            //}
+            // ✅ FIX: Cadena válida - VERIFICAR si necesita extensión
+            uint32_t max_size = chain_length * fs->cluster_size;
+            uint32_t file_size = le32_to_cpu(entry->file_size);
+
+            if (!(entry->attributes & FAT32_ATTR_DIRECTORY) &&
+                file_size > max_size) {
+              terminal_printf(
+                  &main_terminal,
+                  "FAT32: File %s size (%u) exceeds valid chain length "
+                  "(%u clusters, max %u bytes), EXTENDING chain...\n",
+                  name, file_size, chain_length, max_size);
+
+              // Calcular clusters adicionales necesarios
+              uint32_t required_clusters =
+                  (file_size + fs->cluster_size - 1) / fs->cluster_size;
+              uint32_t additional_clusters = required_clusters - chain_length;
+
+              if (additional_clusters > 0) {
+                // EXTENDER la cadena de clusters existente
+                if (fat32_extend_and_update(
+                        fs, first_cluster, additional_clusters, entry->name,
+                        current_cluster, // cluster del directorio padre
+                        file_size) == VFS_OK) {
+                  terminal_printf(
+                      &main_terminal,
+                      "FAT32: Successfully extended %s by %u clusters "
+                      "(now %u clusters total for %u bytes)\n",
+                      name, additional_clusters, required_clusters, file_size);
+
+                  // ✅ CRÍTICO: Verificar que todos los clusters estén bien
+                  // enlazados Contar clusters después de la extensión para
+                  // validación
+                  uint32_t final_count =
+                      fat32_count_clusters_in_chain(fs, first_cluster);
+                  if (final_count != required_clusters) {
+                    terminal_printf(
+                        &main_terminal,
+                        "FAT32: WARNING: Chain count mismatch after extension: "
+                        "%u vs expected %u\n",
+                        final_count, required_clusters);
+                  }
+
+                  // ✅ CRÍTICO: Asegurar que el último cluster tenga EOF
+                  uint32_t current = first_cluster;
+                  uint32_t last_cluster = current;
+                  uint32_t clusters_traversed = 0;
+
+                  while (current < FAT32_EOC && current >= 2 &&
+                         clusters_traversed < required_clusters) {
+                    last_cluster = current;
+                    current = fat32_get_fat_entry(fs, current);
+                    clusters_traversed++;
+                  }
+
+                  if (clusters_traversed == required_clusters) {
+                    uint32_t last_entry = fat32_get_fat_entry(fs, last_cluster);
+                    if (last_entry != FAT32_EOC) {
+                      terminal_printf(
+                          &main_terminal,
+                          "FAT32: Setting EOF on last cluster %u for %s\n",
+                          last_cluster, name);
+                      fat32_set_fat_entry(fs, last_cluster, FAT32_EOC);
+                    }
+                  }
+
+                  invalid_entries++;
+                } else {
+                  terminal_printf(
+                      &main_terminal,
+                      "FAT32: Failed to extend cluster chain for %s, "
+                      "need %u additional clusters (insufficient free "
+                      "space?)\n",
+                      name, additional_clusters);
+                  // Si no podemos extender, solo advertir pero no truncar
+                  terminal_printf(&main_terminal,
+                                  "FAT32: WARNING: File %s may be incomplete "
+                                  "(%u bytes, only %u clusters available)\n",
+                                  name, file_size, chain_length);
+                }
+              }
+            }
           }
         }
       }
@@ -608,33 +791,44 @@ int fat32_calculate_free_clusters(fat32_fs_t *fs, uint32_t *free_clusters,
   if (!fs || !fs->disk || !free_clusters || !next_free_cluster) {
     terminal_puts(&main_terminal,
                   "FAT32: Invalid parameters in calculate_free_clusters\r\n");
-    fs->has_errors = 1;
+    if (fs)
+      fs->has_errors = 1;
     return VFS_ERR;
   }
 
   *free_clusters = 0;
-  *next_free_cluster = 2;
+  *next_free_cluster = 2; // Empezar desde cluster 2
 
   for (uint32_t cluster = 2; cluster < fs->total_clusters + 2; cluster++) {
     uint32_t entry = fat32_get_fat_entry(fs, cluster);
+
     if (entry == FAT32_FREE_CLUSTER) {
       (*free_clusters)++;
-      if (*next_free_cluster == 2) {
+      if (*next_free_cluster == 2) { // Solo la primera vez
         *next_free_cluster = cluster;
       }
-    } else if (entry >= fs->total_clusters && entry != FAT32_EOC &&
-               entry != FAT32_BAD_CLUSTER) {
-      // Marcar clústeres inválidos como FREE, no EOC
-      terminal_printf(
-          &main_terminal,
-          "FAT32: Invalid cluster %u (value %u), setting to FREE\r\n", cluster,
-          entry);
+    } else if (entry == 0xFFFFFFFF || entry == 0x00000000) {
+      // Entrada inválida - marcar como libre
+      serial_printf(
+          COM1_BASE,
+          "FAT32: Invalid cluster %u (value 0x%08X), marking as free\r\n",
+          cluster, entry);
       fat32_set_fat_entry(fs, cluster, FAT32_FREE_CLUSTER);
       (*free_clusters)++;
       if (*next_free_cluster == 2) {
         *next_free_cluster = cluster;
       }
     }
+  }
+
+  // Si no encontramos libres, buscar desde el principio
+  if (*free_clusters == 0) {
+    *next_free_cluster = 2;
+  }
+
+  // Asegurar que next_free_cluster esté en rango
+  if (*next_free_cluster >= fs->total_clusters + 2) {
+    *next_free_cluster = 2;
   }
 
   serial_printf(COM1_BASE,
@@ -650,9 +844,8 @@ int fat32_calculate_free_clusters(fat32_fs_t *fs, uint32_t *free_clusters,
 int fat32_validate_cluster_chain(fat32_fs_t *fs, uint32_t first_cluster,
                                  uint32_t *out_chain_length) {
   if (first_cluster < 2 || first_cluster >= fs->total_clusters + 2) {
-    terminal_printf(&main_terminal,
-                    "FAT32: Invalid first cluster %u in chain\n",
-                    first_cluster);
+    serial_printf(COM1_BASE, "FAT32: Invalid first cluster %u in chain\n",
+                  first_cluster);
     if (out_chain_length)
       *out_chain_length = 0;
     return VFS_ERR;
@@ -666,8 +859,8 @@ int fat32_validate_cluster_chain(fat32_fs_t *fs, uint32_t first_cluster,
          visited_count < MAX_CHAIN_LENGTH) {
     uint32_t next = fat32_get_fat_entry(fs, current);
     if (next == FAT32_FREE_CLUSTER) {
-      terminal_printf(&main_terminal,
-                      "FAT32: Cluster %u in chain is marked free\n", current);
+      serial_printf(COM1_BASE, "FAT32: Cluster %u in chain is marked free\n",
+                    current);
       if (out_chain_length)
         *out_chain_length = visited_count;
       return VFS_ERR;
@@ -682,10 +875,9 @@ int fat32_validate_cluster_chain(fat32_fs_t *fs, uint32_t first_cluster,
       for (uint32_t i = 0; i < 1024 && test_current != current; i++) {
         test_current = fat32_get_fat_entry(fs, test_current);
         if (test_current == current) {
-          terminal_printf(
-              &main_terminal,
-              "FAT32: Cycle detected in cluster chain at length %u\n",
-              visited_count);
+          serial_printf(COM1_BASE,
+                        "FAT32: Cycle detected in cluster chain at length %u\n",
+                        visited_count);
           if (out_chain_length)
             *out_chain_length = visited_count;
           return VFS_ERR;
@@ -695,10 +887,10 @@ int fat32_validate_cluster_chain(fat32_fs_t *fs, uint32_t first_cluster,
 
     if (next == FAT32_BAD_CLUSTER ||
         (next < FAT32_EOC && (next < 2 || next >= fs->total_clusters + 2))) {
-      terminal_printf(&main_terminal,
-                      "FAT32: Invalid cluster %u in chain (next=0x%08X), "
-                      "length so far %u\n",
-                      current, next, visited_count);
+      serial_printf(COM1_BASE,
+                    "FAT32: Invalid cluster %u in chain (next=0x%08X), "
+                    "length so far %u\n",
+                    current, next, visited_count);
       if (out_chain_length)
         *out_chain_length = visited_count;
       return VFS_ERR;
@@ -707,9 +899,9 @@ int fat32_validate_cluster_chain(fat32_fs_t *fs, uint32_t first_cluster,
   }
 
   if (visited_count >= MAX_CHAIN_LENGTH) {
-    terminal_printf(&main_terminal,
-                    "FAT32: Cluster chain too long (%u), possible corruption\n",
-                    visited_count);
+    serial_printf(COM1_BASE,
+                  "FAT32: Cluster chain too long (%u), possible corruption\n",
+                  visited_count);
     if (out_chain_length)
       *out_chain_length = visited_count;
     return VFS_ERR;
@@ -722,22 +914,21 @@ int fat32_validate_cluster_chain(fat32_fs_t *fs, uint32_t first_cluster,
 
 int fat32_mount(void *device, vfs_superblock_t **out_sb) {
   if (!device || !out_sb) {
-    terminal_printf(&main_terminal,
-                    "fat32_mount: Invalid device=%p or out_sb=%p\n", device,
-                    out_sb);
+    serial_printf(COM1_BASE, "fat32_mount: Invalid device=%p or out_sb=%p\n",
+                  device, out_sb);
     return VFS_ERR;
   }
 
   disk_t *disk = (disk_t *)device;
   if (!disk_is_initialized(disk)) {
-    terminal_printf(&main_terminal, "fat32_mount: Disk not initialized\n");
+    serial_printf(COM1_BASE, "fat32_mount: Disk not initialized\n");
     return VFS_ERR;
   }
 
   fat32_fs_t *fs = (fat32_fs_t *)kernel_malloc(sizeof(fat32_fs_t));
   if (!fs) {
-    terminal_printf(&main_terminal,
-                    "fat32_mount: Failed to allocate filesystem structure\n");
+    serial_printf(COM1_BASE,
+                  "fat32_mount: Failed to allocate filesystem structure\n");
     return VFS_ERR;
   }
   memset(fs, 0, sizeof(fat32_fs_t));
@@ -746,8 +937,7 @@ int fat32_mount(void *device, vfs_superblock_t **out_sb) {
 
   // Read boot sector
   if (fat32_read_boot_sector(fs) != VFS_OK) {
-    terminal_printf(&main_terminal,
-                    "fat32_mount: Failed to read boot sector\n");
+    serial_printf(COM1_BASE, "fat32_mount: Failed to read boot sector\n");
     kernel_free(fs);
     return VFS_ERR;
   }
@@ -757,14 +947,14 @@ int fat32_mount(void *device, vfs_superblock_t **out_sb) {
       fs->boot_sector.sectors_per_cluster == 0 ||
       fs->boot_sector.num_fats == 0 || fs->boot_sector.total_sectors_32 == 0 ||
       fs->boot_sector.sectors_per_fat_32 == 0) {
-    terminal_printf(&main_terminal,
-                    "fat32_mount: Invalid boot sector: bytes_per_sector=%u, "
-                    "sectors_per_cluster=%u, num_fats=%u, total_sectors=%u, "
-                    "sectors_per_fat=%u\n",
-                    fs->boot_sector.bytes_per_sector,
-                    fs->boot_sector.sectors_per_cluster,
-                    fs->boot_sector.num_fats, fs->boot_sector.total_sectors_32,
-                    fs->boot_sector.sectors_per_fat_32);
+    serial_printf(COM1_BASE,
+                  "fat32_mount: Invalid boot sector: bytes_per_sector=%u, "
+                  "sectors_per_cluster=%u, num_fats=%u, total_sectors=%u, "
+                  "sectors_per_fat=%u\n",
+                  fs->boot_sector.bytes_per_sector,
+                  fs->boot_sector.sectors_per_cluster, fs->boot_sector.num_fats,
+                  fs->boot_sector.total_sectors_32,
+                  fs->boot_sector.sectors_per_fat_32);
     kernel_free(fs);
     return VFS_ERR;
   }
@@ -773,7 +963,7 @@ int fat32_mount(void *device, vfs_superblock_t **out_sb) {
   fs->fat_cache = (uint32_t *)kernel_malloc(FAT32_SECTOR_SIZE);
   fs->dir_cache = (uint8_t *)kernel_malloc(FAT32_SECTOR_SIZE);
   if (!fs->fat_cache || !fs->dir_cache) {
-    terminal_printf(&main_terminal, "fat32_mount: Failed to allocate caches\n");
+    serial_printf(COM1_BASE, "fat32_mount: Failed to allocate caches\n");
     if (fs->fat_cache)
       kernel_free(fs->fat_cache);
     if (fs->dir_cache)
@@ -803,12 +993,11 @@ int fat32_mount(void *device, vfs_superblock_t **out_sb) {
   if (fs->fat_start_sector >= fs->boot_sector.total_sectors_32 ||
       fs->data_start_sector >= fs->boot_sector.total_sectors_32 ||
       fs->total_clusters < 65526) {
-    terminal_printf(
-        &main_terminal,
-        "fat32_mount: Invalid parameters: fat_start_sector=%u, "
-        "data_start_sector=%u, total_sectors=%u, total_clusters=%u\n",
-        fs->fat_start_sector, fs->data_start_sector,
-        fs->boot_sector.total_sectors_32, fs->total_clusters);
+    serial_printf(COM1_BASE,
+                  "fat32_mount: Invalid parameters: fat_start_sector=%u, "
+                  "data_start_sector=%u, total_sectors=%u, total_clusters=%u\n",
+                  fs->fat_start_sector, fs->data_start_sector,
+                  fs->boot_sector.total_sectors_32, fs->total_clusters);
     kernel_free(fs->fat_cache);
     kernel_free(fs->dir_cache);
     kernel_free(fs);
@@ -836,7 +1025,7 @@ int fat32_mount(void *device, vfs_superblock_t **out_sb) {
     fs->has_errors = 1;
     if (fat32_set_fat_entry(fs, 1, fat1) != VFS_OK ||
         fat32_flush_fat_cache(fs) != VFS_OK) {
-      terminal_printf(&main_terminal, "fat32_mount: Failed to repair FAT[1]\n");
+      serial_printf(COM1_BASE, "fat32_mount: Failed to repair FAT[1]\n");
       kernel_free(fs->fat_cache);
       kernel_free(fs->dir_cache);
       kernel_free(fs);
@@ -850,8 +1039,8 @@ int fat32_mount(void *device, vfs_superblock_t **out_sb) {
   new_fat1 &= 0x0FFFFFFF;
   if (fat32_set_fat_entry(fs, 1, new_fat1) != VFS_OK ||
       fat32_flush_fat_cache(fs) != VFS_OK) {
-    terminal_printf(&main_terminal,
-                    "fat32_mount: Failed to set FAT[1]=0x%08X\n", new_fat1);
+    serial_printf(COM1_BASE, "fat32_mount: Failed to set FAT[1]=0x%08X\n",
+                  new_fat1);
     kernel_free(fs->fat_cache);
     kernel_free(fs->dir_cache);
     kernel_free(fs);
@@ -865,8 +1054,8 @@ int fat32_mount(void *device, vfs_superblock_t **out_sb) {
     uint32_t free_clusters, next_free;
     if (fat32_calculate_free_clusters(fs, &free_clusters, &next_free) !=
         VFS_OK) {
-      terminal_printf(&main_terminal,
-                      "fat32_mount: Failed to calculate free clusters\n");
+      serial_printf(COM1_BASE,
+                    "fat32_mount: Failed to calculate free clusters\n");
       kernel_free(fs->fat_cache);
       kernel_free(fs->dir_cache);
       kernel_free(fs);
@@ -875,7 +1064,7 @@ int fat32_mount(void *device, vfs_superblock_t **out_sb) {
     fs->fsinfo.free_clusters = free_clusters;
     fs->fsinfo.next_free_cluster = next_free;
     if (fat32_update_fsinfo(fs) != VFS_OK) {
-      terminal_printf(&main_terminal, "fat32_mount: Failed to update FSInfo\n");
+      serial_printf(COM1_BASE, "fat32_mount: Failed to update FSInfo\n");
       kernel_free(fs->fat_cache);
       kernel_free(fs->dir_cache);
       kernel_free(fs);
@@ -1194,9 +1383,11 @@ int fat32_read_fsinfo(fat32_fs_t *fs) {
     fs->has_errors = 1;
     return VFS_ERR;
   }
+
   uint8_t buffer[FAT32_SECTOR_SIZE];
   uint16_t fsinfo_sector =
       fs->boot_sector.fs_info_sector ? fs->boot_sector.fs_info_sector : 1;
+
   disk_err_t err = disk_read_dispatch(fs->disk, fsinfo_sector, 1, buffer);
   if (err != DISK_ERR_NONE) {
     terminal_printf(&main_terminal,
@@ -1205,7 +1396,11 @@ int fat32_read_fsinfo(fat32_fs_t *fs) {
     fs->has_errors = 1;
     return VFS_ERR;
   }
+
+  // Copiar la estructura completa
   memcpy(&fs->fsinfo, buffer, sizeof(fat32_fsinfo_t));
+
+  // Verificar firmas
   if (fs->fsinfo.lead_signature != 0x41615252 ||
       fs->fsinfo.struct_signature != 0x61417272 ||
       fs->fsinfo.trail_signature != 0xAA550000) {
@@ -1217,6 +1412,24 @@ int fat32_read_fsinfo(fat32_fs_t *fs) {
     fs->has_errors = 1;
     return VFS_ERR;
   }
+
+  // Convertir de little-endian
+  fs->fsinfo.free_clusters = le32_to_cpu(fs->fsinfo.free_clusters);
+  fs->fsinfo.next_free_cluster = le32_to_cpu(fs->fsinfo.next_free_cluster);
+
+  // Si los valores son inválidos, recalcular
+  if (fs->fsinfo.free_clusters == 0xFFFFFFFF ||
+      fs->fsinfo.next_free_cluster == 0xFFFFFFFF ||
+      fs->fsinfo.next_free_cluster >= fs->total_clusters + 2) {
+
+    uint32_t free_clusters, next_free_cluster;
+    if (fat32_calculate_free_clusters(fs, &free_clusters, &next_free_cluster) ==
+        VFS_OK) {
+      fs->fsinfo.free_clusters = free_clusters;
+      fs->fsinfo.next_free_cluster = next_free_cluster;
+    }
+  }
+
   serial_printf(COM1_BASE,
                 "FAT32: FSInfo read: free_clusters=%u, next_free_cluster=%u\n",
                 fs->fsinfo.free_clusters, fs->fsinfo.next_free_cluster);
@@ -1230,24 +1443,52 @@ int fat32_update_fsinfo(fat32_fs_t *fs) {
     fs->has_errors = 1;
     return VFS_ERR;
   }
-  if (fs->fsinfo.free_clusters == 0xFFFFFFFF ||
-      fs->fsinfo.next_free_cluster == 0xFFFFFFFF) {
-    uint32_t free_clusters, next_free_cluster;
-    if (fat32_calculate_free_clusters(fs, &free_clusters, &next_free_cluster) !=
-        VFS_OK) {
-      terminal_printf(&main_terminal,
-                      "FAT32: Failed to calculate free clusters\n");
-      fs->has_errors = 1;
-      return VFS_ERR;
-    }
-    fs->fsinfo.free_clusters = free_clusters;
-    fs->fsinfo.next_free_cluster = next_free_cluster;
+
+  // **SIEMPRE recalcular antes de escribir**
+  uint32_t free_clusters, next_free_cluster;
+  if (fat32_calculate_free_clusters(fs, &free_clusters, &next_free_cluster) !=
+      VFS_OK) {
+    terminal_printf(&main_terminal,
+                    "FAT32: Failed to calculate free clusters\n");
+    fs->has_errors = 1;
+    return VFS_ERR;
   }
+
+  fs->fsinfo.free_clusters = free_clusters;
+  fs->fsinfo.next_free_cluster = next_free_cluster;
+
+  // **Asegurar que next_free_cluster sea válido**
+  if (fs->fsinfo.next_free_cluster < 2 ||
+      fs->fsinfo.next_free_cluster >= fs->total_clusters + 2) {
+    fs->fsinfo.next_free_cluster = 2;
+  }
+
+  serial_printf(COM1_BASE, "FAT32: Writing FSInfo: free=%u, next_free=%u\n",
+                fs->fsinfo.free_clusters, fs->fsinfo.next_free_cluster);
+
   uint8_t buffer[FAT32_SECTOR_SIZE];
   memset(buffer, 0, FAT32_SECTOR_SIZE);
-  memcpy(buffer, &fs->fsinfo, sizeof(fat32_fsinfo_t));
+
+  // **Construir FSInfo correctamente según la estructura de fat32.h**
+  fat32_fsinfo_t *fsinfo = (fat32_fsinfo_t *)buffer;
+  fsinfo->lead_signature = 0x41615252;
+
+  // **reserved es un array de 480 bytes - llenar con ceros**
+  memset(fsinfo->reserved, 0, sizeof(fsinfo->reserved));
+
+  fsinfo->struct_signature = 0x61417272;
+  fsinfo->free_clusters = cpu_to_le32(fs->fsinfo.free_clusters);
+  fsinfo->next_free_cluster = cpu_to_le32(fs->fsinfo.next_free_cluster);
+
+  // **reserved2 es un array de 12 bytes - llenar con ceros**
+  memset(fsinfo->reserved2, 0, sizeof(fsinfo->reserved2));
+
+  fsinfo->trail_signature = 0xAA550000;
+
   uint16_t fsinfo_sector =
       fs->boot_sector.fs_info_sector ? fs->boot_sector.fs_info_sector : 1;
+
+  // **Escribir sector primario**
   disk_err_t err = disk_write_dispatch(fs->disk, fsinfo_sector, 1, buffer);
   if (err != DISK_ERR_NONE) {
     terminal_printf(
@@ -1257,22 +1498,24 @@ int fat32_update_fsinfo(fat32_fs_t *fs) {
     fs->has_errors = 1;
     return VFS_ERR;
   }
-  uint16_t backup_fsinfo = fs->boot_sector.backup_boot_sector
-                               ? fs->boot_sector.backup_boot_sector + 1
-                               : 7;
-  err = disk_write_dispatch(fs->disk, backup_fsinfo, 1, buffer);
-  if (err != DISK_ERR_NONE) {
-    terminal_printf(
-        &main_terminal,
-        "FAT32: Failed to write backup FSInfo sector %u (error %d)\n",
-        backup_fsinfo, err);
-    fs->has_errors = 1;
-    // Continue despite backup failure to avoid blocking
+
+  // **Escribir backup si existe**
+  if (fs->boot_sector.backup_boot_sector) {
+    uint16_t backup_fsinfo = fs->boot_sector.backup_boot_sector + 1;
+    err = disk_write_dispatch(fs->disk, backup_fsinfo, 1, buffer);
+    if (err != DISK_ERR_NONE) {
+      terminal_printf(
+          &main_terminal,
+          "FAT32: Failed to write backup FSInfo sector %u (error %d)\n",
+          backup_fsinfo, err);
+      // No retornar error aquí - continuar
+    }
   }
-  serial_printf(
-      COM1_BASE,
-      "FAT32: FSInfo updated: free_clusters=%u, next_free_cluster=%u\n",
-      fs->fsinfo.free_clusters, fs->fsinfo.next_free_cluster);
+
+  serial_printf(COM1_BASE,
+                "FAT32: FSInfo updated successfully: free_clusters=%u, "
+                "next_free_cluster=%u\n",
+                fs->fsinfo.free_clusters, fs->fsinfo.next_free_cluster);
   return VFS_OK;
 }
 
@@ -1317,15 +1560,15 @@ uint32_t fat32_get_fat_entry(fat32_fs_t *fs, uint32_t cluster) {
   if (fs->fat_cache_sector != sector) {
     if (fs->fat_cache_dirty) {
       if (fat32_flush_fat_cache(fs) != VFS_OK) {
-        terminal_printf(&main_terminal, "FAT32: Failed to flush FAT cache\n");
+        serial_printf(COM1_BASE, "FAT32: Failed to flush FAT cache\n");
         fs->has_errors = 1;
         return FAT32_BAD_CLUSTER;
       }
     }
     disk_err_t err = disk_read_dispatch(fs->disk, sector, 1, fs->fat_cache);
     if (err != DISK_ERR_NONE) {
-      terminal_printf(
-          &main_terminal,
+      serial_printf(
+          COM1_BASE,
           "FAT32: Failed to read FAT sector %u for cluster %u (error %d)\n",
           sector, cluster, err);
       fs->has_errors = 1;
@@ -1336,28 +1579,30 @@ uint32_t fat32_get_fat_entry(fat32_fs_t *fs, uint32_t cluster) {
   uint32_t value = ((uint32_t *)fs->fat_cache)[offset / 4] & 0x0FFFFFFF;
   if (cluster != 1 && value != FAT32_FREE_CLUSTER && value != FAT32_EOC &&
       value != FAT32_BAD_CLUSTER && value >= fs->total_clusters + 2) {
-    terminal_printf(&main_terminal,
-                    "FAT32: Invalid FAT entry value 0x%08X for cluster %u\n",
-                    value, cluster);
+    serial_printf(COM1_BASE,
+                  "FAT32: Invalid FAT entry value 0x%08X for cluster %u\n",
+                  value, cluster);
     fs->has_errors = 1;
     return FAT32_BAD_CLUSTER;
   }
   if (cluster == 1) {
-    // FAT[1] tiene reglas especiales - solo verificar que no sea BAD_CLUSTER
-    // y que los bits 28-31 estén limpios (0)
-    if (value == FAT32_BAD_CLUSTER || (value & 0xF0000000) != 0) {
-      terminal_printf(
-          &main_terminal,
-          "FAT32: Invalid FAT[1] value 0x%08X, repairing to 0x0FFFFFFF\n",
-          value);
-      value = 0x0FFFFFFF; // Valor estándar para FAT[1]
+    // **FAT[1] debe tener siempre 0x0FFFFFFF excepto bits 26-27**
+    if ((value & 0xF0000000) != 0) {
+      serial_printf(COM1_BASE,
+                    "FAT32: FAT[1] has high bits set: 0x%08X, correcting\n",
+                    value);
+      value = 0x0FFFFFFF;
       fs->has_errors = 1;
-      if (fat32_set_fat_entry(fs, 1, value) != VFS_OK ||
-          fat32_flush_fat_cache(fs) != VFS_OK) {
-        terminal_printf(&main_terminal, "FAT32: Failed to repair FAT[1]\n");
-        fs->has_errors = 1;
-        return FAT32_BAD_CLUSTER;
-      }
+    }
+
+    // **Asegurar bits 26-27 según estado**
+    value &= 0x0FFFFFFF; // Limpiar bits altos
+
+    if (!fs->has_errors) {
+      value |= FAT32_CLN_SHUT_BIT_MASK; // Bit 27 = 1 (limpio)
+      value |= FAT32_HRD_ERR_BIT_MASK;  // Bit 26 = 1 (sin errores)
+    } else {
+      value &= ~FAT32_HRD_ERR_BIT_MASK; // Bit 26 = 0 (con errores)
     }
   }
   // serial_printf(COM1_BASE, "FAT32: Get FAT entry for cluster %u: 0x%08X\n",
@@ -1375,14 +1620,13 @@ int fat32_set_fat_entry(fat32_fs_t *fs, uint32_t cluster, uint32_t value) {
     return VFS_ERR;
   }
   if (fs->boot_sector.bytes_per_sector == 0) {
-    terminal_printf(&main_terminal, "FAT32: Invalid bytes_per_sector=0\n");
+    serial_printf(COM1_BASE, "FAT32: Invalid bytes_per_sector=0\n");
     fs->has_errors = 1;
     return VFS_ERR;
   }
   if (cluster < 1 || cluster >= fs->total_clusters + 2) {
-    terminal_printf(&main_terminal,
-                    "FAT32: Invalid cluster %u (total_clusters=%u)\n", cluster,
-                    fs->total_clusters);
+    serial_printf(COM1_BASE, "FAT32: Invalid cluster %u (total_clusters=%u)\n",
+                  cluster, fs->total_clusters);
     fs->has_errors = 1;
     return VFS_ERR;
   }
@@ -1391,24 +1635,23 @@ int fat32_set_fat_entry(fat32_fs_t *fs, uint32_t cluster, uint32_t value) {
       fs->fat_start_sector + (fat_offset / fs->boot_sector.bytes_per_sector);
   uint32_t offset = fat_offset % fs->boot_sector.bytes_per_sector;
   if (sector >= fs->fat_start_sector + fs->boot_sector.sectors_per_fat_32) {
-    terminal_printf(&main_terminal,
-                    "FAT32: Invalid FAT sector %u for cluster %u\n", sector,
-                    cluster);
+    serial_printf(COM1_BASE, "FAT32: Invalid FAT sector %u for cluster %u\n",
+                  sector, cluster);
     fs->has_errors = 1;
     return VFS_ERR;
   }
   if (fs->fat_cache_sector != sector) {
     if (fs->fat_cache_dirty) {
       if (fat32_flush_fat_cache(fs) != VFS_OK) {
-        terminal_printf(&main_terminal, "FAT32: Failed to flush FAT cache\n");
+        serial_printf(COM1_BASE, "FAT32: Failed to flush FAT cache\n");
         fs->has_errors = 1;
         return VFS_ERR;
       }
     }
     disk_err_t err = disk_read_dispatch(fs->disk, sector, 1, fs->fat_cache);
     if (err != DISK_ERR_NONE) {
-      terminal_printf(
-          &main_terminal,
+      serial_printf(
+          COM1_BASE,
           "FAT32: Failed to read FAT sector %u for cluster %u (error %d)\n",
           sector, cluster, err);
       fs->has_errors = 1;
@@ -1427,8 +1670,8 @@ int fat32_set_fat_entry(fat32_fs_t *fs, uint32_t cluster, uint32_t value) {
 
 uint32_t fat32_allocate_cluster(fat32_fs_t *fs) {
   if (!fs || !fs->disk || !fs->fat_cache) {
-    terminal_printf(
-        &main_terminal,
+    serial_printf(
+        COM1_BASE,
         "fat32_allocate_cluster: Invalid fs=%p, disk=%p, fat_cache=%p\n", fs,
         fs ? fs->disk : NULL, fs ? fs->fat_cache : NULL);
     if (fs)
@@ -1855,186 +2098,247 @@ int fat32_update_dir_entry(fat32_fs_t *fs, fat32_node_t *node_data) {
   return VFS_ERR;
 }
 
+static int fat32_update_dir_entry_size(fat32_fs_t *fs, uint32_t parent_cluster,
+                                       const uint8_t *short_name,
+                                       uint32_t new_size) {
+  if (!fs || !fs->disk || !short_name || parent_cluster < 2) {
+    return VFS_ERR;
+  }
+
+  uint8_t *cluster_buffer = (uint8_t *)kernel_malloc(fs->cluster_size);
+  if (!cluster_buffer) {
+    return VFS_ERR;
+  }
+
+  uint32_t current_cluster = parent_cluster;
+  while (current_cluster >= 2 && current_cluster < FAT32_EOC) {
+    if (fat32_read_cluster(fs, current_cluster, cluster_buffer) != VFS_OK) {
+      kernel_free(cluster_buffer);
+      return VFS_ERR;
+    }
+
+    fat32_dir_entry_t *entries = (fat32_dir_entry_t *)cluster_buffer;
+    uint32_t entries_per_cluster = fs->cluster_size / FAT32_DIR_ENTRY_SIZE;
+
+    for (uint32_t i = 0; i < entries_per_cluster; i++) {
+      if (entries[i].name[0] == 0x00) {
+        kernel_free(cluster_buffer);
+        return VFS_ERR; // No encontrado
+      }
+
+      if (entries[i].name[0] == 0xE5)
+        continue;
+      if ((entries[i].attributes & FAT32_ATTR_LONG_NAME) ==
+          FAT32_ATTR_LONG_NAME)
+        continue;
+
+      if (memcmp(entries[i].name, short_name, 11) == 0) {
+        // Actualizar tamaño del archivo
+        entries[i].file_size = cpu_to_le32(new_size);
+
+        // Actualizar timestamp
+        entries[i].write_date = cpu_to_le16(0x4B85); // 2025-09-03
+        entries[i].write_time = cpu_to_le16(0x3C00); // 11:00 AM
+
+        if (fat32_write_cluster(fs, current_cluster, cluster_buffer) !=
+            VFS_OK) {
+          kernel_free(cluster_buffer);
+          return VFS_ERR;
+        }
+
+        kernel_free(cluster_buffer);
+        serial_printf(COM1_BASE, "FAT32: Updated file size to %u bytes\n",
+                      new_size);
+        return VFS_OK;
+      }
+    }
+
+    current_cluster = fat32_get_fat_entry(fs, current_cluster);
+  }
+
+  kernel_free(cluster_buffer);
+  return VFS_ERR;
+}
+
 // ========================================================================
 // VFS OPERATIONS
 // ========================================================================
 
 int fat32_lookup(vfs_node_t *parent, const char *name, vfs_node_t **out) {
-    if (!parent || !name || !out)
-        return VFS_ERR;
+  if (!parent || !name || !out)
+    return VFS_ERR;
 
-    fat32_node_t *parent_data = (fat32_node_t *)parent->fs_private;
-    if (!parent_data || !parent_data->is_directory)
-        return VFS_ERR;
+  fat32_node_t *parent_data = (fat32_node_t *)parent->fs_private;
+  if (!parent_data || !parent_data->is_directory)
+    return VFS_ERR;
 
-    fat32_fs_t *fs = (fat32_fs_t *)parent->sb->private;
-    uint32_t cluster = parent_data->first_cluster;
+  fat32_fs_t *fs = (fat32_fs_t *)parent->sb->private;
+  uint32_t cluster = parent_data->first_cluster;
 
-    // Convertir name a uppercase para comparación
-    char upper_name[VFS_NAME_MAX];
-    strncpy(upper_name, name, VFS_NAME_MAX - 1);
-    upper_name[VFS_NAME_MAX - 1] = '\0';
-    strupper(upper_name);
+  // Convertir name a uppercase para comparación
+  char upper_name[VFS_NAME_MAX];
+  strncpy(upper_name, name, VFS_NAME_MAX - 1);
+  upper_name[VFS_NAME_MAX - 1] = '\0';
+  strupper(upper_name);
 
-    // Parsear a short name para búsqueda directa
-    uint8_t fat_name[11];
-    if (fat32_parse_short_name(upper_name, fat_name) != VFS_OK)
-        return VFS_ERR;
+  // Parsear a short name para búsqueda directa
+  uint8_t fat_name[11];
+  if (fat32_parse_short_name(upper_name, fat_name) != VFS_OK)
+    return VFS_ERR;
 
-    uint8_t *cluster_buffer = (uint8_t *)kernel_malloc(fs->cluster_size);
-    if (!cluster_buffer)
-        return VFS_ERR;
+  uint8_t *cluster_buffer = (uint8_t *)kernel_malloc(fs->cluster_size);
+  if (!cluster_buffer)
+    return VFS_ERR;
 
-    while (cluster >= 2 && cluster < FAT32_EOC) {
-        if (fat32_read_cluster(fs, cluster, cluster_buffer) != VFS_OK) {
-            kernel_free(cluster_buffer);
-            return VFS_ERR;
-        }
-
-        fat32_dir_entry_t *entries = (fat32_dir_entry_t *)cluster_buffer;
-
-        for (uint32_t i = 0; i < fs->cluster_size / FAT32_DIR_ENTRY_SIZE; i++) {
-            if (entries[i].name[0] == 0x00)
-                break;
-            if (entries[i].name[0] == 0xE5 ||
-                entries[i].attributes == FAT32_ATTR_LONG_NAME)
-                continue;
-
-            if (memcmp(entries[i].name, fat_name, 11) == 0) {
-                // Found
-                vfs_node_t *node = (vfs_node_t *)kernel_malloc(sizeof(vfs_node_t));
-                if (!node) {
-                    kernel_free(cluster_buffer);
-                    return VFS_ERR;
-                }
-                memset(node, 0, sizeof(vfs_node_t));
-
-                if (fat32_format_short_name(entries[i].name, node->name) != VFS_OK) {
-                    kernel_free(node);
-                    kernel_free(cluster_buffer);
-                    return VFS_ERR;
-                }
-                node->type = (entries[i].attributes & FAT32_ATTR_DIRECTORY)
-                             ? VFS_NODE_DIR
-                             : VFS_NODE_FILE;
-                node->ops = &fat32_vnode_ops;
-                node->sb = parent->sb;
-                node->refcount = 1;
-
-                fat32_node_t *node_data =
-                    (fat32_node_t *)kernel_malloc(sizeof(fat32_node_t));
-                if (!node_data) {
-                    kernel_free(node);
-                    kernel_free(cluster_buffer);
-                    return VFS_ERR;
-                }
-                memset(node_data, 0, sizeof(fat32_node_t));
-
-                node_data->first_cluster =
-                    ((uint32_t)entries[i].first_cluster_high << 16) |
-                    entries[i].first_cluster_low;
-                node_data->current_cluster = node_data->first_cluster;
-                node_data->size = entries[i].file_size;
-                node_data->attributes = entries[i].attributes;
-                node_data->is_directory =
-                    (entries[i].attributes & FAT32_ATTR_DIRECTORY) ? 1 : 0;
-                node_data->parent_cluster = parent_data->first_cluster;
-                memcpy(node_data->short_name, entries[i].name, 11);
-
-                node->fs_private = node_data;
-                *out = node;
-
-                kernel_free(cluster_buffer);
-                return VFS_OK;
-            }
-        }
-
-        cluster = fat32_get_fat_entry(fs, cluster);
+  while (cluster >= 2 && cluster < FAT32_EOC) {
+    if (fat32_read_cluster(fs, cluster, cluster_buffer) != VFS_OK) {
+      kernel_free(cluster_buffer);
+      return VFS_ERR;
     }
 
-    kernel_free(cluster_buffer);
-    return VFS_ERR;
+    fat32_dir_entry_t *entries = (fat32_dir_entry_t *)cluster_buffer;
+
+    for (uint32_t i = 0; i < fs->cluster_size / FAT32_DIR_ENTRY_SIZE; i++) {
+      if (entries[i].name[0] == 0x00)
+        break;
+      if (entries[i].name[0] == 0xE5 ||
+          entries[i].attributes == FAT32_ATTR_LONG_NAME)
+        continue;
+
+      if (memcmp(entries[i].name, fat_name, 11) == 0) {
+        // Found
+        vfs_node_t *node = (vfs_node_t *)kernel_malloc(sizeof(vfs_node_t));
+        if (!node) {
+          kernel_free(cluster_buffer);
+          return VFS_ERR;
+        }
+        memset(node, 0, sizeof(vfs_node_t));
+
+        if (fat32_format_short_name(entries[i].name, node->name) != VFS_OK) {
+          kernel_free(node);
+          kernel_free(cluster_buffer);
+          return VFS_ERR;
+        }
+        node->type = (entries[i].attributes & FAT32_ATTR_DIRECTORY)
+                         ? VFS_NODE_DIR
+                         : VFS_NODE_FILE;
+        node->ops = &fat32_vnode_ops;
+        node->sb = parent->sb;
+        node->refcount = 1;
+
+        fat32_node_t *node_data =
+            (fat32_node_t *)kernel_malloc(sizeof(fat32_node_t));
+        if (!node_data) {
+          kernel_free(node);
+          kernel_free(cluster_buffer);
+          return VFS_ERR;
+        }
+        memset(node_data, 0, sizeof(fat32_node_t));
+
+        node_data->first_cluster =
+            ((uint32_t)entries[i].first_cluster_high << 16) |
+            entries[i].first_cluster_low;
+        node_data->current_cluster = node_data->first_cluster;
+        node_data->size = entries[i].file_size;
+        node_data->attributes = entries[i].attributes;
+        node_data->is_directory =
+            (entries[i].attributes & FAT32_ATTR_DIRECTORY) ? 1 : 0;
+        node_data->parent_cluster = parent_data->first_cluster;
+        memcpy(node_data->short_name, entries[i].name, 11);
+
+        node->fs_private = node_data;
+        *out = node;
+
+        kernel_free(cluster_buffer);
+        return VFS_OK;
+      }
+    }
+
+    cluster = fat32_get_fat_entry(fs, cluster);
+  }
+
+  kernel_free(cluster_buffer);
+  return VFS_ERR;
 }
 
 int fat32_create(vfs_node_t *parent, const char *name, vfs_node_t **out) {
-    if (!parent || !name || !out)
-        return VFS_ERR;
+  if (!parent || !name || !out)
+    return VFS_ERR;
 
-    fat32_node_t *parent_data = (fat32_node_t *)parent->fs_private;
-    if (!parent_data || !parent_data->is_directory)
-        return VFS_ERR;
+  fat32_node_t *parent_data = (fat32_node_t *)parent->fs_private;
+  if (!parent_data || !parent_data->is_directory)
+    return VFS_ERR;
 
-    fat32_fs_t *fs = (fat32_fs_t *)parent->sb->private;
-    uint32_t dir_cluster = parent_data->first_cluster;
+  fat32_fs_t *fs = (fat32_fs_t *)parent->sb->private;
+  uint32_t dir_cluster = parent_data->first_cluster;
 
-    // Check if exists
-    vfs_node_t *existing = NULL;
-    if (fat32_lookup(parent, name, &existing) == VFS_OK) {
-        if (existing) {
-            existing->refcount--;
-            if (existing->refcount == 0 && existing->ops->release) {
-                existing->ops->release(existing);
-            }
-        }
-        return VFS_ERR; // Already exists
+  // Check if exists
+  vfs_node_t *existing = NULL;
+  if (fat32_lookup(parent, name, &existing) == VFS_OK) {
+    if (existing) {
+      existing->refcount--;
+      if (existing->refcount == 0 && existing->ops->release) {
+        existing->ops->release(existing);
+      }
     }
+    return VFS_ERR; // Already exists
+  }
 
-    // For empty files, don't allocate cluster yet (FAT32 standard)
-    uint32_t new_cluster = 0;
+  // For empty files, don't allocate cluster yet (FAT32 standard)
+  uint32_t new_cluster = 0;
 
-    // Create dir entry
-    if (fat32_create_dir_entry(fs, dir_cluster, name, new_cluster, 0,
-                               FAT32_ATTR_ARCHIVE) != VFS_OK) {
-        terminal_printf(&main_terminal,
-                       "FAT32: Failed to create dir entry for %s\r\n", name);
-        return VFS_ERR;
-    }
+  // Create dir entry
+  if (fat32_create_dir_entry(fs, dir_cluster, name, new_cluster, 0,
+                             FAT32_ATTR_ARCHIVE) != VFS_OK) {
+    terminal_printf(&main_terminal,
+                    "FAT32: Failed to create dir entry for %s\r\n", name);
+    return VFS_ERR;
+  }
 
-    serial_printf(COM1_BASE, "FAT32: Created dir entry for %s, cluster=0\r\n",
-                  name);
+  serial_printf(COM1_BASE, "FAT32: Created dir entry for %s, cluster=0\r\n",
+                name);
 
-    // Create vnode
-    vfs_node_t *node = (vfs_node_t *)kernel_malloc(sizeof(vfs_node_t));
-    if (!node)
-        return VFS_ERR;
-    memset(node, 0, sizeof(vfs_node_t));
+  // Create vnode
+  vfs_node_t *node = (vfs_node_t *)kernel_malloc(sizeof(vfs_node_t));
+  if (!node)
+    return VFS_ERR;
+  memset(node, 0, sizeof(vfs_node_t));
 
-    strncpy(node->name, name, VFS_NAME_MAX - 1);
-    node->name[VFS_NAME_MAX - 1] = '\0';
-    node->type = VFS_NODE_FILE;
-    node->ops = &fat32_vnode_ops;
-    node->sb = parent->sb;
-    node->refcount = 1;
+  strncpy(node->name, name, VFS_NAME_MAX - 1);
+  node->name[VFS_NAME_MAX - 1] = '\0';
+  node->type = VFS_NODE_FILE;
+  node->ops = &fat32_vnode_ops;
+  node->sb = parent->sb;
+  node->refcount = 1;
 
-    fat32_node_t *node_data = (fat32_node_t *)kernel_malloc(sizeof(fat32_node_t));
-    if (!node_data) {
-        kernel_free(node);
-        return VFS_ERR;
-    }
-    memset(node_data, 0, sizeof(fat32_node_t));
+  fat32_node_t *node_data = (fat32_node_t *)kernel_malloc(sizeof(fat32_node_t));
+  if (!node_data) {
+    kernel_free(node);
+    return VFS_ERR;
+  }
+  memset(node_data, 0, sizeof(fat32_node_t));
 
-    node_data->first_cluster = new_cluster;
-    node_data->current_cluster = new_cluster;
-    node_data->size = 0;
-    node_data->attributes = FAT32_ATTR_ARCHIVE;
-    node_data->is_directory = 0;
-    node_data->parent_cluster = dir_cluster;
+  node_data->first_cluster = new_cluster;
+  node_data->current_cluster = new_cluster;
+  node_data->size = 0;
+  node_data->attributes = FAT32_ATTR_ARCHIVE;
+  node_data->is_directory = 0;
+  node_data->parent_cluster = dir_cluster;
 
-    // Parse short name correctly with uppercase
-    char upper_name[VFS_NAME_MAX];
-    strncpy(upper_name, name, VFS_NAME_MAX - 1);
-    upper_name[VFS_NAME_MAX - 1] = '\0';
-    strupper(upper_name); // Convert to uppercase
-    fat32_parse_short_name(upper_name, node_data->short_name);
+  // Parse short name correctly with uppercase
+  char upper_name[VFS_NAME_MAX];
+  strncpy(upper_name, name, VFS_NAME_MAX - 1);
+  upper_name[VFS_NAME_MAX - 1] = '\0';
+  strupper(upper_name); // Convert to uppercase
+  fat32_parse_short_name(upper_name, node_data->short_name);
 
-    node->fs_private = node_data;
-    *out = node;
+  node->fs_private = node_data;
+  *out = node;
 
-    serial_printf(COM1_BASE, "FAT32: Created vnode for %s successfully\r\n",
-                  name);
-    return VFS_OK;
+  serial_printf(COM1_BASE, "FAT32: Created vnode for %s successfully\r\n",
+                name);
+  return VFS_OK;
 }
-
 
 int fat32_read(vfs_node_t *node, uint8_t *buf, uint32_t size, uint32_t offset) {
   if (!node || !buf)
@@ -2339,18 +2643,19 @@ int fat32_write(vfs_node_t *node, const uint8_t *buf, uint32_t size,
     }
   }
 
-    // Flush caches - CRITICO PARA PERSISTENCIA
+  // Flush caches - CRITICO PARA PERSISTENCIA
   if (fat32_flush_fat_cache(fs) != VFS_OK) {
     terminal_printf(&main_terminal,
                     "FAT32: write warning: failed to flush FAT cache\n");
   }
 
-  // Flush directory cache always after write to ensure size/cluster updates are saved
+  // Flush directory cache always after write to ensure size/cluster updates are
+  // saved
   if (fat32_flush_dir_cache(fs) != VFS_OK) {
     terminal_printf(&main_terminal,
                     "FAT32: write warning: failed to flush dir cache\n");
   }
-  
+
   // Force disk sync
   disk_flush_dispatch(fs->disk);
 
@@ -3055,170 +3360,170 @@ int fat32_create_dir_entry(fat32_fs_t *fs, uint32_t dir_cluster,
 }
 
 int fat32_mkdir(vfs_node_t *parent, const char *name, vfs_node_t **out) {
-    if (!parent || !name || !out || strlen(name) >= VFS_NAME_MAX) {
-        terminal_printf(&main_terminal,
-                       "FAT32: mkdir failed: invalid parameters (parent=%p, "
-                       "name=%s, out=%p)\n",
-                       parent, name, out);
-        return VFS_ERR;
+  if (!parent || !name || !out || strlen(name) >= VFS_NAME_MAX) {
+    terminal_printf(&main_terminal,
+                    "FAT32: mkdir failed: invalid parameters (parent=%p, "
+                    "name=%s, out=%p)\n",
+                    parent, name, out);
+    return VFS_ERR;
+  }
+
+  // Validate name for invalid characters
+  for (const char *p = name; *p; p++) {
+    if (*p <= 0x1F || *p == '*' || *p == '?' || *p == '/' || *p == '\\' ||
+        *p == ':' || *p == '|' || *p == '"' || *p == '<' || *p == '>') {
+      terminal_printf(&main_terminal,
+                      "FAT32: mkdir failed: invalid character in name %s\n",
+                      name);
+      return VFS_ERR;
     }
+  }
 
-    // Validate name for invalid characters
-    for (const char *p = name; *p; p++) {
-        if (*p <= 0x1F || *p == '*' || *p == '?' || *p == '/' || *p == '\\' ||
-            *p == ':' || *p == '|' || *p == '"' || *p == '<' || *p == '>') {
-            terminal_printf(&main_terminal,
-                           "FAT32: mkdir failed: invalid character in name %s\n",
-                           name);
-            return VFS_ERR;
-        }
+  fat32_node_t *parent_data = (fat32_node_t *)parent->fs_private;
+  fat32_fs_t *fs = (fat32_fs_t *)parent->sb->private;
+
+  if (!parent_data->is_directory) {
+    terminal_printf(&main_terminal,
+                    "FAT32: mkdir failed: parent is not a directory\n");
+    return VFS_ERR;
+  }
+
+  // Check if name already exists
+  vfs_node_t *existing = NULL;
+  if (fat32_lookup(parent, name, &existing) == VFS_OK && existing) {
+    terminal_printf(&main_terminal, "FAT32: mkdir failed: %s already exists\n",
+                    name);
+    existing->refcount--;
+    if (existing->refcount == 0 && existing->ops->release) {
+      existing->ops->release(existing);
     }
+    return VFS_ERR;
+  }
 
-    fat32_node_t *parent_data = (fat32_node_t *)parent->fs_private;
-    fat32_fs_t *fs = (fat32_fs_t *)parent->sb->private;
+  // Allocate a new cluster for the directory
+  uint32_t new_cluster = fat32_allocate_cluster(fs);
+  if (new_cluster == FAT32_BAD_CLUSTER) {
+    terminal_printf(&main_terminal,
+                    "FAT32: mkdir failed: unable to allocate cluster\n");
+    return VFS_ERR;
+  }
 
-    if (!parent_data->is_directory) {
-        terminal_printf(&main_terminal,
-                       "FAT32: mkdir failed: parent is not a directory\n");
-        return VFS_ERR;
-    }
+  // Clear the first sector of the cluster
+  uint8_t *sector_buffer = (uint8_t *)kernel_malloc(FAT32_SECTOR_SIZE);
+  if (!sector_buffer) {
+    terminal_printf(&main_terminal,
+                    "FAT32: mkdir failed: unable to allocate sector buffer\n");
+    fat32_free_cluster_chain(fs, new_cluster);
+    return VFS_ERR;
+  }
+  memset(sector_buffer, 0, FAT32_SECTOR_SIZE);
 
-    // Check if name already exists
-    vfs_node_t *existing = NULL;
-    if (fat32_lookup(parent, name, &existing) == VFS_OK && existing) {
-        terminal_printf(&main_terminal, "FAT32: mkdir failed: %s already exists\n",
-                       name);
-        existing->refcount--;
-        if (existing->refcount == 0 && existing->ops->release) {
-            existing->ops->release(existing);
-        }
-        return VFS_ERR;
-    }
+  // Create "." and ".." directory entries
+  fat32_dir_entry_t *entries = (fat32_dir_entry_t *)sector_buffer;
 
-    // Allocate a new cluster for the directory
-    uint32_t new_cluster = fat32_allocate_cluster(fs);
-    if (new_cluster == FAT32_BAD_CLUSTER) {
-        terminal_printf(&main_terminal,
-                       "FAT32: mkdir failed: unable to allocate cluster\n");
-        return VFS_ERR;
-    }
+  // "." entry
+  memset(entries[0].name, ' ', 11);
+  entries[0].name[0] = '.';
+  entries[0].attributes = FAT32_ATTR_DIRECTORY;
+  entries[0].first_cluster_low = new_cluster & 0xFFFF;
+  entries[0].first_cluster_high = (new_cluster >> 16) & 0xFFFF;
+  entries[0].file_size = 0;
+  entries[0].creation_date = 0x4B85; // Example: 2025-09-03
+  entries[0].creation_time = 0x3C00; // Example: 11:00 AM
+  entries[0].write_date = 0x4B85;
+  entries[0].write_time = 0x3C00;
 
-    // Clear the first sector of the cluster
-    uint8_t *sector_buffer = (uint8_t *)kernel_malloc(FAT32_SECTOR_SIZE);
-    if (!sector_buffer) {
-        terminal_printf(&main_terminal,
-                       "FAT32: mkdir failed: unable to allocate sector buffer\n");
-        fat32_free_cluster_chain(fs, new_cluster);
-        return VFS_ERR;
-    }
-    memset(sector_buffer, 0, FAT32_SECTOR_SIZE);
+  // ".." entry
+  uint32_t dotdot_cluster = (parent_data->first_cluster == fs->root_dir_cluster)
+                                ? 0
+                                : parent_data->first_cluster;
+  memset(entries[1].name, ' ', 11);
+  entries[1].name[0] = '.';
+  entries[1].name[1] = '.';
+  entries[1].attributes = FAT32_ATTR_DIRECTORY;
+  entries[1].first_cluster_low = dotdot_cluster & 0xFFFF;
+  entries[1].first_cluster_high = (dotdot_cluster >> 16) & 0xFFFF;
+  entries[1].file_size = 0;
+  entries[1].creation_date = 0x4B85;
+  entries[1].creation_time = 0x3C00;
+  entries[1].write_date = 0x4B85;
+  entries[1].write_time = 0x3C00;
 
-    // Create "." and ".." directory entries
-    fat32_dir_entry_t *entries = (fat32_dir_entry_t *)sector_buffer;
-
-    // "." entry
-    memset(entries[0].name, ' ', 11);
-    entries[0].name[0] = '.';
-    entries[0].attributes = FAT32_ATTR_DIRECTORY;
-    entries[0].first_cluster_low = new_cluster & 0xFFFF;
-    entries[0].first_cluster_high = (new_cluster >> 16) & 0xFFFF;
-    entries[0].file_size = 0;
-    entries[0].creation_date = 0x4B85; // Example: 2025-09-03
-    entries[0].creation_time = 0x3C00; // Example: 11:00 AM
-    entries[0].write_date = 0x4B85;
-    entries[0].write_time = 0x3C00;
-
-    // ".." entry
-    uint32_t dotdot_cluster = (parent_data->first_cluster == fs->root_dir_cluster)
-                                 ? 0
-                                 : parent_data->first_cluster;
-    memset(entries[1].name, ' ', 11);
-    entries[1].name[0] = '.';
-    entries[1].name[1] = '.';
-    entries[1].attributes = FAT32_ATTR_DIRECTORY;
-    entries[1].first_cluster_low = dotdot_cluster & 0xFFFF;
-    entries[1].first_cluster_high = (dotdot_cluster >> 16) & 0xFFFF;
-    entries[1].file_size = 0;
-    entries[1].creation_date = 0x4B85;
-    entries[1].creation_time = 0x3C00;
-    entries[1].write_date = 0x4B85;
-    entries[1].write_time = 0x3C00;
-
-    // Write the first sector of the new directory cluster
-    uint32_t sector = fat32_cluster_to_sector(fs, new_cluster);
-    if (disk_write_dispatch(fs->disk, sector, 1, sector_buffer) !=
-        DISK_ERR_NONE) {
-        terminal_printf(&main_terminal,
-                       "FAT32: mkdir failed: unable to write sector %u\n", sector);
-        kernel_free(sector_buffer);
-        fat32_free_cluster_chain(fs, new_cluster);
-        return VFS_ERR;
-    }
+  // Write the first sector of the new directory cluster
+  uint32_t sector = fat32_cluster_to_sector(fs, new_cluster);
+  if (disk_write_dispatch(fs->disk, sector, 1, sector_buffer) !=
+      DISK_ERR_NONE) {
+    terminal_printf(&main_terminal,
+                    "FAT32: mkdir failed: unable to write sector %u\n", sector);
     kernel_free(sector_buffer);
+    fat32_free_cluster_chain(fs, new_cluster);
+    return VFS_ERR;
+  }
+  kernel_free(sector_buffer);
 
-    // Create directory entry in parent
-    if (fat32_create_dir_entry(fs, parent_data->first_cluster, name, new_cluster,
-                               0, FAT32_ATTR_DIRECTORY) != VFS_OK) {
-        terminal_printf(
-            &main_terminal,
-            "FAT32: mkdir failed: unable to create directory entry for %s\n", name);
-        fat32_free_cluster_chain(fs, new_cluster);
-        return VFS_ERR;
-    }
+  // Create directory entry in parent
+  if (fat32_create_dir_entry(fs, parent_data->first_cluster, name, new_cluster,
+                             0, FAT32_ATTR_DIRECTORY) != VFS_OK) {
+    terminal_printf(
+        &main_terminal,
+        "FAT32: mkdir failed: unable to create directory entry for %s\n", name);
+    fat32_free_cluster_chain(fs, new_cluster);
+    return VFS_ERR;
+  }
 
-    // Flush directory cache
-    if (fat32_flush_dir_cache(fs) != VFS_OK) {
-        terminal_printf(&main_terminal,
-                       "FAT32: mkdir failed: unable to flush directory cache\n");
-        fat32_free_cluster_chain(fs, new_cluster);
-        return VFS_ERR;
-    }
+  // Flush directory cache
+  if (fat32_flush_dir_cache(fs) != VFS_OK) {
+    terminal_printf(&main_terminal,
+                    "FAT32: mkdir failed: unable to flush directory cache\n");
+    fat32_free_cluster_chain(fs, new_cluster);
+    return VFS_ERR;
+  }
 
-    // Create new vnode
-    vfs_node_t *new_dir = (vfs_node_t *)kernel_malloc(sizeof(vfs_node_t));
-    if (!new_dir) {
-        terminal_printf(&main_terminal,
-                       "FAT32: mkdir failed: unable to allocate vnode\n");
-        fat32_free_cluster_chain(fs, new_cluster);
-        return VFS_ERR;
-    }
-    memset(new_dir, 0, sizeof(vfs_node_t));
+  // Create new vnode
+  vfs_node_t *new_dir = (vfs_node_t *)kernel_malloc(sizeof(vfs_node_t));
+  if (!new_dir) {
+    terminal_printf(&main_terminal,
+                    "FAT32: mkdir failed: unable to allocate vnode\n");
+    fat32_free_cluster_chain(fs, new_cluster);
+    return VFS_ERR;
+  }
+  memset(new_dir, 0, sizeof(vfs_node_t));
 
-    fat32_node_t *new_data = (fat32_node_t *)kernel_malloc(sizeof(fat32_node_t));
-    if (!new_data) {
-        terminal_printf(&main_terminal,
-                       "FAT32: mkdir failed: unable to allocate node data\n");
-        kernel_free(new_dir);
-        fat32_free_cluster_chain(fs, new_cluster);
-        return VFS_ERR;
-    }
-    memset(new_data, 0, sizeof(fat32_node_t));
+  fat32_node_t *new_data = (fat32_node_t *)kernel_malloc(sizeof(fat32_node_t));
+  if (!new_data) {
+    terminal_printf(&main_terminal,
+                    "FAT32: mkdir failed: unable to allocate node data\n");
+    kernel_free(new_dir);
+    fat32_free_cluster_chain(fs, new_cluster);
+    return VFS_ERR;
+  }
+  memset(new_data, 0, sizeof(fat32_node_t));
 
-    strncpy(new_dir->name, name, VFS_NAME_MAX - 1);
-    new_dir->type = VFS_NODE_DIR;
-    new_dir->ops = &fat32_vnode_ops;
-    new_dir->sb = parent->sb;
-    new_dir->refcount = 1;
+  strncpy(new_dir->name, name, VFS_NAME_MAX - 1);
+  new_dir->type = VFS_NODE_DIR;
+  new_dir->ops = &fat32_vnode_ops;
+  new_dir->sb = parent->sb;
+  new_dir->refcount = 1;
 
-    new_data->first_cluster = new_cluster;
-    new_data->current_cluster = new_cluster;
-    new_data->is_directory = 1;
-    new_data->parent_cluster = parent_data->first_cluster;
-    fat32_parse_short_name(name, new_data->short_name);
-    new_dir->fs_private = new_data;
+  new_data->first_cluster = new_cluster;
+  new_data->current_cluster = new_cluster;
+  new_data->is_directory = 1;
+  new_data->parent_cluster = parent_data->first_cluster;
+  fat32_parse_short_name(name, new_data->short_name);
+  new_dir->fs_private = new_data;
 
-    *out = new_dir;
-    
-    // Force flush to ensure directory creation persists
-    fat32_flush_fat_cache(fs);
-    fat32_flush_dir_cache(fs);
-    disk_flush_dispatch(fs->disk);
+  *out = new_dir;
 
-    serial_printf(COM1_BASE,
-                 "FAT32: Successfully created directory %s, cluster=%u\n", name,
-                 new_cluster);
+  // Force flush to ensure directory creation persists
+  fat32_flush_fat_cache(fs);
+  fat32_flush_dir_cache(fs);
+  disk_flush_dispatch(fs->disk);
 
-    return VFS_OK;
+  serial_printf(COM1_BASE,
+                "FAT32: Successfully created directory %s, cluster=%u\n", name,
+                new_cluster);
+
+  return VFS_OK;
 }
 
 int fat32_unlink(vfs_node_t *parent, const char *name) {
@@ -4072,10 +4377,10 @@ int fat32_format_with_params(disk_t *disk, uint16_t sectors_per_cluster,
   }
 
   // Step 2: Write FSInfo sector
-  terminal_printf(&main_terminal, "FAT32: Writing FSInfo sector...\n");
+  serial_printf(COM1_BASE, "FAT32: Writing FSInfo sector...\n");
   if (fat32_write_fsinfo_sector(disk, boot_sector.fs_info_sector,
                                 total_clusters - 1, 2) != VFS_OK) {
-    terminal_printf(&main_terminal, "FAT32: Failed to write FSInfo sector\n");
+    serial_printf(COM1_BASE, "FAT32: Failed to write FSInfo sector\n");
     return VFS_ERR;
   }
 

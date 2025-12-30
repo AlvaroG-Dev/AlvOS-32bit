@@ -19,8 +19,59 @@
 #define SYSCALL_STAT 0x0B
 #define SYSCALL_FORK 0x0C
 #define SYSCALL_EXECVE 0x0D
+#define SYSCALL_READKEY 0x0E       // Leer tecla del teclado
+#define SYSCALL_KEY_AVAILABLE 0x0F // Verificar si hay teclas disponibles
+#define SYSCALL_GETC 0x10          // Obtener caracter (similar a getchar)
+#define SYSCALL_GETS 0x11          // Obtener string (similar a gets)
+#define SYSCALL_KBHIT 0x12         // Verificar si hay tecla disponible
+#define SYSCALL_KBFLUSH 0x13       // Limpiar buffer del teclado
+#define SYSCALL_MKDIR 0x14         // Crear directorio
+#define SYSCALL_RMDIR 0x15         // Eliminar directorio
+#define SYSCALL_UNLINK 0x16        // Eliminar archivo
+#define SYSCALL_SEEK 0x17          // Mover puntero de archivo
+#define SYSCALL_TELL 0x18          // Obtener posición en archivo
+#define SYSCALL_IOCTL 0x19         // Control de dispositivo
+#define SYSCALL_GETPPID 0x1A       // Obtener PID del padre
+#define SYSCALL_GETUID 0x1B        // Obtener UID
+#define SYSCALL_GETGID 0x1C        // Obtener GID
+#define SYSCALL_DUP 0x1D           // Duplicar descriptor de archivo
+#define SYSCALL_DUP2 0x1E          // Duplicar descriptor con número específico
+#define SYSCALL_PIPE 0x1F          // Crear pipe
+#define SYSCALL_WAITPID 0x20       // Esperar proceso hijo
+#define SYSCALL_BRK 0x21           // Control de heap
+#define SYSCALL_SBRK 0x22          // Cambiar tamaño del heap
+#define SYSCALL_MMAP 0x23          // Mapear memoria
+#define SYSCALL_MUNMAP 0x24        // Desmapear memoria
+#define SYSCALL_GETDENTS 0x25      // Leer directorio
+#define SYSCALL_FSTAT 0x26         // Estadísticas de archivo abierto
+#define SYSCALL_FSYNC 0x27         // Sincronizar archivo
+#define SYSCALL_TRUNCATE 0x28      // Truncar archivo
+#define SYSCALL_ACCESS 0x29        // Verificar acceso a archivo
+#define SYSCALL_CHMOD 0x2A         // Cambiar permisos
+#define SYSCALL_CHOWN 0x2B         // Cambiar propietario
+#define SYSCALL_UMASK 0x2C         // Cambiar máscara de permisos
+#define SYSCALL_GETRUSAGE 0x2D     // Obtener uso de recursos
+#define SYSCALL_TIMES 0x2E         // Obtener tiempos del proceso
+#define SYSCALL_UNAME 0x2F         // Obtener información del sistema
+#define SYSCALL_SYSCONF 0x30       // Obtener configuración del sistema
+#define SYSCALL_GETPGRP 0x31       // Obtener grupo de proceso
+#define SYSCALL_SETPGID 0x32       // Establecer grupo de proceso
+#define SYSCALL_SETSID 0x33        // Crear nueva sesión
+#define SYSCALL_GETSID 0x34        // Obtener ID de sesión
+#define SYSCALL_MOUNT 0x35         // Montar filesystem
+#define SYSCALL_UMOUNT 0x36        // Desmontar filesystem
+#define SYSCALL_LSEEK 0x37         // Mover puntero de archivo (alias)
+#define SYSCALL_LINK 0x38          // Crear enlace físico
+#define SYSCALL_SYMLINK 0x39       // Crear enlace simbólico
+#define SYSCALL_READLINK 0x3A      // Leer enlace simbólico
+#define SYSCALL_RENAME 0x3B        // Renombrar archivo
+#define SYSCALL_FCHDIR 0x3C        // Cambiar directorio por FD
+#define SYSCALL_FCHMOD 0x3D        // Cambiar permisos de archivo abierto
+#define SYSCALL_FCHOWN 0x3E        // Cambiar propietario de archivo abierto
+#define SYSCALL_UTIME 0x3F         // Cambiar tiempos de acceso/modificación
+#define SYSCALL_SYNC 0x40          // Sincronizar filesystem
 
-// ✅ Definir códigos de error (agregar a syscalls.h)
+// ✅ Definir códigos de error
 #define EPERM 1
 #define ENOENT 2
 #define ESRCH 3
@@ -150,15 +201,31 @@
 #define ERFKILL 132
 #define EHWPOISON 133
 
-// Estructura para argumentos de syscall
+// Estructuras adicionales para syscalls
 typedef struct {
-  uint32_t eax;
-  uint32_t ebx;
-  uint32_t ecx;
-  uint32_t edx;
-  uint32_t esi;
-  uint32_t edi;
-} syscall_args_t;
+  uint32_t st_dev;     // Device ID
+  uint32_t st_ino;     // Inode number
+  uint16_t st_mode;    // File type and mode
+  uint16_t st_nlink;   // Number of hard links
+  uint16_t st_uid;     // User ID of owner
+  uint16_t st_gid;     // Group ID of owner
+  uint32_t st_rdev;    // Device ID (if special file)
+  uint32_t st_size;    // Total size, in bytes
+  uint32_t st_blksize; // Block size for filesystem I/O
+  uint32_t st_blocks;  // Number of 512-byte blocks allocated
+  uint32_t st_atime;   // Time of last access
+  uint32_t st_mtime;   // Time of last modification
+  uint32_t st_ctime;   // Time of last status change
+} vfs_stat_t;
+
+typedef struct {
+  char sysname[65];    // Operating system name
+  char nodename[65];   // Name within network
+  char release[65];    // Operating system release
+  char version[65];    // Operating system version
+  char machine[65];    // Hardware identifier
+  char domainname[65]; // Network domain
+} uname_t;
 
 // Prototipos básicos
 void syscall_init(void);
@@ -168,5 +235,8 @@ void syscall_handler(struct regs *r);
 bool validate_user_pointer(uint32_t ptr, uint32_t size);
 int copy_from_user(void *kernel_dst, uint32_t user_src, size_t size);
 int copy_to_user(uint32_t user_dst, void *kernel_src, size_t size);
+int copy_string_from_user(char *kernel_dst, uint32_t user_src, size_t max_len);
+int copy_string_to_user(uint32_t user_dst, const char *kernel_src,
+                        size_t max_len);
 
 #endif // SYSCALLS_H

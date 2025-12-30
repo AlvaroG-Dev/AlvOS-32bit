@@ -912,7 +912,7 @@ task_t *task_create_user(const char *name, void *user_code_addr, void *arg,
   task->user_stack_size = aligned_stack_size;
   task->user_entry_point = user_code_addr;
   task->user_code_base = user_code_addr;
-  task->user_code_size = 4096;
+  task->user_code_size = 8192;
   task->flags |= TASK_FLAG_USER_MODE;
 
   // 10. Verificar que el contexto de kernel esté correcto

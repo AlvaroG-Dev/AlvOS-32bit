@@ -118,6 +118,7 @@ typedef struct vfs_superblock {
   uint32_t flags;                     /* Flags de montaje */
   struct vfs_superblock *bind_source; /* CORRECCIÓN: usa struct aquí */
   char bind_path[VFS_PATH_MAX];       /* Path dentro del source */
+  uint32_t refcount;                  /* Contador de referencias */
 } vfs_superblock_t;
 
 /* open file descriptor (internal) */
@@ -149,6 +150,8 @@ typedef struct vfs_mount_info {
   uint32_t flags;
   struct vfs_mount_info *next; // Para lista enlazada
 } vfs_mount_info_t;
+
+extern vfs_mount_info_t *mount_list;
 
 /* Public API (POSIX-like fd interface) */
 void vfs_init(void);

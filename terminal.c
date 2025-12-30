@@ -7,6 +7,7 @@
 #include "disk_io_daemon.h"
 #include "dma.h"
 #include "driver_system.h"
+#include "exec.h"
 #include "fat32.h"
 #include "gdt.h"
 #include "installer.h"
@@ -2161,8 +2162,6 @@ void cmd_edit(const char *args) {
   terminal_printf(&main_terminal, "Editor cerrado.\r\n");
 }
 
-// Añade estas funciones si no las tienes
-
 void verify_page_permissions(uint32_t vaddr) {
   uint32_t page_start = vaddr & ~0xFFF;
   uint32_t pd_index = page_start >> 22;
@@ -2296,21 +2295,21 @@ void test_user_mode_simple(void) {
       0x5D,                         // pop ebp ; EBP = base address
 
       // ===== Calcular dirección del mensaje =====
-      0x8D, 0x8D, 0x42, 0x00, 0x00,
+      0x8D, 0x8D, 0x49, 0x00, 0x00,
       0x00, // lea ecx, [ebp+0x42] ; offset al mensaje
 
       // ===== SYS_WRITE stdout =====
       0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
       0xBB, 0x01, 0x00, 0x00, 0x00, // mov ebx, 1
       // ECX ya tiene la dirección
-      0xBA, 0x30, 0x00, 0x00, 0x00, // mov edx, 48
+      0xBA, 0x1C, 0x00, 0x00, 0x00, // mov edx, 27
       0xCD, 0x80,                   // int 0x80
 
       // ===== SYS_WRITE stderr =====
       0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
       0xBB, 0x02, 0x00, 0x00, 0x00, // mov ebx, 2
       // ECX todavía válido
-      0xBA, 0x30, 0x00, 0x00, 0x00, // mov edx, 48
+      0xBA, 0x1C, 0x00, 0x00, 0x00, // mov edx, 27
       0xCD, 0x80,                   // int 0x80
 
       // ===== SYS_GETPID =====
@@ -2725,8 +2724,19 @@ void terminal_execute(Terminal *term, const char *cmd) {
       }
       strncat(args, argv[i], sizeof(args) - strlen(args) - 1);
     }
-  }
+  } else if (strcmp(command, "exec") == 0) {
+    terminal_printf(term, "exec: Loading program: %s\r\n", "/home/hello.bin");
 
+    // Cargar y ejecutar
+    task_t *task = exec_load_and_run("/mnt/sda1/hello.bin");
+
+    if (task) {
+      terminal_printf(term, "exec: Program started (PID %u)\r\n",
+                      task->task_id);
+    } else {
+      terminal_printf(term, "exec: Failed to load or execute program\r\n");
+    }
+  }
   // Comandos de memoria visuales
   else if (strcmp(command, "free") == 0) {
     uint32_t total_p = pmm_get_total_pages();
@@ -2845,7 +2855,7 @@ void terminal_execute(Terminal *term, const char *cmd) {
   }
 
   // Comandos básicos
-  if (strcmp(command, "help") == 0) {
+  else if (strcmp(command, "help") == 0) {
     terminal_puts(term, "Available commands:\r\n");
     terminal_puts(term, "help    - Show this help message\r\n");
     terminal_puts(term, "clear   - Clear the terminal\r\n");
@@ -2860,8 +2870,7 @@ void terminal_execute(Terminal *term, const char *cmd) {
     terminal_puts(term, "su      - Switch user\r\n");
   } else if (strcmp(command, "clear") == 0) {
     terminal_clear(term);
-  }
-  if (strcmp(command, "modules") == 0) {
+  } else if (strcmp(command, "modules") == 0) {
     cmd_list_modules(args);
   }
   if (strcmp(command, "apic") == 0) {
@@ -3139,7 +3148,7 @@ void terminal_execute(Terminal *term, const char *cmd) {
       return;
     }
 
-    char buffer[4096];
+    char buffer[8192];
     int total_read = 0;
     int read_this_time;
     int has_content = 0;

@@ -11,6 +11,7 @@ extern Terminal main_terminal;
 
 static disk_partitions_t managed_disks[MAX_DISKS];
 static uint32_t disk_count = 0;
+extern vfs_mount_info_t *mount_list;
 
 static void print_mount_callback(const char *mountpoint, const char *fs_name,
                                  void *arg) {
@@ -734,12 +735,24 @@ void partition_manager_list_partitions(uint32_t disk_id) {
 part_mgr_err_t partition_manager_auto_mount_all(void) {
   terminal_puts(&main_terminal, "\r\n=== Partition Auto-mount ===\r\n");
 
+  // **VERIFICAR ESTADO INICIAL**
+  terminal_puts(&main_terminal, "Checking existing mounts...\r\n");
+  vfs_mount_info_t *current = mount_list;
+  int existing_mounts = 0;
+  while (current) {
+    terminal_printf(&main_terminal, "  %s -> %s\r\n", current->mountpoint,
+                    current->fs_type);
+    current = current->next;
+    existing_mounts++;
+  }
+  terminal_printf(&main_terminal, "Existing mounts: %d\r\n\r\n",
+                  existing_mounts);
+
   // **CORRECCIÓN: Crear directorios base necesarios**
   // Crear /mnt si no existe
   vfs_node_t *mnt_dir = NULL;
   if (vfs_mkdir("/mnt", &mnt_dir) != VFS_OK) {
-    terminal_puts(&main_terminal,
-                  "WARNING: /mnt already exists or cannot be created\r\n");
+    terminal_puts(&main_terminal, "  /mnt already exists\r\n");
   } else {
     if (mnt_dir) {
       mnt_dir->refcount--;
@@ -747,25 +760,14 @@ part_mgr_err_t partition_manager_auto_mount_all(void) {
         mnt_dir->ops->release(mnt_dir);
       }
     }
+    terminal_puts(&main_terminal, "  Created /mnt directory\r\n");
   }
 
-  // Crear /home si no existe
-  vfs_node_t *home_dir = NULL;
-  if (vfs_mkdir("/home", &home_dir) != VFS_OK) {
-    terminal_puts(&main_terminal, "WARNING: /home already exists\r\n");
-  } else {
-    if (home_dir) {
-      home_dir->refcount--;
-      if (home_dir->refcount == 0 && home_dir->ops->release) {
-        home_dir->ops->release(home_dir);
-      }
-    }
-  }
+  // **NO CREAR /home AQUÍ - será creado por el mount si es necesario**
 
   uint32_t mounted_count = 0;
   uint32_t fat32_count = 0;
-  disk_t *home_disk_instance =
-      NULL; // Para guardar referencia al disco de /home
+  disk_t *home_disk_instance = NULL;
   partition_info_t *home_partition = NULL;
 
   // **PROCESAR CADA DISCO**
@@ -785,7 +787,6 @@ part_mgr_err_t partition_manager_auto_mount_all(void) {
     // **CREAR DISPOSITIVO PARA EL DISCO COMPLETO EN /dev/**
     char disk_device[32];
     snprintf(disk_device, sizeof(disk_device), "/dev/sd%c", disk_letter);
-
     uint32_t minor_base = disk_id * 16;
 
     if (vfs_mknod(disk_device, VFS_DEV_BLOCK, 8, minor_base) == VFS_OK) {
@@ -833,7 +834,6 @@ part_mgr_err_t partition_manager_auto_mount_all(void) {
         char part_device[32];
         snprintf(part_device, sizeof(part_device), "/dev/sd%c%d", disk_letter,
                  part->index + 1);
-
         uint32_t minor = minor_base + part->index + 1;
 
         if (vfs_mknod(part_device, VFS_DEV_BLOCK, 8, minor) != VFS_OK) {
@@ -860,21 +860,20 @@ part_mgr_err_t partition_manager_auto_mount_all(void) {
         if (!has_fat32_sig) {
           terminal_printf(&main_terminal,
                           "      WARNING: No FAT32 signature found\r\n");
-          // Aún así intentar montar si el tipo indica FAT32
         } else {
           terminal_puts(&main_terminal, "      ✓ FAT32 signature verified\r\n");
         }
 
-        // **CORRECCIÓN: CREAR PUNTO DE MONTAJE EN /mnt/**
+        // **CREAR PUNTO DE MONTAJE EN /mnt/**
         char mount_point[64];
         snprintf(mount_point, sizeof(mount_point), "/mnt/sd%c%d", disk_letter,
                  part->index + 1);
 
-        // Crear directorio de montaje
+        // Crear directorio de montaje si no existe
         vfs_node_t *mount_dir = NULL;
         if (vfs_mkdir(mount_point, &mount_dir) != VFS_OK) {
           terminal_printf(&main_terminal,
-                          "      WARNING: Cannot create mount point %s\r\n",
+                          "      Mount point %s already exists\r\n",
                           mount_point);
         } else {
           if (mount_dir) {
@@ -886,8 +885,8 @@ part_mgr_err_t partition_manager_auto_mount_all(void) {
         }
 
         // **INTENTAR MONTAR EN /mnt/**
-        terminal_printf(&main_terminal,
-                        "      Attempting to mount at %s...\r\n", mount_point);
+        terminal_printf(&main_terminal, "      Mounting at %s...\r\n",
+                        mount_point);
 
         int mount_err = vfs_mount(mount_point, "fat32", part_disk);
         if (mount_err != VFS_OK) {
@@ -917,11 +916,16 @@ part_mgr_err_t partition_manager_auto_mount_all(void) {
           mounted_count++;
         }
 
-        // **CORRECCIÓN: DECIDIR QUÉ PARTICION VA EN /home**
-        // Estrategia: Usar la partición más grande para /home
-        if (!home_partition || part->size_mb > home_partition->size_mb) {
+        // **SELECCIONAR PARTICION PARA /home**
+        // Estrategia: Usar la primera partición FAT32 encontrada en el disco 0
+        if (disk_id == 0 && !home_partition) {
           home_partition = part;
           home_disk_instance = part_disk; // Guardar referencia
+          terminal_printf(&main_terminal,
+                          "      Selected for /home candidate\r\n");
+        } else {
+          // Liberar disco si no es candidato para /home
+          kernel_free(part_disk);
         }
 
       } else {
@@ -932,44 +936,104 @@ part_mgr_err_t partition_manager_auto_mount_all(void) {
     }
   }
 
-  // **CORRECCIÓN: MONTAR LA PARTICION ELEGIDA EN /home**
+  // **MONTAR /home SI SE ENCONTRÓ UNA PARTICION APROPIADA**
   if (home_disk_instance && home_partition) {
     terminal_printf(&main_terminal,
                     "\r\nSelected partition %u for /home (%llu MB)\r\n",
                     home_partition->index + 1, home_partition->size_mb);
 
-    // **IMPORTANTE: Usar bind mount o montar la misma instancia**
-    // Por ahora, creamos otro disco para /home (NO RECOMENDADO PERO FUNCIONAL)
-    disk_t *home_disk_copy = (disk_t *)kernel_malloc(sizeof(disk_t));
-    if (home_disk_copy) {
-      // Encontrar el disk_part original
-      disk_partitions_t *disk_part =
-          partition_manager_get_disk(0); // Asumimos disco 0
-      if (disk_part) {
-        disk_err_t home_err = disk_init_from_partition(
-            home_disk_copy, disk_part->disk, home_partition);
-        if (home_err == DISK_ERR_NONE) {
-          int home_mount_err = vfs_mount("/home", "fat32", home_disk_copy);
-          if (home_mount_err == VFS_OK) {
-            terminal_puts(&main_terminal, "      ✓ Mounted as /home\r\n");
+    // **VERIFICAR SI /home YA ESTÁ MONTADO**
+    current = mount_list;
+    vfs_mount_info_t *home_mount = NULL;
 
-            // **CREAR ENLACE SIMBÓLICO PARA CONVENIENCIA**
-            char home_link[64];
-            snprintf(home_link, sizeof(home_link), "/mnt/home");
-            // Nota: Necesitarías implementar vfs_symlink
-            terminal_printf(&main_terminal,
-                            "      Access via: /mnt/sda%u and /home\r\n",
-                            home_partition->index + 1);
-          } else {
-            terminal_printf(&main_terminal,
-                            "      ERROR: Failed to mount /home: %d\r\n",
-                            home_mount_err);
-            kernel_free(home_disk_copy);
+    while (current) {
+      if (strcmp(current->mountpoint, "/home") == 0) {
+        home_mount = current;
+        break;
+      }
+      current = current->next;
+    }
+
+    if (home_mount) {
+      // **DESMONTAR /home EXISTENTE**
+      terminal_printf(&main_terminal, "  Unmounting existing /home (%s)...\r\n",
+                      home_mount->fs_type);
+
+      close_fds_for_mount(home_mount->sb);
+      int unmount_result = vfs_unmount("/home");
+
+      if (unmount_result != VFS_OK) {
+        terminal_puts(&main_terminal,
+                      "  WARNING: Failed to unmount existing /home\r\n");
+        terminal_puts(&main_terminal, "  Will mount anyway...\r\n");
+      } else {
+        terminal_puts(&main_terminal, "  ✓ Existing /home unmounted\r\n");
+      }
+
+      for (volatile int i = 0; i < 100000; i++)
+        ; // Pequeña pausa
+    }
+
+    // **MONTAR EN /home**
+    terminal_puts(&main_terminal, "  Mounting to /home...\r\n");
+
+    int home_mount_err = vfs_mount("/home", "fat32", home_disk_instance);
+    if (home_mount_err == VFS_OK) {
+      terminal_puts(&main_terminal, "      ✓ /home mounted successfully\r\n");
+
+      // **CREAR ENLACE EN /mnt/home PARA FACILIDAD DE ACCESO**
+      vfs_node_t *home_link_dir = NULL;
+      if (vfs_mkdir("/mnt/home", &home_link_dir) == VFS_OK) {
+        if (home_link_dir) {
+          home_link_dir->refcount--;
+          if (home_link_dir->refcount == 0 && home_link_dir->ops->release) {
+            home_link_dir->ops->release(home_link_dir);
           }
-        } else {
-          kernel_free(home_disk_copy);
+        }
+        terminal_puts(&main_terminal,
+                      "      Also accessible via /mnt/home\r\n");
+      }
+    } else {
+      terminal_printf(&main_terminal,
+                      "      ERROR: Failed to mount /home: %d\r\n",
+                      home_mount_err);
+
+      // **FALLBACK: Montar solo en /mnt y crear alias**
+      char fallback_mount[64];
+      snprintf(fallback_mount, sizeof(fallback_mount), "/mnt/sda%d",
+               home_partition->index + 1);
+
+      terminal_printf(&main_terminal, "      Falling back to %s...\r\n",
+                      fallback_mount);
+
+      home_mount_err = vfs_mount(fallback_mount, "fat32", home_disk_instance);
+      if (home_mount_err == VFS_OK) {
+        terminal_printf(&main_terminal, "      ✓ Mounted at %s\r\n",
+                        fallback_mount);
+        terminal_printf(&main_terminal, "      Use: cd %s\r\n", fallback_mount);
+      } else {
+        terminal_printf(&main_terminal,
+                        "      ERROR: Fallback also failed: %d\r\n",
+                        home_mount_err);
+      }
+    }
+
+    // **IMPORTANTE: NO liberar home_disk_instance - vfs_mount lo maneja**
+  } else {
+    terminal_puts(&main_terminal,
+                  "\r\nNo suitable FAT32 partition found for /home\r\n");
+
+    // **CREAR /home CON TMPFS COMO FALLBACK**
+    vfs_node_t *home_dir = NULL;
+    if (vfs_mkdir("/home", &home_dir) == VFS_OK) {
+      if (home_dir) {
+        home_dir->refcount--;
+        if (home_dir->refcount == 0 && home_dir->ops->release) {
+          home_dir->ops->release(home_dir);
         }
       }
+      terminal_puts(&main_terminal,
+                    "  Created empty /home directory (tmpfs)\r\n");
     }
   }
 
@@ -986,23 +1050,6 @@ part_mgr_err_t partition_manager_auto_mount_all(void) {
                   fat32_count);
   terminal_printf(&main_terminal, "FAT32 partitions mounted: %u\r\n",
                   mounted_count);
-
-  if (mounted_count == 0 && fat32_count > 0) {
-    terminal_puts(&main_terminal,
-                  "\r\nERROR: FAT32 partitions found but none mounted!\r\n");
-    terminal_puts(&main_terminal, "Possible issues:\r\n");
-    terminal_puts(&main_terminal,
-                  "  1. FAT32 driver not properly registered\r\n");
-    terminal_puts(&main_terminal,
-                  "  2. Partitions not formatted (no FAT32 signature)\r\n");
-    terminal_puts(&main_terminal, "  3. VFS mount function failing\r\n");
-  }
-
-  // **MOSTRAR ESTRUCTURA CREADA**
-  terminal_puts(&main_terminal, "\r\nCreated structure:\r\n");
-  terminal_puts(&main_terminal, "  /dev/sd*      - Disk devices\r\n");
-  terminal_puts(&main_terminal, "  /mnt/sd*      - Mount points\r\n");
-  terminal_puts(&main_terminal, "  /home         - Home directory\r\n");
 
   // **MOSTRAR MONTAJES ACTIVOS**
   terminal_puts(&main_terminal, "\r\nActive mount points:\r\n");

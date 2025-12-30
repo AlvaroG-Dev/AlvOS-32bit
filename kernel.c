@@ -353,29 +353,6 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
       disk_hardware_initialized = true;
       memcpy(&main_disk, sata_disk, sizeof(disk_t));
       boot_log_info("SATA disk 0 initialized as main disk");
-      if (vfs_mount("/home", "fat32", &main_disk) == VFS_OK) {
-        boot_log_info("Mounted FAT32 (SATA)");
-        home_mounted = true;
-      } else {
-        // Try identifying partitions
-        partition_table_t pt;
-        if (partition_read_table(&main_disk, &pt) == PART_OK) {
-          for (int i = 0; i < 4; i++) {
-            if (partition_is_fat(pt.partitions[i].type)) {
-              disk_t *part_disk = (disk_t *)kernel_malloc(sizeof(disk_t));
-              if (disk_init_from_partition(part_disk, &main_disk,
-                                           &pt.partitions[i]) ==
-                  DISK_ERR_NONE) {
-                if (vfs_mount("/home", "fat32", part_disk) == VFS_OK) {
-                  boot_log_info("Mounted FAT32 partition %d", i);
-                  home_mounted = true;
-                  break;
-                }
-              }
-            }
-          }
-        }
-      }
     }
   }
   if (!home_mounted && !disk_hardware_initialized) {
@@ -389,15 +366,6 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
       uint8_t *test_buffer = (uint8_t *)kernel_malloc(512);
       if (test_buffer &&
           disk_read_dispatch(&main_disk, 0, 1, test_buffer) == DISK_ERR_NONE) {
-        if (check_fat32_signature(test_buffer)) {
-          if (vfs_mount("/home", "fat32", &main_disk) == VFS_OK) {
-            boot_log_info("Mounted FAT32 (IDE)");
-            home_mounted = true;
-          }
-        } else {
-          boot_log_warn("No FAT32 signature on IDE disk, but hardware ready "
-                        "for formatting.");
-        }
         kernel_free(test_buffer);
       } else {
         boot_log_warn("Failed to read IDE disk boot sector.");
@@ -420,16 +388,8 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
         uint8_t *test_buffer = (uint8_t *)kernel_malloc(512);
         if (test_buffer && disk_read_dispatch(&main_disk, 0, 1, test_buffer) ==
                                DISK_ERR_NONE) {
-          if (check_fat32_signature(test_buffer)) {
-            if (vfs_mount("/home", "fat32", &main_disk) == VFS_OK) {
-              boot_log_info("Mounted FAT32 (ATAPI, read-only)");
-              home_mounted = true;
-            }
-          } else {
-            boot_log_warn("No FAT32 signature on ATAPI device, but hardware "
-                          "ready (read-only).");
-          }
           kernel_free(test_buffer);
+          boot_log_warn("ATAPI device ready (read-only).");
         } else {
           boot_log_warn("Failed to read ATAPI boot sector.");
         }

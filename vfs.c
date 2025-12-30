@@ -17,7 +17,7 @@ static vfs_fs_type_t fs_table[VFS_MAX_FS_TYPES];
 static int fs_count = 0;
 
 /* NUEVO: Tabla de montajes como lista enlazada */
-static vfs_mount_info_t *mount_list = NULL;
+vfs_mount_info_t *mount_list = NULL;
 int mount_count = 0;
 
 /* FD table */
@@ -278,6 +278,36 @@ int vfs_mount(const char *mountpoint, const char *fsname, void *device) {
 
   vfs_unlock_restore_irq(f);
 
+  // **NUEVO: Verificar si ya hay un mount para este dispositivo**
+  // **PERO SOLO SI device NO ES NULL (tmpfs tiene device = NULL)**
+  vfs_superblock_t *existing_sb = NULL;
+  vfs_mount_info_t *existing_mount = NULL;
+
+  if (device != NULL) {
+    // Solo buscar superblocks existentes para dispositivos reales
+    current = mount_list;
+    while (current) {
+      // Verificar si es el mismo dispositivo y filesystem
+      if (current->sb && current->sb->backing_device == device &&
+          strcmp(current->fs_type, fsname) == 0) {
+        existing_sb = current->sb;
+        existing_mount = current;
+        terminal_printf(&main_terminal,
+                        "VFS: Found existing %s mount for same device, reusing "
+                        "superblock\r\n",
+                        fsname);
+        break;
+      }
+      current = current->next;
+    }
+  } else {
+    // Para tmpfs y otros filesystems sin dispositivo, siempre crear nuevo
+    // superblock
+    terminal_printf(
+        &main_terminal,
+        "VFS: Creating new superblock for %s (no backing device)\r\n", fsname);
+  }
+
   // Create mount point directory if it's not root and doesn't exist
   if (strcmp(mountpoint, "/") != 0) {
     const char *relpath;
@@ -353,21 +383,36 @@ int vfs_mount(const char *mountpoint, const char *fsname, void *device) {
     }
   }
 
-  // Now proceed with mounting
   vfs_superblock_t *sb = NULL;
-  vfs_fs_type_t *fst = find_fs(fsname);
-  if (!fst || fst->mount(device, &sb) != VFS_OK || !sb) {
-    return VFS_ERR;
+
+  if (existing_sb) {
+    // **REUTILIZAR SUPERBLOCK EXISTENTE**
+    sb = existing_sb;
+    sb->refcount++; // Incrementar contador de referencias
+
+  } else {
+    // **CREAR NUEVO SUPERBLOCK**
+    vfs_fs_type_t *fst = find_fs(fsname);
+    if (!fst || fst->mount(device, &sb) != VFS_OK || !sb) {
+      return VFS_ERR;
+    }
+    sb->refcount = 1;
+    sb->backing_device =
+        device; // Guardar referencia al dispositivo (puede ser NULL para tmpfs)
   }
 
   // Create mount info
   vfs_mount_info_t *mount_info =
       (vfs_mount_info_t *)vfs_alloc(sizeof(vfs_mount_info_t));
   if (!mount_info) {
-    // Cleanup sb
-    if (sb->private)
-      vfs_free(sb->private);
-    vfs_free(sb);
+    // Cleanup sb - solo si nadie más lo está usando
+    if (sb->refcount == 1) {
+      if (sb->private)
+        vfs_free(sb->private);
+      vfs_free(sb);
+    } else {
+      sb->refcount--; // Decrementar ya que no vamos a usarlo
+    }
     return VFS_ERR;
   }
 
@@ -376,7 +421,16 @@ int vfs_mount(const char *mountpoint, const char *fsname, void *device) {
   strncpy(mount_info->mountpoint, mountpoint, VFS_PATH_MAX - 1);
   mount_info->mountpoint[VFS_PATH_MAX - 1] = '\0';
   strncpy(mount_info->fs_type, fsname, sizeof(mount_info->fs_type) - 1);
-  mount_info->flags = 0;
+
+  // **MARCAR COMO BIND MOUNT SI ES REUTILIZACIÓN**
+  if (existing_sb) {
+    mount_info->flags = VFS_MOUNT_BIND;
+    if (existing_mount) {
+      strncpy(mount_info->source, existing_mount->mountpoint, VFS_PATH_MAX - 1);
+    }
+  } else {
+    mount_info->flags = 0;
+  }
 
   // Agregar a lista
   f = vfs_lock_disable_irq();
@@ -384,6 +438,10 @@ int vfs_mount(const char *mountpoint, const char *fsname, void *device) {
   mount_list = mount_info;
   mount_count++;
   vfs_unlock_restore_irq(f);
+
+  terminal_printf(
+      &main_terminal, "VFS: Mounted %s at %s (refcount: %u, device: %s)\r\n",
+      fsname, mountpoint, sb->refcount, device ? "present" : "none");
 
   return VFS_OK;
 }
@@ -905,31 +963,54 @@ int vfs_unmount(const char *mountpoint) {
     return VFS_ERR;
   }
 
-  // ✅ Llamar a FS-specific unmount - EL FS DEBE ENCARGARSE DE LIBERAR TODO
-  vfs_fs_type_t *fst = find_fs(sb->fs_name);
-  if (fst && fst->unmount) {
-    int ret = fst->unmount(sb);
-    if (ret != VFS_OK) {
-      boot_log_info("VFS: FS-specific unmount failed for %s (error %d)\r\n",
-                    normalized, ret);
-      boot_log_error();
-      return ret;
+  // **Decrementar refcount**
+  terminal_printf(&main_terminal,
+                  "VFS: Unmounting %s (fs: %s, refcount: %u -> %u)\r\n",
+                  normalized, sb->fs_name, sb->refcount, sb->refcount - 1);
+
+  sb->refcount--;
+
+  // **SOLO LIBERAR SI ES LA ÚLTIMA REFERENCIA**
+  if (sb->refcount == 0) {
+    terminal_printf(&main_terminal,
+                    "VFS: Last reference to superblock, freeing...\r\n");
+
+    // ✅ Llamar a FS-specific unmount
+    vfs_fs_type_t *fst = find_fs(sb->fs_name);
+    if (fst && fst->unmount) {
+      int ret = fst->unmount(sb);
+      if (ret != VFS_OK) {
+        boot_log_info("VFS: FS-specific unmount failed for %s (error %d)\r\n",
+                      normalized, ret);
+        boot_log_error();
+        // Restaurar refcount ya que falló
+        sb->refcount++;
+        return ret;
+      }
+    } else {
+      // **MANEJO ESPECIAL PARA TMPFS Y OTROS SIN UNMOUNT**
+      terminal_printf(
+          &main_terminal,
+          "VFS: No FS-specific unmount for %s, using generic cleanup\r\n",
+          sb->fs_name);
+
+      // ✅ Liberación genérica
+      if (sb->root && sb->root->ops && sb->root->ops->release) {
+        sb->root->ops->release(sb->root);
+      }
+      if (sb->private) {
+        kernel_free(sb->private);
+      }
+      kernel_free(sb);
     }
   } else {
-    boot_log_warn("VFS: Warning: No FS-specific unmount for %s (fs: %s)\r\n",
-                  normalized, sb->fs_name);
-
-    // ✅ Liberación mínima si no hay unmount específico
-    if (sb->root && sb->root->ops && sb->root->ops->release) {
-      sb->root->ops->release(sb->root);
-    }
-    if (sb->private) {
-      kernel_free(sb->private);
-    }
-    kernel_free(sb);
+    terminal_printf(
+        &main_terminal,
+        "VFS: Superblock still has %u references, keeping alive\r\n",
+        sb->refcount);
   }
 
-  // ✅ Limpiar tabla de mounts (esto debe hacerse SIEMPRE)
+  // ✅ Limpiar tabla de mounts
   f = vfs_lock_disable_irq();
   if (prev) {
     prev->next = found_info->next;
@@ -942,6 +1023,8 @@ int vfs_unmount(const char *mountpoint) {
   // Liberar mount_info
   vfs_free(found_info);
 
+  terminal_printf(&main_terminal, "VFS: Successfully unmounted %s\r\n",
+                  normalized);
   return VFS_OK;
 }
 
@@ -1017,10 +1100,67 @@ static vfs_mount_info_t *find_mount_info(const char *mountpoint) {
   }
   return NULL;
 }
+/* Funciones wrapper estáticas para bind mounts */
+static int bind_readdir_wrapper(vfs_node_t *node, vfs_dirent_t *buf,
+                                uint32_t *count, uint32_t offset) {
+  vfs_node_t *original = (vfs_node_t *)node->fs_private;
+  if (!original || !original->ops || !original->ops->readdir) {
+    return VFS_ERR;
+  }
+  return original->ops->readdir(original, buf, count, offset);
+}
 
-/* Crear bind mount */
+static int bind_lookup_wrapper(vfs_node_t *parent, const char *name,
+                               vfs_node_t **out) {
+  vfs_node_t *original = (vfs_node_t *)parent->fs_private;
+  if (!original || !original->ops || !original->ops->lookup) {
+    return VFS_ERR;
+  }
+  return original->ops->lookup(original, name, out);
+}
+
+static void bind_release_wrapper(vfs_node_t *node) {
+  vfs_node_t *original = (vfs_node_t *)node->fs_private;
+  if (original) {
+    original->refcount--;
+    if (original->refcount == 0 && original->ops && original->ops->release) {
+      original->ops->release(original);
+    }
+  }
+  // Liberar el nodo bind
+  kernel_free(node);
+}
+
+static int bind_create_wrapper(vfs_node_t *parent, const char *name,
+                               vfs_node_t **out) {
+  vfs_node_t *original = (vfs_node_t *)parent->fs_private;
+  if (!original || !original->ops || !original->ops->create) {
+    return VFS_ERR;
+  }
+  return original->ops->create(original, name, out);
+}
+
+static int bind_mkdir_wrapper(vfs_node_t *parent, const char *name,
+                              vfs_node_t **out) {
+  vfs_node_t *original = (vfs_node_t *)parent->fs_private;
+  if (!original || !original->ops || !original->ops->mkdir) {
+    return VFS_ERR;
+  }
+  return original->ops->mkdir(original, name, out);
+}
+
+static int bind_unlink_wrapper(vfs_node_t *parent, const char *name) {
+  vfs_node_t *original = (vfs_node_t *)parent->fs_private;
+  if (!original || !original->ops || !original->ops->unlink) {
+    return VFS_ERR;
+  }
+  return original->ops->unlink(original, name);
+}
+
+/* Crear bind mount - VERSIÓN CORREGIDA PARA C */
 int vfs_bind_mount(const char *source, const char *target, int recursive) {
   if (!source || !target) {
+    terminal_printf(&main_terminal, "VFS_BIND_MOUNT: Invalid parameters\r\n");
     return VFS_ERR;
   }
 
@@ -1029,44 +1169,108 @@ int vfs_bind_mount(const char *source, const char *target, int recursive) {
 
   if (vfs_normalize_path(source, norm_source, VFS_PATH_MAX) != VFS_OK ||
       vfs_normalize_path(target, norm_target, VFS_PATH_MAX) != VFS_OK) {
+    terminal_printf(&main_terminal,
+                    "VFS_BIND_MOUNT: Failed to normalize paths\r\n");
     return VFS_ERR;
   }
+
+  terminal_printf(&main_terminal, "VFS_BIND_MOUNT: Attempting %s -> %s\r\n",
+                  norm_source, norm_target);
 
   // Buscar el filesystem source
   const char *source_rel;
   vfs_superblock_t *source_sb = find_mount_for_path(norm_source, &source_rel);
   if (!source_sb) {
-    terminal_printf(&main_terminal, "vfs_bind_mount: Source not found: %s\r\n",
+    terminal_printf(&main_terminal, "VFS_BIND_MOUNT: Source not found: %s\r\n",
                     norm_source);
     return VFS_ERR;
   }
 
-  // Resolver el nodo source
+  // Resolver el nodo source - DEBE SER UN DIRECTORIO
   vfs_node_t *source_node = resolve_path_to_vnode(source_sb, source_rel);
   if (!source_node) {
     terminal_printf(&main_terminal,
-                    "vfs_bind_mount: Source node not found: %s\r\n",
+                    "VFS_BIND_MOUNT: Source node not found: %s\r\n",
                     source_rel);
     return VFS_ERR;
   }
 
-  // Verificar que sea un directorio
+  // **VERIFICACIÓN CRÍTICA: Debe ser un directorio**
   if (source_node->type != VFS_NODE_DIR) {
     terminal_printf(&main_terminal,
-                    "vfs_bind_mount: Source is not a directory\r\n");
+                    "VFS_BIND_MOUNT: Source is not a directory (type: %d)\r\n",
+                    source_node->type);
     source_node->refcount--;
-    if (source_node->refcount == 0 && source_node->ops->release) {
+    if (source_node->refcount == 0 && source_node->ops &&
+        source_node->ops->release) {
       source_node->ops->release(source_node);
     }
     return VFS_ERR;
   }
 
-  // Crear nuevo superblock para bind mount
+  // **CREAR NODO PARA BIND MOUNT**
+  vfs_node_t *bind_node = (vfs_node_t *)vfs_alloc(sizeof(vfs_node_t));
+  if (!bind_node) {
+    source_node->refcount--;
+    if (source_node->refcount == 0 && source_node->ops &&
+        source_node->ops->release) {
+      source_node->ops->release(source_node);
+    }
+    return VFS_ERR;
+  }
+
+  memset(bind_node, 0, sizeof(vfs_node_t));
+
+  // **CONFIGURAR COMO DIRECTORIO**
+  strncpy(bind_node->name, source_node->name, VFS_NAME_MAX - 1);
+  bind_node->type = VFS_NODE_DIR;
+  bind_node->refcount = 1;
+
+  // **GUARDAR EL NODO ORIGINAL**
+  bind_node->fs_private = source_node;
+
+  // **CREAR OPERACIONES WRAPPER ESTÁTICAS**
+  static vnode_ops_t bind_ops = {
+      .lookup = bind_lookup_wrapper,
+      .create = bind_create_wrapper,
+      .mkdir = bind_mkdir_wrapper,
+      .read = NULL,  // No soportado para directorios en bind mount
+      .write = NULL, // No soportado para directorios en bind mount
+      .readdir = bind_readdir_wrapper,
+      .release = bind_release_wrapper,
+      .unlink = bind_unlink_wrapper,
+      .symlink = NULL, // Puedes agregar wrapper si es necesario
+      .readlink = NULL,
+      .truncate = NULL,
+      .getattr = NULL};
+
+  // **COPIAR OTRAS OPERACIONES DEL SOURCE SI EXISTEN**
+  if (source_node->ops) {
+    // Ya configuramos las principales, copiamos las opcionales
+    if (source_node->ops->symlink) {
+      // Necesitarías crear un wrapper para symlink también
+    }
+    if (source_node->ops->readlink) {
+      // Necesitarías crear un wrapper para readlink también
+    }
+    if (source_node->ops->truncate) {
+      bind_ops.truncate = source_node->ops->truncate;
+    }
+    if (source_node->ops->getattr) {
+      bind_ops.getattr = source_node->ops->getattr;
+    }
+  }
+
+  bind_node->ops = &bind_ops;
+
+  // Crear superblock para bind mount
   vfs_superblock_t *bind_sb =
       (vfs_superblock_t *)vfs_alloc(sizeof(vfs_superblock_t));
   if (!bind_sb) {
+    kernel_free(bind_node);
     source_node->refcount--;
-    if (source_node->refcount == 0 && source_node->ops->release) {
+    if (source_node->refcount == 0 && source_node->ops &&
+        source_node->ops->release) {
       source_node->ops->release(source_node);
     }
     return VFS_ERR;
@@ -1074,16 +1278,26 @@ int vfs_bind_mount(const char *source, const char *target, int recursive) {
 
   memset(bind_sb, 0, sizeof(vfs_superblock_t));
   strncpy(bind_sb->fs_name, "bind", sizeof(bind_sb->fs_name) - 1);
-  bind_sb->root = source_node;
+  bind_sb->root = bind_node;
   bind_sb->flags = VFS_MOUNT_BIND | (recursive ? VFS_MOUNT_RECURSIVE : 0);
   bind_sb->bind_source = source_sb;
   strncpy(bind_sb->bind_path, source_rel, VFS_PATH_MAX - 1);
+  bind_sb->backing_device = source_sb->backing_device; // Mismo dispositivo
+
+  // **ESTABLECER SUPERBLOCK**
+  bind_node->sb = bind_sb;
 
   // Crear mount info
   vfs_mount_info_t *mount_info =
       (vfs_mount_info_t *)vfs_alloc(sizeof(vfs_mount_info_t));
   if (!mount_info) {
-    vfs_free(bind_sb);
+    kernel_free(bind_sb);
+    kernel_free(bind_node);
+    source_node->refcount--;
+    if (source_node->refcount == 0 && source_node->ops &&
+        source_node->ops->release) {
+      source_node->ops->release(source_node);
+    }
     return VFS_ERR;
   }
 
@@ -1101,8 +1315,11 @@ int vfs_bind_mount(const char *source, const char *target, int recursive) {
   mount_count++;
   vfs_unlock_restore_irq(f);
 
-  terminal_printf(&main_terminal, "Bind mount created: %s -> %s\r\n",
+  terminal_printf(&main_terminal, "✓ Bind mount created: %s -> %s\r\n",
                   norm_source, norm_target);
+
+  // **INCREMENTAR REFCOUNT DEL SOURCE NODE**
+  source_node->refcount++;
 
   return VFS_OK;
 }
