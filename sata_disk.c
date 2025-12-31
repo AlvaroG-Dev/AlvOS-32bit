@@ -132,6 +132,17 @@ bool sata_disk_init(void) {
     sata_initialized = true;
     terminal_printf(&main_terminal, "SATA: Initialized %u SATA disk(s)\r\n",
                     sata_disk_count);
+
+    // Create driver instances for the system
+    for (uint32_t i = 0; i < sata_disk_count; i++) {
+      char name[16];
+      snprintf(name, sizeof(name), "sata%d", i);
+      driver_instance_t *drv = sata_disk_driver_create(name);
+      if (drv) {
+        driver_init(drv, NULL);
+        driver_start(drv);
+      }
+    }
     return true;
   }
 
@@ -794,4 +805,86 @@ void sata_disk_debug_port(uint8_t port_num) {
   terminal_printf(&main_terminal, "DET: %s\n", det_str[det & 0x3]);
   if (ipm < 5)
     terminal_printf(&main_terminal, "IPM: %s\n", ipm_str[ipm]);
+}
+
+// ========================================================================
+// DRIVER SYSTEM INTEGRATION
+// ========================================================================
+#include "driver_system.h"
+
+static int sata_disk_driver_init(driver_instance_t *drv, void *config) {
+  (void)config;
+  if (!drv)
+    return -1;
+  if (!sata_disk_init()) {
+    return -1;
+  }
+  return 0;
+}
+
+static int sata_disk_driver_start(driver_instance_t *drv) {
+  if (!drv)
+    return -1;
+  terminal_printf(&main_terminal,
+                  "SATA disk driver: Started. Found %u disks.\r\n",
+                  sata_disk_count);
+  return 0;
+}
+
+static int sata_disk_driver_stop(driver_instance_t *drv) {
+  if (!drv)
+    return -1;
+  // No hay mucho que parar aquí, tal vez flush cache
+  return 0;
+}
+
+static int sata_disk_driver_cleanup(driver_instance_t *drv) {
+  if (!drv)
+    return -1;
+  sata_disk_cleanup();
+  return 0;
+}
+
+static int sata_disk_driver_ioctl(driver_instance_t *drv, uint32_t cmd,
+                                  void *arg) {
+  if (!drv)
+    return -1;
+
+  switch (cmd) {
+  case 0x2001: // List disks
+    sata_disk_list();
+    return 0;
+  case 0x2002: { // Get disk count
+    uint32_t *count = (uint32_t *)arg;
+    if (count)
+      *count = sata_disk_count;
+    return 0;
+  }
+  default:
+    return -1;
+  }
+}
+
+static driver_ops_t sata_disk_driver_ops = {.init = sata_disk_driver_init,
+                                            .start = sata_disk_driver_start,
+                                            .stop = sata_disk_driver_stop,
+                                            .cleanup = sata_disk_driver_cleanup,
+                                            .ioctl = sata_disk_driver_ioctl,
+                                            .load_data = NULL};
+
+static driver_type_info_t sata_disk_driver_type = {.type = DRIVER_TYPE_STORAGE,
+                                                   .type_name = "sata_disk",
+                                                   .version = "1.0.0",
+                                                   .priv_data_size = 0,
+                                                   .default_ops =
+                                                       &sata_disk_driver_ops,
+                                                   .validate_data = NULL,
+                                                   .print_info = NULL};
+
+int sata_disk_driver_register_type(void) {
+  return driver_register_type(&sata_disk_driver_type);
+}
+
+driver_instance_t *sata_disk_driver_create(const char *name) {
+  return driver_create(DRIVER_TYPE_STORAGE, name);
 }

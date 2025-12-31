@@ -114,12 +114,16 @@ void shutdown(void) {
   boot_log_info("Cleaning tasks");
   task_cleanup_zombies();
   boot_log_ok();
-  // 4. Limpiar sistema de drivers
+
+  // 4. Desmontar sistemas de archivos (DEBE ser antes de limpiar drivers para
+  // poder flashear caches)
+  boot_log_info("Unmounting filesystems");
+  vfs_list_mounts(unmount_callback, &unmount_data);
+  boot_log_ok();
+
+  // 5. Limpiar sistema de drivers
   boot_log_info("Cleaning drivers");
   driver_system_cleanup();
-  boot_log_ok();
-  // Desmontar usando vfs_list_mounts
-  vfs_list_mounts(unmount_callback, &unmount_data);
   boot_log_ok();
   // 6. Limpiar módulos
   boot_log_info("Cleaning modules");
@@ -279,6 +283,20 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
   outb(0x40, (uint8_t)(divisor & 0xFF));
   outb(0x40, (uint8_t)((divisor >> 8) & 0xFF));
   boot_log_ok();
+  // 13. Inicializar drivers
+  boot_log_start("Initializing driver system");
+  driver_system_init();
+  keyboard_set_handler(keyboard_terminal_handler);
+  boot_log_ok();
+  // 14. Cargar layout de teclado
+  boot_log_start("Loading keyboard layout");
+  if (keyboard_load_layout("/dev/ES-KBD.KBD", "ES-QWERTY") == 0) {
+    keyboard_set_layout("ES-QWERTY");
+    boot_log_info("Loaded ES-QWERTY layout");
+    boot_log_ok();
+  } else {
+    boot_log_warn("Using default layout");
+  }
   initialize_acpi_pci();
   // NUEVO: Ahora sí inicializar el timer (usará APIC si está disponible)
   boot_log_start("Initializing timer");
@@ -416,20 +434,6 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
   boot_log_start("Initializing logging system");
   log_init();
   boot_log_ok();
-  // 13. Inicializar drivers
-  boot_log_start("Initializing driver system");
-  keyboard_set_handler(keyboard_terminal_handler);
-  driver_system_init();
-  boot_log_ok();
-  // 14. Cargar layout de teclado
-  boot_log_start("Loading keyboard layout");
-  if (keyboard_load_layout("/dev/ES-KBD.KBD", "ES-QWERTY") == 0) {
-    keyboard_set_layout("ES-QWERTY");
-    boot_log_info("Loaded ES-QWERTY layout");
-    boot_log_ok();
-  } else {
-    boot_log_warn("Using default layout");
-  }
   // Inicializar gestor de particiones
   partition_manager_init();
   disk_scan_all_buses();

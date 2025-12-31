@@ -65,7 +65,6 @@ compile "serial.c"     "$GCC $GCC_OPTS -c serial.c -o build/serial.o"
 compile "log.c"        "$GCC $GCC_OPTS -c log.c -o build/log.o"
 compile "module_loader.c" "$GCC $GCC_OPTS -c module_loader.c -o build/module_loader.o"
 compile "driver_system.c" "$GCC $GCC_OPTS -c driver_system.c -o build/driver_system.o"
-compile "keyboard_driver.c" "$GCC $GCC_OPTS -c ./drivers/keyboard_driver.c -o build/keyboard_driver.o"
 compile "pci.c" "$GCC $GCC_OPTS -c pci.c -o build/pci.o"
 compile "acpi.c" "$GCC $GCC_OPTS -c acpi.c -o build/acpi.o"
 compile "dma.c" "$GCC $GCC_OPTS -c dma.c -o build/dma.o"
@@ -99,7 +98,7 @@ ld -m elf_i386 -T linker.ld -o build/kernel.bin \
     build/keyboard.o build/drawing.o build/math_utils.o build/terminal.o \
     build/disk.o build/disk_io_daemon.o build/task.o build/task_switch.o build/task_utils.o \
     build/task_test.o build/serial.o build/vfs.o build/tmpfs.o build/fat32.o build/log.o \
-    build/module_loader.o build/driver_system.o build/keyboard_driver.o \
+    build/module_loader.o build/driver_system.o \
     build/pci.o build/acpi.o build/dma.o build/ahci.o build/sata_disk.o \
     build/atapi.o build/usb_core.o build/usb_disk_wrapper.o \
     build/uhci.o build/usb_mass_storage.o build/ehci.o build/usb_commands.o \

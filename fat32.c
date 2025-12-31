@@ -1085,7 +1085,7 @@ int fat32_mount(void *device, vfs_superblock_t **out_sb) {
   }
   memset(sb, 0, sizeof(vfs_superblock_t));
   strcpy(sb->fs_name, "fat32");
-  sb->private = fs;
+  sb->priv = fs;
   sb->backing_device = device;
 
   // Initialize root node
@@ -1153,7 +1153,7 @@ static int fat32_unmount(vfs_superblock_t *sb) {
     return VFS_ERR;
   }
 
-  fat32_fs_t *fs = (fat32_fs_t *)sb->private;
+  fat32_fs_t *fs = (fat32_fs_t *)sb->priv;
   if (!fs) {
     terminal_puts(&main_terminal,
                   "FAT32: unmount failed: invalid filesystem structure\r\n");
@@ -1307,7 +1307,7 @@ static int fat32_unmount(vfs_superblock_t *sb) {
   }
 
   kernel_free(fs);
-  sb->private = NULL;
+  sb->priv = NULL;
 
   terminal_puts(&main_terminal, "FAT32: Unmount completed\r\n");
   return result;
@@ -2172,7 +2172,7 @@ int fat32_lookup(vfs_node_t *parent, const char *name, vfs_node_t **out) {
   if (!parent_data || !parent_data->is_directory)
     return VFS_ERR;
 
-  fat32_fs_t *fs = (fat32_fs_t *)parent->sb->private;
+  fat32_fs_t *fs = (fat32_fs_t *)parent->sb->priv;
   uint32_t cluster = parent_data->first_cluster;
 
   // Convertir name a uppercase para comparación
@@ -2269,7 +2269,7 @@ int fat32_create(vfs_node_t *parent, const char *name, vfs_node_t **out) {
   if (!parent_data || !parent_data->is_directory)
     return VFS_ERR;
 
-  fat32_fs_t *fs = (fat32_fs_t *)parent->sb->private;
+  fat32_fs_t *fs = (fat32_fs_t *)parent->sb->priv;
   uint32_t dir_cluster = parent_data->first_cluster;
 
   // Check if exists
@@ -2348,7 +2348,7 @@ int fat32_read(vfs_node_t *node, uint8_t *buf, uint32_t size, uint32_t offset) {
   if (!node_data || node_data->is_directory)
     return VFS_ERR;
 
-  fat32_fs_t *fs = (fat32_fs_t *)node->sb->private;
+  fat32_fs_t *fs = (fat32_fs_t *)node->sb->priv;
   if (offset >= node_data->size)
     return 0;
 
@@ -2404,7 +2404,7 @@ int fat32_write(vfs_node_t *node, const uint8_t *buf, uint32_t size,
   }
 
   fat32_node_t *node_data = (fat32_node_t *)node->fs_private;
-  fat32_fs_t *fs = (fat32_fs_t *)node->sb->private;
+  fat32_fs_t *fs = (fat32_fs_t *)node->sb->priv;
 
   if (!fs || !fs->disk || !fs->fat_cache) {
     terminal_printf(&main_terminal,
@@ -2672,7 +2672,7 @@ int fat32_readdir(vfs_node_t *node, vfs_dirent_t *buf, uint32_t *count,
     return VFS_ERR;
   }
 
-  fat32_fs_t *fs = (fat32_fs_t *)node->sb->private;
+  fat32_fs_t *fs = (fat32_fs_t *)node->sb->priv;
   fat32_node_t *node_data = (fat32_node_t *)node->fs_private;
 
   if (!node_data->is_directory) {
@@ -2832,7 +2832,7 @@ void fat32_release(vfs_node_t *node) {
   }
 
   // Verificar filesystem structure
-  fat32_fs_t *fs = node->sb ? (fat32_fs_t *)node->sb->private : NULL;
+  fat32_fs_t *fs = node->sb ? (fat32_fs_t *)node->sb->priv : NULL;
   if (fs && fs->disk) {
     // Solo flush si el filesystem parece válido
     if ((uintptr_t)fs > 0x100000 && (uintptr_t)fs < 0xFFFFFFFF) {
@@ -3380,7 +3380,7 @@ int fat32_mkdir(vfs_node_t *parent, const char *name, vfs_node_t **out) {
   }
 
   fat32_node_t *parent_data = (fat32_node_t *)parent->fs_private;
-  fat32_fs_t *fs = (fat32_fs_t *)parent->sb->private;
+  fat32_fs_t *fs = (fat32_fs_t *)parent->sb->priv;
 
   if (!parent_data->is_directory) {
     terminal_printf(&main_terminal,
@@ -3528,7 +3528,7 @@ int fat32_mkdir(vfs_node_t *parent, const char *name, vfs_node_t **out) {
 
 int fat32_unlink(vfs_node_t *parent, const char *name) {
   fat32_node_t *parent_data = (fat32_node_t *)parent->fs_private;
-  fat32_fs_t *fs = (fat32_fs_t *)parent->sb->private;
+  fat32_fs_t *fs = (fat32_fs_t *)parent->sb->priv;
 
   if (!parent_data->is_directory)
     return VFS_ERR;

@@ -407,8 +407,8 @@ int vfs_mount(const char *mountpoint, const char *fsname, void *device) {
   if (!mount_info) {
     // Cleanup sb - solo si nadie más lo está usando
     if (sb->refcount == 1) {
-      if (sb->private)
-        vfs_free(sb->private);
+      if (sb->priv)         // Changed from sb->private to sb->priv
+        vfs_free(sb->priv); // Changed from sb->private to sb->priv
       vfs_free(sb);
     } else {
       sb->refcount--; // Decrementar ya que no vamos a usarlo
@@ -998,8 +998,8 @@ int vfs_unmount(const char *mountpoint) {
       if (sb->root && sb->root->ops && sb->root->ops->release) {
         sb->root->ops->release(sb->root);
       }
-      if (sb->private) {
-        kernel_free(sb->private);
+      if (sb->priv) {
+        kernel_free(sb->priv);
       }
       kernel_free(sb);
     }

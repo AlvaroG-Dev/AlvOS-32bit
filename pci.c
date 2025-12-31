@@ -98,6 +98,13 @@ void pci_init(void) {
   terminal_printf(&main_terminal,
                   "PCI initialization complete. Found %u devices.\r\n",
                   pci_device_count);
+
+  pci_driver_create("pci_bus");
+  driver_instance_t *drv = driver_find_by_name("pci_bus");
+  if (drv) {
+    driver_init(drv, NULL);
+    driver_start(drv);
+  }
 }
 void pci_scan_all_buses(void) {
   // Primero verificar si el host bridge es multi-function
@@ -355,10 +362,97 @@ const char *pci_get_class_name(uint8_t class_code) {
   return "Unknown";
 }
 const char *pci_get_vendor_name(uint16_t vendor_id) {
-  for (int i = 0; vendor_names[i].name != NULL; i++) {
-    if (vendor_names[i].id == vendor_id) {
-      return vendor_names[i].name;
+  if (vendor_id == 0x8086)
+    return "Intel Corporation";
+  if (vendor_id == 0x10EC)
+    return "Realtek Semiconductor Co., Ltd.";
+  if (vendor_id == 0x1AF4)
+    return "VirtIO";
+  if (vendor_id == 0x1022)
+    return "AMD";
+  if (vendor_id == 0x1234)
+    return "QEMU Virtual Video Controller";
+  return "Unknown Vendor";
+}
+
+// ========================================================================
+// DRIVER SYSTEM INTEGRATION
+// ========================================================================
+#include "driver_system.h"
+
+static int pci_driver_init(driver_instance_t *drv, void *config) {
+  (void)config;
+  if (!drv)
+    return -1;
+  pci_init();
+  return 0;
+}
+
+static int pci_driver_start(driver_instance_t *drv) {
+  if (!drv)
+    return -1;
+  terminal_printf(&main_terminal,
+                  "PCI driver: Started. Enumerated %u devices.\r\n",
+                  pci_device_count);
+  return 0;
+}
+
+static int pci_driver_stop(driver_instance_t *drv) {
+  if (!drv)
+    return -1;
+  return 0;
+}
+
+static int pci_driver_cleanup(driver_instance_t *drv) {
+  if (!drv)
+    return -1;
+  return 0;
+}
+
+static int pci_driver_ioctl(driver_instance_t *drv, uint32_t cmd, void *arg) {
+  if (!drv)
+    return -1;
+
+  switch (cmd) {
+  case 0x3001: // List devices
+    pci_list_devices();
+    return 0;
+  case 0x3002: { // Find device by ID
+    struct {
+      uint16_t v;
+      uint16_t d;
+      pci_device_t **out;
+    } *f = arg;
+    if (f && f->out) {
+      *f->out = pci_find_device(f->v, f->d);
+      return 0;
     }
+    return -1;
   }
-  return "Unknown";
+  default:
+    return -1;
+  }
+}
+
+static driver_ops_t pci_driver_ops = {.init = pci_driver_init,
+                                      .start = pci_driver_start,
+                                      .stop = pci_driver_stop,
+                                      .cleanup = pci_driver_cleanup,
+                                      .ioctl = pci_driver_ioctl,
+                                      .load_data = NULL};
+
+static driver_type_info_t pci_driver_type = {.type = DRIVER_TYPE_BUS,
+                                             .type_name = "pci_bus",
+                                             .version = "1.0.0",
+                                             .priv_data_size = 0,
+                                             .default_ops = &pci_driver_ops,
+                                             .validate_data = NULL,
+                                             .print_info = NULL};
+
+int pci_driver_register_type(void) {
+  return driver_register_type(&pci_driver_type);
+}
+
+driver_instance_t *pci_driver_create(const char *name) {
+  return driver_create(DRIVER_TYPE_BUS, name);
 }

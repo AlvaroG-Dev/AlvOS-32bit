@@ -1,10 +1,14 @@
 #ifndef KEYBOARD_H
 #define KEYBOARD_H
 
+#include "driver_system.h"
 #include <stddef.h>
 #include <stdint.h>
 
 // Definición del layout de teclado
+#define KEYBOARD_LAYOUT_MAGIC 0x4B4244 // 'KBD'
+#define KEYBOARD_MAX_LAYOUTS 8
+
 typedef struct keyboard_layout {
   char name[32];
   uint8_t normal[128];
@@ -12,13 +16,44 @@ typedef struct keyboard_layout {
   uint8_t altgr[128];
 } keyboard_layout_t;
 
+// Keyboard driver private data
+typedef struct keyboard_driver_data {
+  keyboard_layout_t *current_layout;
+  keyboard_layout_t *default_layout;
+  keyboard_layout_t **available_layouts;
+  uint32_t layout_count;
+  uint8_t max_layouts;
+} keyboard_driver_data_t;
+
+// Keyboard driver IOCTL commands
+#define KBD_IOCTL_SET_LAYOUT 0x1001
+#define KBD_IOCTL_GET_LAYOUT 0x1002
+#define KBD_IOCTL_LIST_LAYOUTS 0x1003
+#define KBD_IOCTL_LOAD_LAYOUT 0x1004
+
+// IOCTL argument structures
+typedef struct {
+  char layout_name[32];
+} kbd_ioctl_set_layout_t;
+
+typedef struct {
+  char layout_name[32];
+  char filename[256];
+} kbd_ioctl_load_layout_t;
+
+typedef struct {
+  uint32_t max_layouts;
+  uint32_t layout_count;
+  char layout_names[][32]; // Variable length array
+} kbd_ioctl_list_layouts_t;
+
 typedef void (*EditorKeyHandler)(int key, void *context);
 
 #define KEYBOARD_DATA_PORT 0x60
 #define KEYBOARD_STATUS_PORT 0x64
 #define RELEASE_MASK 0x80
 
-// Códigos de teclas especiales
+// Códigos de teclas especiales (mapeados a negativos para distinguirlos)
 #define KEY_UP (-1)
 #define KEY_DOWN (-2)
 #define KEY_LEFT (-3)
@@ -57,11 +92,12 @@ typedef struct {
   uint8_t right_shift;
   uint8_t ctrl;
   uint8_t alt;
-  uint8_t altgr; // Nuevo: Para Right Alt (AltGr)
+  uint8_t altgr;
   uint8_t caps_lock;
   uint8_t last_key_processed;
 } KeyboardState;
 
+// High-level API
 void keyboard_init();
 uint8_t keyboard_read_scancode();
 int keyboard_process_scancode(uint8_t scancode, KeyboardState *state,
@@ -73,7 +109,7 @@ void keyboard_set_handler(KeyboardCallback handler);
 int keyboard_get_char(void);
 int keyboard_wait_char(void);
 
-// Nuevas funciones para integración con el sistema de drivers
+// Layout management functions
 keyboard_layout_t *keyboard_get_current_layout(void);
 int keyboard_set_layout(const char *layout_name);
 int keyboard_load_layout(const char *filename, const char *layout_name);
@@ -81,5 +117,16 @@ int keyboard_load_layout(const char *filename, const char *layout_name);
 int keyboard_available(void);
 int keyboard_getkey_nonblock(void);
 void keyboard_clear_buffer(void);
+
+// Driver registration functions (previously in keyboard_driver.h)
+int keyboard_driver_register_type(void);
+driver_instance_t *keyboard_driver_create(const char *name);
+int keyboard_driver_set_layout(driver_instance_t *drv, const char *layout_name);
+keyboard_layout_t *keyboard_driver_get_current_layout(driver_instance_t *drv);
+int keyboard_load_layout_from_data(driver_instance_t *drv,
+                                   const void *file_data, size_t file_size);
+char keyboard_driver_map_scancode(const keyboard_layout_t *layout,
+                                  uint8_t scancode, uint8_t shift,
+                                  uint8_t altgr, uint8_t caps_lock);
 
 #endif

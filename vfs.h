@@ -112,7 +112,7 @@ typedef struct file_ops {
 /* Superblock - EXTENDIDO con flags de montaje */
 typedef struct vfs_superblock {
   char fs_name[16];
-  void *private; /* FS private data */
+  void *priv; /* FS private data */
   vfs_node_t *root;
   void *backing_device;               /* e.g. disk_t* or NULL */
   uint32_t flags;                     /* Flags de montaje */

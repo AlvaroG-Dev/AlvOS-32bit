@@ -6,7 +6,6 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-
 #define MAX_SATA_DISKS 8
 #define SECTOR_SIZE 512
 #define SATA_IO_BUFFER_SIZE (128 * 1024) // 64KB buffer for I/O
@@ -82,5 +81,9 @@ disk_err_t sata_to_legacy_disk_write(disk_t *disk, uint64_t lba, uint32_t count,
 // Testing
 bool sata_disk_test(uint32_t disk_id);
 void sata_disk_debug_port(uint8_t port_num);
+
+// Driver registration functions
+int sata_disk_driver_register_type(void);
+struct driver_instance *sata_disk_driver_create(const char *name);
 
 #endif // SATA_DISK_H

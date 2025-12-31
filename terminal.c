@@ -655,8 +655,10 @@ void find_fs_callback(const char *mountpoint, const char *fs_name, void *arg) {
   }
 
   // Información específica del sistema de archivos
-  if (strcmp(sb->fs_name, "fat32") == 0 && sb->private) {
-    fat32_fs_t *fs = (fat32_fs_t *)sb->private;
+  if (strcmp(sb->fs_name, "fat32") == 0 && sb->priv) {
+    fat32_fs_t *fs = (fat32_fs_t *)sb->priv;
+
+    // Mostrar información básica del sistema de archivos
 
     terminal_printf(info->term, "FAT32 Details:\r\n");
     terminal_printf(info->term, "  Bytes per Sector: %u\r\n",
