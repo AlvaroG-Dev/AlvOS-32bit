@@ -3212,19 +3212,30 @@ void terminal_execute(Terminal *term, const char *cmd) {
       }
       return;
     }
-    vfs_dirent_t dirents[10];
+    vfs_dirent_t *dirents =
+        (vfs_dirent_t *)kernel_malloc(sizeof(vfs_dirent_t) * 10);
+    if (!dirents) {
+      terminal_printf(term, "ls: Out of memory\r\n");
+      dir->refcount--;
+      if (dir->refcount == 0 && dir->ops->release) {
+        dir->ops->release(dir);
+      }
+      return;
+    }
+
     uint32_t count = 10;
     if (dir->ops->readdir(dir, dirents, &count, 0) == 0) {
-      terminal_printf(term, "Directory listing for %s: %u entries\n", full_path,
-                      count);
+      terminal_printf(term, "Directory listing for %s: %u entries\r\n",
+                      full_path, count);
       for (uint32_t i = 0; i < count; i++) {
-        terminal_printf(term, "%s (%s)\n", dirents[i].name,
+        terminal_printf(term, "%s (%s)\r\n", dirents[i].name,
                         dirents[i].type == VFS_NODE_FILE ? "file" : "dir");
       }
     } else {
-      terminal_printf(term, "ls: Failed to list directory %s\n", full_path);
+      terminal_printf(term, "ls: Failed to list directory %s\r\n", full_path);
       log_message(LOG_ERROR, "ls failed to list %s\n", full_path);
     }
+    kernel_free(dirents);
     dir->refcount--;
     if (dir->refcount == 0 && dir->ops->release) {
       dir->ops->release(dir);

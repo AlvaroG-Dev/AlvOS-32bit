@@ -88,6 +88,7 @@ compile "text_editor.c" "$GCC $GCC_OPTS -c text_editor.c -o build/text_editor.o"
 compile "mini_parser.c" "$GCC $GCC_OPTS -c mini_parser.c -o build/mini_parser.o"
 compile "syscalls.c" "$GCC $GCC_OPTS -c syscalls.c -o build/syscalls.o"
 compile "exec.c" "$GCC $GCC_OPTS -c exec.c -o build/exec.o"
+compile "sysfs.c" "$GCC $GCC_OPTS -c sysfs.c -o build/sysfs.o"
 
 # Enlazado con linker.ld
 echo -e "${GREEN}Enlazando kernel.bin...${RESET}"
@@ -104,7 +105,8 @@ ld -m elf_i386 -T linker.ld -o build/kernel.bin \
     build/uhci.o build/usb_mass_storage.o build/ehci.o build/usb_commands.o \
     build/partition.o build/mbr.o build/installer.o build/boot_log.o \
     build/mouse.o build/partition_manager.o build/apic.o build/mini_parser.o \
-    build/text_editor.o build/syscalls.o build/syscall_asm.o build/exec.o
+    build/text_editor.o build/syscalls.o build/syscall_asm.o build/exec.o \
+    build/sysfs.o
 
 if [ $? -ne 0 ]; then
     echo -e "${RED}Error en el enlazado con linker.ld${RESET}"

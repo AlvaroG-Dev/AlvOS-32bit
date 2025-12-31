@@ -46,6 +46,10 @@ typedef struct driver_ops {
   int (*stop)(struct driver_instance *drv);
   int (*cleanup)(struct driver_instance *drv);
   int (*ioctl)(struct driver_instance *drv, uint32_t cmd, void *arg);
+  int (*read)(struct driver_instance *drv, uint8_t *buffer, size_t size,
+              uint32_t offset);
+  int (*write)(struct driver_instance *drv, const uint8_t *buffer, size_t size,
+               uint32_t offset);
   int (*load_data)(struct driver_instance *drv, const void *data, size_t size);
 } driver_ops_t;
 

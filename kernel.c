@@ -43,6 +43,8 @@ uint32_t g_screen_width = 0;
 uint32_t g_screen_height = 0;
 Terminal main_terminal;
 disk_t main_disk;
+extern vfs_fs_type_t fat32_fs_type;
+extern vfs_fs_type_t sysfs_type;
 extern vfs_file_t *fd_table[VFS_MAX_FDS];
 extern vfs_superblock_t *mount_table[VFS_MAX_MOUNTS];
 extern char mount_points[VFS_MAX_MOUNTS][VFS_PATH_MAX];
@@ -317,6 +319,7 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
   vfs_init();
   vfs_register_fs(&tmpfs_type);
   vfs_register_fs(&fat32_fs_type);
+  vfs_register_fs(&sysfs_type);
   boot_log_ok();
   // 8. Inicializar SATA/AHCI
   boot_log_start("Initializing SATA/AHCI subsystem");
@@ -356,6 +359,12 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
   }
   boot_log_start("Mounting /ramfs filesystem");
   if (vfs_mount("/ramfs", "tmpfs", NULL) == VFS_OK) {
+    boot_log_ok();
+  } else {
+    boot_log_error();
+  }
+  boot_log_start("Mounting /sys info filesystem");
+  if (vfs_mount("/sys", "sysfs", NULL) == VFS_OK) {
     boot_log_ok();
   } else {
     boot_log_error();
