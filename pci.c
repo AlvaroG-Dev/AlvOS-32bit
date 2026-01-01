@@ -7,6 +7,7 @@
 // Tabla global de dispositivos PCI
 pci_device_t pci_devices[MAX_PCI_DEVICES];
 uint32_t pci_device_count = 0;
+static bool pci_initialized = false;
 // Nombres de clases PCI (simplificado)
 static const char *class_names[] = {
     [0x00] = "Unclassified",    [0x01] = "Mass Storage",
@@ -87,6 +88,8 @@ void pci_config_write_byte(uint8_t bus, uint8_t device, uint8_t function,
 // FUNCIONES DE ENUMERACIÓN
 // ========================================================================
 void pci_init(void) {
+  if (pci_initialized) return;
+
   terminal_puts(&main_terminal, "Initializing PCI subsystem...\r\n");
 
   pci_device_count = 0;
@@ -95,16 +98,10 @@ void pci_init(void) {
   // Escanear todos los buses
   pci_scan_all_buses();
 
+  pci_initialized = true;
   terminal_printf(&main_terminal,
                   "PCI initialization complete. Found %u devices.\r\n",
                   pci_device_count);
-
-  pci_driver_create("pci_bus");
-  driver_instance_t *drv = driver_find_by_name("pci_bus");
-  if (drv) {
-    driver_init(drv, NULL);
-    driver_start(drv);
-  }
 }
 void pci_scan_all_buses(void) {
   // Primero verificar si el host bridge es multi-function

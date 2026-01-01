@@ -71,6 +71,7 @@ compile "dma.c" "$GCC $GCC_OPTS -c dma.c -o build/dma.o"
 compile "ahci.c" "$GCC $GCC_OPTS -c ahci.c -o build/ahci.o"
 compile "sata_disk.c" "$GCC $GCC_OPTS -c sata_disk.c -o build/sata_disk.o"
 compile "atapi.c" "$GCC $GCC_OPTS -c atapi.c -o build/atapi.o"
+compile "ide.c" "$GCC $GCC_OPTS -c ide.c -o build/ide.o"
 compile "usb_core.c" "$GCC $GCC_OPTS -c usb_core.c -o build/usb_core.o"
 compile "usb_uhci.c" "$GCC $GCC_OPTS -c usb_uhci.c -o build/uhci.o"
 compile "usb_ehci.c" "$GCC $GCC_OPTS -c usb_ehci.c -o build/ehci.o"
@@ -89,6 +90,9 @@ compile "mini_parser.c" "$GCC $GCC_OPTS -c mini_parser.c -o build/mini_parser.o"
 compile "syscalls.c" "$GCC $GCC_OPTS -c syscalls.c -o build/syscalls.o"
 compile "exec.c" "$GCC $GCC_OPTS -c exec.c -o build/exec.o"
 compile "sysfs.c" "$GCC $GCC_OPTS -c sysfs.c -o build/sysfs.o"
+compile "devfs.c" "$GCC $GCC_OPTS -c devfs.c -o build/devfs.o"
+compile "chardev.c" "$GCC $GCC_OPTS -c chardev.c -o build/chardev.o"
+compile "chardev_vfs.c" "$GCC $GCC_OPTS -c chardev_vfs.c -o build/chardev_vfs.o"
 
 # Enlazado con linker.ld
 echo -e "${GREEN}Enlazando kernel.bin...${RESET}"
@@ -99,14 +103,14 @@ ld -m elf_i386 -T linker.ld -o build/kernel.bin \
     build/keyboard.o build/drawing.o build/math_utils.o build/terminal.o \
     build/disk.o build/disk_io_daemon.o build/task.o build/task_switch.o build/task_utils.o \
     build/task_test.o build/serial.o build/vfs.o build/tmpfs.o build/fat32.o build/log.o \
-    build/module_loader.o build/driver_system.o \
+    build/module_loader.o build/driver_system.o build/ide.o \
     build/pci.o build/acpi.o build/dma.o build/ahci.o build/sata_disk.o \
     build/atapi.o build/usb_core.o build/usb_disk_wrapper.o \
     build/uhci.o build/usb_mass_storage.o build/ehci.o build/usb_commands.o \
     build/partition.o build/mbr.o build/installer.o build/boot_log.o \
     build/mouse.o build/partition_manager.o build/apic.o build/mini_parser.o \
     build/text_editor.o build/syscalls.o build/syscall_asm.o build/exec.o \
-    build/sysfs.o
+    build/sysfs.o build/devfs.o build/chardev.o build/chardev_vfs.o
 
 if [ $? -ne 0 ]; then
     echo -e "${RED}Error en el enlazado con linker.ld${RESET}"

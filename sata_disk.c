@@ -872,7 +872,7 @@ static driver_ops_t sata_disk_driver_ops = {.init = sata_disk_driver_init,
                                             .ioctl = sata_disk_driver_ioctl,
                                             .load_data = NULL};
 
-static driver_type_info_t sata_disk_driver_type = {.type = DRIVER_TYPE_STORAGE,
+static driver_type_info_t sata_disk_driver_type = {.type = DRIVER_TYPE_SATA,
                                                    .type_name = "sata_disk",
                                                    .version = "1.0.0",
                                                    .priv_data_size = 0,
@@ -886,5 +886,5 @@ int sata_disk_driver_register_type(void) {
 }
 
 driver_instance_t *sata_disk_driver_create(const char *name) {
-  return driver_create(DRIVER_TYPE_STORAGE, name);
+  return driver_create(DRIVER_TYPE_SATA, name);
 }

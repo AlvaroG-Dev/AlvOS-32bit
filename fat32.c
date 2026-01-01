@@ -2447,7 +2447,7 @@ int fat32_write(vfs_node_t *node, const uint8_t *buf, uint32_t size,
   snprintf(log_buf, sizeof(log_buf),
            "FAT32: Writing %u bytes at offset %u (current size: %u)\n", size,
            offset, old_size);
-  serial_write_string(COM1_BASE, log_buf);
+  /* serial_write_string(COM1_BASE, log_buf); */
 
   // If file is empty, allocate first cluster
   if (node_data->first_cluster == 0) {
@@ -2487,7 +2487,7 @@ int fat32_write(vfs_node_t *node, const uint8_t *buf, uint32_t size,
     snprintf(log_buf, sizeof(log_buf),
              "FAT32: Allocated and initialized first cluster %u\n",
              new_cluster);
-    serial_write_string(COM1_BASE, log_buf);
+    /* serial_write_string(COM1_BASE, log_buf); */
   }
 
   // Calculate clusters needed for the entire file
@@ -2499,7 +2499,7 @@ int fat32_write(vfs_node_t *node, const uint8_t *buf, uint32_t size,
   snprintf(log_buf, sizeof(log_buf),
            "FAT32: Need %u clusters, currently have %u\n", clusters_needed,
            current_clusters);
-  serial_write_string(COM1_BASE, log_buf);
+  /* serial_write_string(COM1_BASE, log_buf); */
 
   // Extend cluster chain if needed
   if (clusters_needed > current_clusters) {
@@ -2512,7 +2512,7 @@ int fat32_write(vfs_node_t *node, const uint8_t *buf, uint32_t size,
     }
     snprintf(log_buf, sizeof(log_buf),
              "FAT32: Extended cluster chain to %u clusters\n", clusters_needed);
-    serial_write_string(COM1_BASE, log_buf);
+    /* serial_write_string(COM1_BASE, log_buf); */
   }
 
   // Navigate to starting cluster
@@ -2620,7 +2620,7 @@ int fat32_write(vfs_node_t *node, const uint8_t *buf, uint32_t size,
     if (bytes_written % 4096 == 0) {
       snprintf(log_buf, sizeof(log_buf),
                "FAT32: Progress: %u/%u bytes written\n", bytes_written, size);
-      serial_write_string(COM1_BASE, log_buf);
+      /* serial_write_string(COM1_BASE, log_buf); */
     }
   }
 
@@ -2632,7 +2632,7 @@ int fat32_write(vfs_node_t *node, const uint8_t *buf, uint32_t size,
     snprintf(log_buf, sizeof(log_buf),
              "FAT32: Updated file size from %u to %u\n", old_size,
              node_data->size);
-    serial_write_string(COM1_BASE, log_buf);
+    /* serial_write_string(COM1_BASE, log_buf); */
   }
 
   // Update directory entry if needed
@@ -2661,7 +2661,7 @@ int fat32_write(vfs_node_t *node, const uint8_t *buf, uint32_t size,
 
   snprintf(log_buf, sizeof(log_buf),
            "FAT32: Write completed: %u bytes written\n", bytes_written);
-  serial_write_string(COM1_BASE, log_buf);
+  /* serial_write_string(COM1_BASE, log_buf); */
   return bytes_written;
 }
 

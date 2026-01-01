@@ -13,23 +13,25 @@ boot_state_t boot_state = {
 
 static char current_step_message[256] = {0};
 
-// Helper de bajo nivel: dibujar carácter sin modificar cursor global
+// Helper optimizado para fuente 8x16_vga
 static void boot_draw_char_direct(uint32_t x, uint32_t y, char c, uint32_t fg_color) {
     if (c < 0 || c > 127) return;
     
-    const uint8_t* glyph = font8x8_basic[(uint8_t)c];
+    // Usar fuente 8x16_vga
+    const uint8_t* glyph = font8x16_vga[(uint8_t)c];
     
-    for (uint32_t dy = 0; dy < 8; dy++) {
+    for (uint32_t dy = 0; dy < 16; dy++) {
         uint8_t row = glyph[dy];
         for (uint32_t dx = 0; dx < 8; dx++) {
-            if (row & (1 << dx)) {
+            // Para VGA, el bit más significativo está a la izquierda
+            if (row & (1 << (7 - dx))) {
                 put_pixel(x + dx, y + dy, fg_color);
             }
         }
     }
 }
 
-// Helper de bajo nivel: dibujar string sin modificar cursor global
+// Helper optimizado para fuente 8x16_vga
 static void boot_draw_string_direct(uint32_t x, uint32_t y, const char* str, uint32_t fg_color) {
     uint32_t current_x = x;
     while (*str) {
@@ -43,7 +45,10 @@ void boot_log_init(void) {
     boot_state.boot_phase = true;
     boot_state.current_line = 2;
     boot_state.step_count = 0;
-    boot_state.max_lines = (g_fb.height / 8) - 4; // Fuente 8x8
+    boot_state.max_lines = (g_fb.height / 16) - 4; // Fuente 8x16
+    
+    // Establecer fuente 8x16_vga
+    set_font(FONT_8x16_VGA);
     
     // Limpiar pantalla con fondo negro
     for (uint32_t y = 0; y < g_fb.height; y++) {
@@ -53,7 +58,7 @@ void boot_log_init(void) {
     }
     
     // Dibujar banner superior
-    uint32_t banner_y = 20;
+    uint32_t banner_y = 40; // Mayor espacio para fuente 8x16
     
     // Título principal (centrado)
     const char* title = "MicroKernel OS v1.0";
@@ -73,73 +78,68 @@ void boot_log_init(void) {
         put_pixel(x, banner_y + 1, BOOT_COLOR_INFO);
     }
     
-    // Mensaje de inicio de boot
+    // Mensaje de inicio de boot (ahora en formato Linux)
     banner_y += 24;
-    boot_draw_string_direct(50, banner_y, "Starting boot sequence...", BOOT_COLOR_TEXT);
+    boot_draw_string_direct(50, banner_y, "[....]", 0x808080); // Gris para indicar inicio
+    boot_draw_string_direct(50 + 54, banner_y, "Starting boot sequence...", BOOT_COLOR_TEXT);
     
-    boot_state.current_line = (banner_y / 8) + 4;
+    boot_state.current_line = (banner_y / 16) + 4;
     for (volatile int i = 0; i < 1000000; i++);
 }
 
+// Esta función ahora dibuja solo el mensaje (sin estado)
 void boot_log_start(const char* message) {
     if (!boot_state.boot_phase) return;
     
     strncpy(current_step_message, message, sizeof(current_step_message) - 1);
     current_step_message[sizeof(current_step_message) - 1] = '\0';
     
-    // Calcular posiciones
-    uint32_t y_pos = boot_state.current_line * 8;
-    uint32_t msg_x = 50;
+    uint32_t y_pos = boot_state.current_line * 16;
     
     // Limpiar línea completa
-    fill_rect(0, y_pos, g_fb.width, 8, COLOR_BLACK);
+    fill_rect(0, y_pos, g_fb.width, 16, COLOR_BLACK);
     
-    // Dibujar bullet point
-    boot_draw_char_direct(msg_x, y_pos, '*', BOOT_COLOR_INFO);
+    // Dibujar solo el mensaje (el estado se añadirá después)
+    boot_draw_string_direct(104, y_pos, current_step_message, BOOT_COLOR_TEXT);
     
-    // Dibujar mensaje
-    boot_draw_string_direct(msg_x + 18, y_pos, current_step_message, BOOT_COLOR_TEXT);
-    
-    // Dibujar "..."
-    uint32_t dots_x = msg_x + 18 + strlen(current_step_message) * 9;
-    boot_draw_string_direct(dots_x, y_pos, " ...", BOOT_COLOR_WARN);
-    for (volatile int i = 0; i < 75000000; i++);
+    for (volatile int i = 0; i < 500000; i++);
 }
 
+// Ahora muestra [ OK ] y luego el mensaje
 void boot_log_ok(void) {
     if (!boot_state.boot_phase) return;
     
-    uint32_t y_pos = boot_state.current_line * 8;
-    uint32_t status_x = g_fb.width - 100;
+    uint32_t y_pos = boot_state.current_line * 16;
     
-    // Limpiar área del estado
-    fill_rect(status_x - 60, y_pos, 100, 8, COLOR_BLACK);
+    // Limpiar área del estado (pero mantener mensaje)
+    fill_rect(50, y_pos, 54, 16, COLOR_BLACK);
     
-    // Dibujar "[ OK ]"
-    boot_draw_string_direct(status_x, y_pos, "[ OK ]", BOOT_COLOR_OK);
+    // Dibujar "[ OK ]" primero
+    boot_draw_string_direct(50, y_pos, "[ OK ] ", BOOT_COLOR_OK);
     
     boot_state.current_line++;
     boot_state.step_count++;
     for (volatile int i = 0; i < 1000000; i++);
 }
 
+// Ahora muestra [***] y luego el mensaje
 void boot_log_error(void) {
     if (!boot_state.boot_phase) return;
     
-    uint32_t y_pos = boot_state.current_line * 8;
-    uint32_t status_x = g_fb.width - 100;
+    uint32_t y_pos = boot_state.current_line * 16;
     
-    // Limpiar área del estado
-    fill_rect(status_x - 60, y_pos, 100, 8, COLOR_BLACK);
+    // Limpiar área del estado (pero mantener mensaje)
+    fill_rect(50, y_pos, 54, 16, COLOR_BLACK);
     
-    // Dibujar "[ERROR]"
-    boot_draw_string_direct(status_x, y_pos, "[ERROR]", BOOT_COLOR_ERROR);
+    // Dibujar "[ERR]" primero
+    boot_draw_string_direct(50, y_pos, "[ERR] ", BOOT_COLOR_ERROR);
     
     boot_state.current_line++;
     boot_state.step_count++;
     for (volatile int i = 0; i < 10000000; i++);
 }
 
+// Para mensajes informativos, también en formato Linux
 void boot_log_info(const char* format, ...) {
     if (!boot_state.boot_phase) return;
     
@@ -149,21 +149,22 @@ void boot_log_info(const char* format, ...) {
     vsnprintf(buffer, sizeof(buffer), format, args);
     va_end(args);
     
-    uint32_t y_pos = boot_state.current_line * 8;
+    uint32_t y_pos = boot_state.current_line * 16;
     
     // Limpiar línea
-    fill_rect(0, y_pos, g_fb.width, 8, COLOR_BLACK);
+    fill_rect(0, y_pos, g_fb.width, 16, COLOR_BLACK);
     
-    // Dibujar flecha
-    boot_draw_string_direct(80, y_pos, "->", BOOT_COLOR_INFO);
+    // Dibujar "[INFO]" primero
+    boot_draw_string_direct(50, y_pos, "[INFO] ", BOOT_COLOR_INFO);
     
-    // Dibujar mensaje
-    boot_draw_string_direct(80 + 27, y_pos, buffer, 0x80FFFF);
+    // Luego el mensaje
+    boot_draw_string_direct(50 + 54, y_pos, buffer, BOOT_COLOR_INFO);
     
     boot_state.current_line++;
     for (volatile int i = 0; i < 1000000; i++);
 }
 
+// Para advertencias, también en formato Linux
 void boot_log_warn(const char* format, ...) {
     if (!boot_state.boot_phase) return;
     
@@ -173,17 +174,44 @@ void boot_log_warn(const char* format, ...) {
     vsnprintf(buffer, sizeof(buffer), format, args);
     va_end(args);
     
-    uint32_t y_pos = boot_state.current_line * 8;
+    uint32_t y_pos = boot_state.current_line * 16;
     
     // Limpiar línea
-    fill_rect(0, y_pos, g_fb.width, 8, COLOR_BLACK);
+    fill_rect(0, y_pos, g_fb.width, 16, COLOR_BLACK);
     
-    // Dibujar warning
-    boot_draw_string_direct(80, y_pos, "!", BOOT_COLOR_WARN);
-    boot_draw_string_direct(80 + 18, y_pos, buffer, BOOT_COLOR_WARN);
+    // Dibujar "[WARN]" primero
+    boot_draw_string_direct(50, y_pos, "[WARN] ", BOOT_COLOR_WARN);
+    
+    // Luego el mensaje
+    boot_draw_string_direct(50 + 54, y_pos, buffer, BOOT_COLOR_WARN);
     
     boot_state.current_line++;
     for (volatile int i = 0; i < 1000000; i++);
+}
+
+// Nueva función interna para mostrar asteriscos animados
+void boot_log_show_asterisks(uint32_t intensity) {
+    if (!boot_state.boot_phase) return;
+    
+    uint32_t y_pos = boot_state.current_line * 16;
+    
+    // Limpiar área del estado (pero mantener mensaje)
+    fill_rect(50, y_pos, 54, 16, COLOR_BLACK);
+    
+    // Determinar color basado en la intensidad
+    uint32_t color;
+    switch(intensity % 3) {
+        case 0: color = 0x400000; break; // Rojo oscuro
+        case 1: color = 0x800000; break; // Rojo medio
+        case 2: color = 0xFF0000; break; // Rojo brillante
+        default: color = 0x800000;
+    }
+    
+    // Dibujar "[***]" con el color correspondiente
+    boot_draw_string_direct(50, y_pos, "[***] ", color);
+    
+    // Pequeña pausa para animación
+    for (volatile int i = 0; i < 200000; i++);
 }
 
 void boot_log_finish(void) {
@@ -191,7 +219,7 @@ void boot_log_finish(void) {
     
     // Añadir espacio
     boot_state.current_line += 2;
-    uint32_t y_pos = boot_state.current_line * 8;
+    uint32_t y_pos = boot_state.current_line * 16;
     
     // Línea separadora inferior
     for (uint32_t x = 50; x < g_fb.width - 50; x++) {
@@ -264,6 +292,6 @@ void boot_log_draw_progress_bar(uint32_t current, uint32_t total) {
     snprintf(percent, sizeof(percent), "%u%%", (current * 100) / total);
     uint32_t percent_len = strlen(percent) * 9;
     boot_draw_string_direct(bar_x + (bar_width - percent_len) / 2, 
-                           bar_y + (bar_height - 8) / 2, 
+                           bar_y + (bar_height - 16) / 2, 
                            percent, COLOR_WHITE);
 }

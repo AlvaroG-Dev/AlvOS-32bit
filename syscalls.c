@@ -13,8 +13,7 @@
 extern void syscall_entry(void);
 
 // Declarar variables externas de vfs.c
-extern vfs_file_t
-    *fd_table[VFS_MAX_FDS]; // ¡AQUÍ ESTÁ LA DECLARACIÓN QUE FALTA!
+extern vfs_file_t *fd_table[VFS_MAX_FDS];
 extern int mount_count;
 static char cwd_buffer[VFS_PATH_MAX] = "/";
 

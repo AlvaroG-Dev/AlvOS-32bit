@@ -481,41 +481,39 @@ bool ahci_initialize_port(uint8_t port_num) {
                   port_num);
 
   // =================================================================
-  // FASE 1: RESET Y LIMPIEZA DEL PUERTO
+  // FASE 1: RESET COMPLETO DEL PUERTO (MEJORADO)
   // =================================================================
 
-  // 1. Detener puerto si está corriendo
+  // 1. Detener puerto si está corriendo - con timeout extendido
   uint32_t cmd = port->port_regs->cmd;
-  if (cmd & (AHCI_PORT_CMD_ST | AHCI_PORT_CMD_FRE | AHCI_PORT_CMD_CR |
-             AHCI_PORT_CMD_FR)) {
-    terminal_printf(&main_terminal, "AHCI: Port %u is active, stopping...\r\n",
+  if (cmd & (AHCI_PORT_CMD_ST | AHCI_PORT_CMD_FRE)) {
+    terminal_printf(&main_terminal, "AHCI: Port %u is active, performing full reset...\r\n",
                     port_num);
 
     // Deshabilitar comandos
-    port->port_regs->cmd &= ~AHCI_PORT_CMD_ST;
-
-    // Esperar a que se detenga
-    uint32_t timeout = 10000;
-    while ((port->port_regs->cmd & AHCI_PORT_CMD_CR) && timeout--) {
-      __asm__ volatile("pause");
+    port->port_regs->cmd &= ~(AHCI_PORT_CMD_ST | AHCI_PORT_CMD_FRE);
+    
+    // Esperar a que se detenga (timeout extendido para hardware real)
+    uint32_t timeout = 500000; // 500ms para hardware real
+    while ((port->port_regs->cmd & (AHCI_PORT_CMD_CR | AHCI_PORT_CMD_FR)) && timeout--) {
+      for (volatile int i = 0; i < 100; i++) __asm__ volatile("pause");
     }
 
-    if (port->port_regs->cmd & AHCI_PORT_CMD_CR) {
-      terminal_printf(&main_terminal, "AHCI: Failed to stop port %u\r\n",
+    if (port->port_regs->cmd & (AHCI_PORT_CMD_CR | AHCI_PORT_CMD_FR)) {
+      terminal_printf(&main_terminal, "AHCI: WARNING - Port %u didn't stop cleanly, forcing...\r\n",
                       port_num);
-      return false;
+      // Forzar reset
+      port->port_regs->cmd |= AHCI_PORT_CMD_CLO; // Clear task file
     }
   }
 
-  // 2. Limpiar SERR (crítico para ICH9)
-  port->port_regs->serr = ~0U;
-
-  // Esperar después de limpiar SERR
-  for (volatile int i = 0; i < 1000; i++)
-    __asm__ volatile("pause");
-
-  // 3. Limpiar interrupciones
-  port->port_regs->is = ~0U;
+  // 2. Limpiar TODOS los registros de error e interrupciones
+  port->port_regs->serr = ~0U; // Clear all SERR bits
+  port->port_regs->is = ~0U;   // Clear all interrupts
+  
+  // Esperar después de limpiar (crítico para hardware real)
+  for (volatile int i = 0; i < 100000; i++) __asm__ volatile("pause");
+                
 
   // =================================================================
   // FASE 2: DETECCIÓN DE DISPOSITIVO
@@ -736,118 +734,195 @@ bool ahci_initialize_port(uint8_t port_num) {
   // FASE 6: INICIAR EL PUERTO
   // =================================================================
 
-  // 13. Start the port
+  // 13. Start the port con timeout extendido
   if (!ahci_start_port(port_num)) {
-    terminal_printf(&main_terminal, "AHCI: Failed to start port %u\r\n",
+    terminal_printf(&main_terminal, "AHCI: Failed to start port %u, retrying...\r\n",
                     port_num);
-
-    // Cleanup
-    for (int i = 0; i < AHCI_MAX_CMDS; i++) {
-      if (port->cmd_table_buffers[i]) {
-        dma_free_buffer(port->cmd_table_buffers[i]);
-      }
+    
+    // Segundo intento con reset completo
+    ahci_stop_port(port_num);
+    
+    // Pequeña pausa
+    for (volatile int i = 0; i < 1000000; i++) __asm__ volatile("pause");
+    
+    if (!ahci_start_port(port_num)) {
+      terminal_printf(&main_terminal, "AHCI: Second attempt also failed for port %u\r\n",
+                      port_num);
+      return false;
     }
-    dma_free_buffer(port->fis_buffer);
-    dma_free_buffer(port->cmd_list_buffer);
-
-    return false;
   }
 
   // =================================================================
   // FASE 7: VERIFICACIÓN FINAL
   // =================================================================
 
-  // 14. Verificar que el puerto esté corriendo
-  cmd = port->port_regs->cmd;
-  if (!(cmd & AHCI_PORT_CMD_CR) || !(cmd & AHCI_PORT_CMD_FR)) {
+  // 14. Esperar a que el puerto se estabilice (crítico para hardware real)
+  terminal_printf(&main_terminal, "AHCI: Waiting for port %u to stabilize...\r\n",
+                  port_num);
+  
+  uint32_t stabilization_timeout = 1000000; // 1 segundo
+  while (stabilization_timeout--) {
+    cmd = port->port_regs->cmd;
+    
+    // Verificar que FR y CR estén activos
+    if ((cmd & AHCI_PORT_CMD_FR) && (cmd & AHCI_PORT_CMD_CR)) {
+      terminal_printf(&main_terminal, "AHCI: Port %u stabilized (CMD=0x%08x)\r\n",
+                      port_num, cmd);
+      break;
+    }
+    
+    // Pequeña pausa
+    for (volatile int i = 0; i < 100; i++) __asm__ volatile("pause");
+  }
+  
+  if (!(port->port_regs->cmd & AHCI_PORT_CMD_FR) || 
+      !(port->port_regs->cmd & AHCI_PORT_CMD_CR)) {
     terminal_printf(&main_terminal,
-                    "AHCI: Port %u not running properly (CMD=0x%08x)\r\n",
-                    port_num, cmd);
-    return false;
+                    "AHCI: Port %u not running properly after stabilization (CMD=0x%08x)\r\n",
+                    port_num, port->port_regs->cmd);
+    
+    // Debug adicional
+    uint32_t ssts = port->port_regs->ssts;
+    uint8_t det = ssts & AHCI_PORT_SSTS_DET_MASK;
+    uint8_t ipm = (ssts >> AHCI_PORT_SSTS_IPM_SHIFT) & AHCI_PORT_SSTS_IPM_MASK;
+    
+    terminal_printf(&main_terminal,
+                    "AHCI: Port %u SSTS=0x%08x (DET=%u, IPM=%u)\r\n",
+                    port_num, ssts, det, ipm);
+    
+    // Intentar recover si DET=3 (device present)
+    if (det == AHCI_PORT_DET_ESTABLISHED) {
+      terminal_printf(&main_terminal, "AHCI: Device present but port not running, attempting recovery...\r\n");
+      
+      // Forzar ICC a Active
+      port->port_regs->cmd = (port->port_regs->cmd & ~AHCI_PORT_CMD_ICC_MASK) |
+                            (AHCI_PORT_CMD_ICC_ACTIVE << AHCI_PORT_CMD_ICC_SHIFT);
+      
+      // Esperar y verificar de nuevo
+      for (volatile int i = 0; i < 500000; i++) __asm__ volatile("pause");
+      
+      cmd = port->port_regs->cmd;
+      if ((cmd & AHCI_PORT_CMD_FR) && (cmd & AHCI_PORT_CMD_CR)) {
+        terminal_printf(&main_terminal, "AHCI: Port %u recovered (CMD=0x%08x)\r\n",
+                        port_num, cmd);
+      } else {
+        return false;
+      }
+    } else {
+      return false;
+    }
   }
 
   port->initialized = true;
 
-  terminal_printf(&main_terminal, "AHCI: Port %u initialized successfully\r\n",
-                  port_num);
-  terminal_printf(&main_terminal, "AHCI: Port %u CMD=0x%08x, TFD=0x%08x\r\n",
-                  port_num, port->port_regs->cmd, port->port_regs->tfd);
+  terminal_printf(&main_terminal, "AHCI: Port %u initialized successfully (CMD=0x%08x)\r\n",
+                  port_num, port->port_regs->cmd);
 
   return true;
 }
+
 
 bool ahci_start_port(uint8_t port_num) {
-  if (port_num >= AHCI_MAX_PORTS)
-    return false;
+  if (port_num >= AHCI_MAX_PORTS) return false;
+  
   ahci_port_t *port = &ahci_controller.ports[port_num];
   hba_port_t *regs = port->port_regs;
-  // Asegurarse de que el puerto esté detenido
-  if (regs->cmd & (AHCI_PORT_CMD_ST | AHCI_PORT_CMD_FRE)) {
-    if (!ahci_stop_port(port_num)) {
-      return false;
-    }
-  }
+  
+  // Asegurarse de que el puerto esté completamente detenido
+  ahci_stop_port(port_num);
+  
+  // Pequeña pausa después de detener
+  for (volatile int i = 0; i < 10000; i++) __asm__ volatile("pause");
+  
   // Limpiar interrupciones pendientes
   regs->is = ~0U;
-  // Habilitar FIS Receive (FRE)
+  
+  // 1. Primero habilitar FIS Receive (FRE)
   regs->cmd |= AHCI_PORT_CMD_FRE;
-  // Esperar a que FR se active
-  uint32_t timeout = 10000;
+  
+  // Esperar a que FR se active (timeout extendido para hardware real)
+  uint32_t timeout = 500000; // 500ms
   while (!(regs->cmd & AHCI_PORT_CMD_FR) && timeout--) {
-    __asm__ volatile("pause");
+    for (volatile int i = 0; i < 100; i++) __asm__ volatile("pause");
   }
+  
   if (!(regs->cmd & AHCI_PORT_CMD_FR)) {
-    terminal_printf(&main_terminal, "AHCI: Port %u FIS receive not running\r\n",
-                    port_num);
+    terminal_printf(&main_terminal, "AHCI: Port %u FIS receive not running after %u ms\r\n",
+                    port_num, 500);
     return false;
   }
-  // Forzar ICC a Active (importante después de COMRESET)
+  
+  terminal_printf(&main_terminal, "AHCI: Port %u FIS receive running (FR=1)\r\n", port_num);
+  
+  // 2. Forzar ICC a Active (crítico después de COMRESET)
   regs->cmd = (regs->cmd & ~AHCI_PORT_CMD_ICC_MASK) |
               (AHCI_PORT_CMD_ICC_ACTIVE << AHCI_PORT_CMD_ICC_SHIFT);
-  // Habilitar Start (ST)
+  
+  // 3. Habilitar Start (ST)
   regs->cmd |= AHCI_PORT_CMD_ST;
-  // Esperar a que CR se active
-  timeout = 10000;
+  
+  // Esperar a que CR se active (timeout extendido)
+  timeout = 500000;
   while (!(regs->cmd & AHCI_PORT_CMD_CR) && timeout--) {
-    __asm__ volatile("pause");
+    for (volatile int i = 0; i < 100; i++) __asm__ volatile("pause");
   }
+  
   if (!(regs->cmd & AHCI_PORT_CMD_CR)) {
-    terminal_printf(&main_terminal,
-                    "AHCI: Port %u command list not running\r\n", port_num);
+    terminal_printf(&main_terminal, "AHCI: Port %u command list not running after %u ms\r\n",
+                    port_num, 500);
     return false;
   }
-  terminal_printf(&main_terminal, "AHCI: Port %u started successfully\r\n",
-                  port_num);
-  return true;
-}
-bool ahci_stop_port(uint8_t port_num) {
-  if (port_num >= AHCI_MAX_PORTS)
+  
+  terminal_printf(&main_terminal, "AHCI: Port %u command list running (CR=1)\r\n", port_num);
+  
+  // 4. Verificar estado completo
+  uint32_t final_cmd = regs->cmd;
+  if ((final_cmd & AHCI_PORT_CMD_FR) && (final_cmd & AHCI_PORT_CMD_CR)) {
+    terminal_printf(&main_terminal, "AHCI: Port %u started successfully (CMD=0x%08x)\r\n",
+                    port_num, final_cmd);
+    return true;
+  } else {
+    terminal_printf(&main_terminal, "AHCI: Port %u started but not fully operational (CMD=0x%08x)\r\n",
+                    port_num, final_cmd);
     return false;
+  }
+}
+
+bool ahci_stop_port(uint8_t port_num) {
+  if (port_num >= AHCI_MAX_PORTS) return false;
+  
   ahci_port_t *port = &ahci_controller.ports[port_num];
   hba_port_t *regs = port->port_regs;
-  // Desactivar ST (Start)
-  regs->cmd &= ~AHCI_PORT_CMD_ST;
-  // Esperar a que CR (Command List Running) se desactive
-  uint32_t timeout = 5000;
+  
+  // 1. Desactivar ST (Start) y FRE (FIS Receive Enable)
+  regs->cmd &= ~(AHCI_PORT_CMD_ST | AHCI_PORT_CMD_FRE);
+  
+  // 2. Esperar a que CR (Command List Running) se desactive
+  uint32_t timeout = 100000; // 100ms
   while ((regs->cmd & AHCI_PORT_CMD_CR) && timeout--) {
-    __asm__ volatile("pause");
+    for (volatile int i = 0; i < 100; i++) __asm__ volatile("pause");
   }
-  // Desactivar FRE (FIS Receive Enable)
-  regs->cmd &= ~AHCI_PORT_CMD_FRE;
-  // Esperar a que FR (FIS Receive Running) se desactive
-  timeout = 5000;
+  
+  // 3. Esperar a que FR (FIS Receive Running) se desactive
+  timeout = 100000;
   while ((regs->cmd & AHCI_PORT_CMD_FR) && timeout--) {
-    __asm__ volatile("pause");
+    for (volatile int i = 0; i < 100; i++) __asm__ volatile("pause");
   }
+  
+  // 4. Limpiar interrupciones
+  regs->is = ~0U;
+  
   if (regs->cmd & (AHCI_PORT_CMD_CR | AHCI_PORT_CMD_FR)) {
     terminal_printf(&main_terminal,
-                    "AHCI: Failed to stop port %u (CMD=0x%08x)\r\n", port_num,
-                    regs->cmd);
+                    "AHCI: WARNING - Port %u didn't stop cleanly (CMD=0x%08x)\r\n",
+                    port_num, regs->cmd);
     return false;
   }
+  
   terminal_printf(&main_terminal, "AHCI: Port %u stopped\r\n", port_num);
   return true;
 }
+
 // ========================================================================
 // FUNCIONES DE COMANDO
 // ========================================================================

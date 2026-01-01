@@ -3150,12 +3150,29 @@ void terminal_execute(Terminal *term, const char *cmd) {
       return;
     }
 
-    char buffer[8192];
+    char buffer[1024];
     int total_read = 0;
     int read_this_time;
     int has_content = 0;
+    int max_read = 8192; // Límite por defecto para archivos normales
+    
+    // Límites especiales para dispositivos de carácter
+    if (strstr(full_path, "/dev/zero") || strstr(full_path, "/dev/random") || 
+        strstr(full_path, "/dev/urandom")) {
+        max_read = 4096; // Limitar a 4KB para dispositivos infinitos
+        terminal_printf(term, "Reading from device %s (limited to %d bytes)...\r\n", 
+                       full_path, max_read);
+    }
+    
+    // Para /dev/null, sabemos que siempre será EOF
+    if (strstr(full_path, "/dev/null")) {
+        terminal_printf(term, "/dev/null: always returns EOF (0 bytes)\r\n");
+        vfs_close(fd);
+        return;
+    }
 
-    while ((read_this_time = vfs_read(fd, buffer, sizeof(buffer) - 1)) > 0) {
+    while (total_read < max_read && 
+           (read_this_time = vfs_read(fd, buffer, sizeof(buffer) - 1)) > 0) {
       total_read += read_this_time;
 
       // ✅ FILTRAR CARACTERES NO IMPRIMIBLES
@@ -3166,6 +3183,9 @@ void terminal_execute(Terminal *term, const char *cmd) {
         } else if (buffer[i] == '\n' || buffer[i] == '\t' ||
                    buffer[i] == '\r') {
           terminal_putchar(term, buffer[i]); // Caracteres de control útiles
+        } else if (buffer[i] == 0 && strstr(full_path, "/dev/zero")) {
+          // Para /dev/zero, mostrar "0" en lugar del byte nulo
+          terminal_putchar(term, '0');
         } else {
           // Mostrar caracteres no imprimibles como hex
           terminal_printf(term, "[0x%02X]", (unsigned char)buffer[i]);
@@ -3177,9 +3197,14 @@ void terminal_execute(Terminal *term, const char *cmd) {
     if (has_content) {
       terminal_puts(term, "\r\n");
     } else if (read_this_time == 0) {
-      terminal_printf(term, "%s: empty file\r\n", full_path);
+      terminal_printf(term, "%s: empty file or EOF reached\r\n", full_path);
     } else {
       terminal_printf(term, "cat: Read error: %d\r\n", read_this_time);
+    }
+
+    if (total_read >= max_read) {
+        terminal_printf(term, "(stopped after %d bytes - device produces infinite data)\r\n", 
+                       max_read);
     }
 
     vfs_close(fd);
@@ -3228,8 +3253,13 @@ void terminal_execute(Terminal *term, const char *cmd) {
       terminal_printf(term, "Directory listing for %s: %u entries\r\n",
                       full_path, count);
       for (uint32_t i = 0; i < count; i++) {
-        terminal_printf(term, "%s (%s)\r\n", dirents[i].name,
-                        dirents[i].type == VFS_NODE_FILE ? "file" : "dir");
+        const char *type_str = "dir";
+        if (dirents[i].type == VFS_NODE_FILE) type_str = "file";
+        else if (dirents[i].type == VFS_NODE_CHRDEV) type_str = "chr";
+        else if (dirents[i].type == VFS_NODE_BLKDEV) type_str = "blk";
+        else if (dirents[i].type == VFS_NODE_SYMLINK) type_str = "sym";
+        
+        terminal_printf(term, "%s (%s)\r\n", dirents[i].name, type_str);
       }
     } else {
       terminal_printf(term, "ls: Failed to list directory %s\r\n", full_path);
@@ -3475,12 +3505,14 @@ void terminal_execute(Terminal *term, const char *cmd) {
 
     terminal_printf(term, "umount: Successfully unmounted %s\r\n", normalized);
   }
-  if (strcmp(command, "part") == 0) {
+  else if (strcmp(command, "part") == 0) {
     handle_part_command(term, argc, argv);
   } else if (strcmp(command, "shutdown") == 0) {
     terminal_puts(term, "Initiating system shutdown...\r\n");
     serial_write_string(COM1_BASE, "Initiating system shutdown...\r\n");
     shutdown();
+  } else if (strcmp(command, "serialtest") == 0) {
+    cmd_serial_test(args);
   } else if (strcmp(command, "sata") == 0) {
     if (argc > 1) {
       if (strcmp(argv[1], "list") == 0) {

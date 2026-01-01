@@ -10,6 +10,7 @@
 // Global state
 usb_controller_t usb_controllers[USB_MAX_CONTROLLERS];
 uint8_t usb_controller_count = 0;
+static bool usb_initialized = false;
 
 static usb_driver_t *registered_drivers[16];
 static uint8_t registered_driver_count = 0;
@@ -19,6 +20,8 @@ static uint8_t registered_driver_count = 0;
 // ========================================================================
 
 bool usb_init(void) {
+  if (usb_initialized) return true;
+
   terminal_puts(&main_terminal, "Initializing USB subsystem...\r\n");
 
   memset(usb_controllers, 0, sizeof(usb_controllers));
@@ -35,14 +38,7 @@ bool usb_init(void) {
                   "USB initialization complete: %u controller(s) found\r\n",
                   usb_controller_count);
 
-  if (usb_controller_count > 0) {
-    driver_instance_t *drv = usb_driver_create("usb_subsystem");
-    if (drv) {
-      driver_init(drv, NULL);
-      driver_start(drv);
-    }
-  }
-
+  usb_initialized = true;
   return true;
 }
 

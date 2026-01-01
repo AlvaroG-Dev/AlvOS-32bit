@@ -7,6 +7,7 @@
 #include "string.h"
 
 static mouse_state_t mouse_state = {0};
+static bool mouse_initialized = false;
 
 // Cursor simple para modo terminal
 static const uint8_t terminal_cursor[16] = {0x80, 0xC0, 0xE0, 0xF0, 0xF8, 0xFC,
@@ -117,6 +118,8 @@ static bool mouse_install(void) {
 
 // Inicializar el mouse
 void mouse_init(uint32_t screen_width, uint32_t screen_height) {
+  if (mouse_initialized) return;
+
   memset(&mouse_state, 0, sizeof(mouse_state_t));
 
   mouse_state.screen_width = screen_width;
@@ -141,13 +144,7 @@ void mouse_init(uint32_t screen_width, uint32_t screen_height) {
       ;
   }
 
-  if (mouse_state.enabled) {
-    driver_instance_t *drv = mouse_driver_create("ps2_mouse");
-    if (drv) {
-      driver_init(drv, NULL);
-      driver_start(drv);
-    }
-  }
+  mouse_initialized = true;
 }
 
 // Manejador de IRQ del mouse

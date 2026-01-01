@@ -35,7 +35,15 @@ void timer_irq_handler(void);             // <-- Debe estar visible
 void irq_common_handler(struct regs* r);
 void pic_send_eoi(uint8_t irq);
 void pit_init(uint32_t frequency);
-void kernel_delay(uint32_t milliseconds);
 void irq_setup_apic(void);
+
+// Funciones del delay
+void kernel_delay_init(uint32_t freq_hz);
+void kernel_delay(uint32_t milliseconds);
+void kernel_delay_us(uint32_t microseconds);
+void kernel_safe_delay(uint32_t milliseconds);
+void kernel_active_delay(uint32_t milliseconds);
+bool kernel_delay_condition(uint32_t milliseconds, bool (*condition)(void));
+void kernel_calibrate_delay(void);
 
 #endif

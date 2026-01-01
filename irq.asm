@@ -15,6 +15,10 @@ global irq12_entry
 global irq13_entry
 global irq14_entry
 global irq15_entry
+global irq51_entry
+global irq52_entry
+global irq51_entry
+global irq52_entry
 
 extern mouse_irq_handler
 extern timer_irq_handler
@@ -79,13 +83,33 @@ irq3_entry:
     push dword 3              ; <-- pasa IRQ 3
     call serial_irq_handler_line
     add esp, 4
-
     pop gs
     pop fs
     pop es
     pop ds
     popa
-    iret
+    iretd
+
+irq51_entry:
+    pusha
+    push ds
+    push es
+    push fs
+    push gs
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    push dword 3
+    call serial_irq_handler_line
+    add esp, 4
+    pop gs
+    pop fs
+    pop es
+    pop ds
+    popa
+    iretd
 
 irq4_entry:
     pusha
@@ -103,13 +127,33 @@ irq4_entry:
     push dword 4              ; <-- pasa IRQ 4
     call serial_irq_handler_line
     add esp, 4
-
     pop gs
     pop fs
     pop es
     pop ds
     popa
-    iret
+    iretd
+
+irq52_entry:
+    pusha
+    push ds
+    push es
+    push fs
+    push gs
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    push dword 4
+    call serial_irq_handler_line
+    add esp, 4
+    pop gs
+    pop fs
+    pop es
+    pop ds
+    popa
+    iretd
 
 irq5_entry:
     pusha

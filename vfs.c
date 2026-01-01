@@ -251,8 +251,8 @@ vfs_superblock_t *find_mount_for_path(const char *path,
     return NULL;
   }
 
-  serial_printf(COM1_BASE, "VFS: Matched mount %s for path %s (fs: %s)\r\n",
-                best_mountpoint, normalized, best_sb->fs_name);
+  /* serial_printf(COM1_BASE, "VFS: Matched mount %s for path %s (fs: %s)\r\n",
+                best_mountpoint, normalized, best_sb->fs_name); */
 
   *out_relpath = best_relpath;
   vfs_unlock_restore_irq(f);
@@ -263,6 +263,8 @@ vfs_superblock_t *find_mount_for_path(const char *path,
 int vfs_mount(const char *mountpoint, const char *fsname, void *device) {
   if (!mountpoint || !fsname)
     return VFS_ERR;
+
+  terminal_printf(&main_terminal, "VFS: Mount attempt %s on %s...\n", fsname, mountpoint);
 
   unsigned int f = vfs_lock_disable_irq();
 
@@ -316,8 +318,11 @@ int vfs_mount(const char *mountpoint, const char *fsname, void *device) {
       return VFS_ERR;
     }
 
+    terminal_printf(&main_terminal, "VFS: Parent SB found for %s\n", mountpoint);
+
     vfs_node_t *mount_dir = resolve_path_to_vnode(parent_sb, relpath);
     if (!mount_dir) {
+      terminal_printf(&main_terminal, "VFS: Node %s not found, creating...\n", relpath);
       // Mount point doesn't exist, create it
       char parent_path[VFS_PATH_MAX];
       char name[VFS_NAME_MAX];
@@ -354,6 +359,7 @@ int vfs_mount(const char *mountpoint, const char *fsname, void *device) {
         }
         return VFS_ERR;
       }
+      terminal_printf(&main_terminal, "VFS: Directory %s created\n", mountpoint);
 
       // Release the new directory node
       new_dir->refcount--;
@@ -725,7 +731,16 @@ int vfs_read(int fd, void *buf, uint32_t size) {
     return -1;
   if (!f->node || !f->node->ops || !f->node->ops->read)
     return -1;
+  
+  // ✅ DEBUG
+  serial_printf(COM1_BASE, "vfs_read: fd=%d, size=%u, calling node->ops->read\r\n", 
+                fd, size);
+  
   int got = f->node->ops->read(f->node, (uint8_t *)buf, size, f->offset);
+  
+  // ✅ DEBUG
+  serial_printf(COM1_BASE, "vfs_read: node->ops->read returned %d\r\n", got);
+  
   if (got > 0)
     f->offset += got;
   return got;

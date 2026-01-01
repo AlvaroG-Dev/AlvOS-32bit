@@ -190,7 +190,8 @@ int vfs_list_mounts(void (*callback)(const char *mountpoint,
                     void *arg);
 int close_fds_for_mount(vfs_superblock_t *sb);
 
-// Fix: Agregar declaraciones públicas para mkdir y unmount
+extern vfs_fs_type_t sysfs_type;
+extern vfs_fs_type_t devfs_type;
 int vfs_mkdir(const char *path, vfs_node_t **out);
 int vfs_unmount(const char *mountpoint);
 void debug_hex_dump(const char *label, const char *str, size_t len);

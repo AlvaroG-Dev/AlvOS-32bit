@@ -30,8 +30,6 @@ void pmm_init(struct multiboot_tag_mmap *mmap_tag) {
   uint32_t entry_count = (mmap_tag->size - sizeof(struct multiboot_tag_mmap)) /
                          mmap_tag->entry_size;
 
-  boot_log_start("Initializing Physical Memory Manager");
-
   // Contar memoria total disponible
   uint64_t total_memory = 0;
 

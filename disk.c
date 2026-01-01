@@ -7,23 +7,10 @@
 #include "kernel.h"
 #include "partition.h"
 #include "sata_disk.h"
+#include "ide.h"
 #include "string.h"
 #include "terminal.h"
 #include "usb_disk_wrapper.h"
-
-// PATA (IDE) ports
-#define ATA_DATA_PORT 0x1F0
-#define ATA_ERROR_PORT 0x1F1
-#define ATA_FEATURES_PORT 0x1F1
-#define ATA_SECTOR_COUNT 0x1F2
-#define ATA_LBA_LOW 0x1F3
-#define ATA_LBA_MID 0x1F4
-#define ATA_LBA_HIGH 0x1F5
-#define ATA_DRIVE_SELECT 0x1F6
-#define ATA_COMMAND_PORT 0x1F7
-#define ATA_STATUS_PORT 0x1F7
-#define ATA_DEVCTL 0x3F6     // Device Control (write)
-#define ATA_ALT_STATUS 0x3F6 // Alternate Status (read)
 
 // ATA commands
 #define ATA_CMD_READ_SECTORS 0x20
@@ -81,7 +68,6 @@ static void pio_read16(uint16_t port, void *dst, size_t words);
 static void pio_write16(uint16_t port, const void *src, size_t words);
 static device_type_t disk_detect_device_type(uint8_t drive_number);
 static device_type_t enhanced_disk_detect(uint8_t drive_number);
-static device_type_t detect_disk_type_enhanced(uint8_t drive_number);
 static device_type_t try_identify_detection(uint8_t drive_number);
 static int perform_ide_initialization(disk_t *disk);
 
@@ -94,59 +80,6 @@ static int disk_check_timeout(uint32_t start_ticks) {
     return -1; // Timeout
   }
   return 0;
-}
-
-// Función mejorada para detectar tipo de dispositivo
-static device_type_t detect_disk_type_enhanced(uint8_t drive_number) {
-  uint16_t io_base = (drive_number < 2) ? ATA_PRIMARY_IO : ATA_SECONDARY_IO;
-  uint8_t drive_bit =
-      (drive_number < 2) ? (drive_number << 4) : ((drive_number - 2) << 4);
-
-  // 1. Verificar presencia básica
-  outb(io_base + ATA_DRIVE_SELECT, 0xA0 | drive_bit);
-
-  // Esperar 400ns - leer alternate status 4 veces
-  uint16_t alt_status_port =
-      (drive_number < 2) ? ATA_PRIMARY_CTRL : ATA_SECONDARY_CTRL;
-  for (int i = 0; i < 4; i++) {
-    inb(alt_status_port);
-  }
-
-  // Verificar si responde
-  uint8_t status = inb(io_base + ATA_STATUS_PORT);
-  if (status == 0xFF || status == 0x00) {
-    return DEVICE_TYPE_NONE;
-  }
-
-  // 2. Enviar DEVICE RESET y leer signature
-  outb(io_base + ATA_COMMAND_PORT, 0x08); // DEVICE RESET
-
-  // Esperar un momento
-  for (volatile int i = 0; i < 5000; i++)
-    ;
-
-  // Leer signature bytes
-  uint8_t lba_mid = inb(io_base + ATA_LBA_MID);
-  uint8_t lba_high = inb(io_base + ATA_LBA_HIGH);
-
-  terminal_printf(&main_terminal, "DISK: Drive %u signature: 0x%02x%02x\n",
-                  drive_number, lba_mid, lba_high);
-
-  // 3. Identificar por signature
-  if (lba_mid == ATAPI_SIGNATURE_LBA_MID &&
-      lba_high == ATAPI_SIGNATURE_LBA_HIGH) {
-    return DEVICE_TYPE_PATAPI_CDROM;
-  } else if (lba_mid == SATA_SIGNATURE_LBA_MID &&
-             lba_high == SATA_SIGNATURE_LBA_HIGH) {
-    // Verificar si realmente es SATA o IDE-emulado
-    return DEVICE_TYPE_PATA_DISK; // Tratar como PATA primero
-  } else if (lba_mid == ATA_SIGNATURE_LBA_MID &&
-             lba_high == ATA_SIGNATURE_LBA_HIGH) {
-    return DEVICE_TYPE_PATA_DISK;
-  } else {
-    // Intentar identificación más precisa con IDENTIFY
-    return try_identify_detection(drive_number);
-  }
 }
 
 // Función para detección mediante comando IDENTIFY
@@ -428,13 +361,28 @@ static device_type_t enhanced_disk_detect(uint8_t drive_number) {
       }
     }
   }
-
-  // 2. Si no es AHCI, usar detección IDE tradicional
-  return detect_disk_type_enhanced(drive_number);
+  // 2. Si no es AHCI, usar el nuevo driver IDE
+  // Convertir drive_number a bus/drive
+  uint8_t bus = (drive_number < 2) ? 0 : 1;
+  uint8_t drive = (drive_number < 2) ? drive_number : (drive_number - 2);
+  
+  // Usar la función del driver IDE
+  ide_device_type_t ide_type = ide_detect_device_type(bus, drive);
+  
+  switch (ide_type) {
+      case IDE_TYPE_PATA_DISK:
+          return DEVICE_TYPE_PATA_DISK;
+      case IDE_TYPE_PATAPI_CDROM:
+          return DEVICE_TYPE_PATAPI_CDROM;
+      case IDE_TYPE_UNKNOWN:
+          return DEVICE_TYPE_UNKNOWN;
+      default:
+          return DEVICE_TYPE_NONE;
+  }
 }
 
 static int disk_check_presence(disk_t *disk) {
-  device_type_t dev_type = detect_disk_type_enhanced(disk->drive_number);
+  device_type_t dev_type = enhanced_disk_detect(disk->drive_number);
 
   switch (dev_type) {
   case DEVICE_TYPE_NONE:
@@ -453,7 +401,29 @@ static int disk_check_presence(disk_t *disk) {
                     disk->drive_number);
     disk->type = DEVICE_TYPE_PATA_DISK;
 
-    // Intentar inicializar como IDE
+    // NUEVO: Usar el driver IDE en lugar de la inicialización directa
+    // Convertir drive_number a bus/drive para el driver IDE
+    uint8_t bus = (disk->drive_number < 2) ? 0 : 1;
+    uint8_t drive = (disk->drive_number < 2) ? disk->drive_number : (disk->drive_number - 2);
+    
+    // Buscar el disco en el driver IDE
+    for (uint8_t i = 0; i < ide_get_disk_count(); i++) {
+      ide_disk_t *ide_disk = ide_get_disk_info(i);
+      if (ide_disk && ide_disk->bus == bus && ide_disk->drive == drive && ide_disk->present) {
+        // Usar la información del driver IDE
+        disk->initialized = 1;
+        disk->present = 1;
+        disk->sector_count = ide_disk->sector_count;
+        disk->supports_lba48 = ide_disk->supports_lba48;
+        
+        terminal_printf(&main_terminal, "DISK: IDE disk initialized via driver: %llu sectors\n",
+                       disk->sector_count);
+        return 0;
+      }
+    }
+    
+    // Si no se encontró en el driver IDE, intentar inicialización directa (fallback)
+    terminal_printf(&main_terminal, "DISK: Disk not found in IDE driver, trying direct init\n");
     if (perform_ide_initialization(disk) == 0) {
       return 0;
     }
@@ -631,67 +601,97 @@ disk_err_t disk_init(disk_t *disk, uint8_t drive_number) {
   memset(disk, 0, sizeof(disk_t));
   disk->drive_number = drive_number;
 
+  // Primero verificar si es un dispositivo IDE
+  uint8_t bus = (drive_number < 2) ? 0 : 1;
+  uint8_t drive = (drive_number < 2) ? drive_number : (drive_number - 2);
+  
+  // Buscar en el driver IDE
+  for (uint8_t i = 0; i < ide_get_disk_count(); i++) {
+    ide_disk_t *ide_disk = ide_get_disk_info(i);
+    if (ide_disk && ide_disk->bus == bus && ide_disk->drive == drive && ide_disk->present) {
+      // Configurar el disco usando información del driver IDE
+      disk->type = DEVICE_TYPE_PATA_DISK;
+      disk->initialized = 1;
+      disk->present = 1;
+      disk->supports_lba48 = ide_disk->supports_lba48;
+      disk->sector_count = ide_disk->sector_count;
+      disk->physical_disk = NULL;
+      
+      terminal_printf(&main_terminal, 
+                     "DISK: IDE disk initialized via driver: %s, %llu sectors\r\n",
+                     ide_disk->model, disk->sector_count);
+      return DISK_ERR_NONE;
+    }
+  }
+  
+  // Si no se encontró en el driver IDE, usar la detección original
   if (disk_check_presence(disk) != 0) {
     disk->present = 0;
     return DISK_ERR_DEVICE_NOT_PRESENT;
   }
+  
   disk->present = 1;
 
-  // Enable IRQs
-  for (int i = 0; i < 4; i++)
-    inb(ATA_ALT_STATUS); // ~400ns delay
+  // Para discos IDE que no fueron detectados por el driver, usar inicialización tradicional
+  if (disk->type == DEVICE_TYPE_PATA_DISK) {
+    // Enable IRQs
+    for (int i = 0; i < 4; i++)
+      inb(ATA_ALT_STATUS); // ~400ns delay
 
-  int retries = DISK_RETRIES;
-  while (retries-- > 0) {
-    // Clear registers
-    outb(ATA_SECTOR_COUNT, 0);
-    outb(ATA_LBA_LOW, 0);
-    outb(ATA_LBA_MID, 0);
-    outb(ATA_LBA_HIGH, 0);
-    outb(ATA_COMMAND_PORT, ATA_CMD_IDENTIFY);
+    int retries = DISK_RETRIES;
+    while (retries-- > 0) {
+      // Clear registers
+      outb(ATA_SECTOR_COUNT, 0);
+      outb(ATA_LBA_LOW, 0);
+      outb(ATA_LBA_MID, 0);
+      outb(ATA_LBA_HIGH, 0);
+      outb(ATA_COMMAND_PORT, ATA_CMD_IDENTIFY);
 
-    if (disk_wait_ready(disk, ticks_since_boot) != 0) {
-      disk_reset(disk);
-      continue;
+      if (disk_wait_ready(disk, ticks_since_boot) != 0) {
+        disk_reset(disk);
+        continue;
+      }
+
+      if (disk_wait_drq(disk, ticks_since_boot) != 0) {
+        disk_reset(disk);
+        continue;
+      }
+
+      uint16_t buffer[256];
+      pio_read16(ATA_DATA_PORT, buffer, 256);
+
+      // Check if device exists and data is valid
+      if (buffer[0] == 0 || buffer[0] == 0xFFFF) {
+        terminal_puts(&main_terminal, "Invalid disk identification\r\n");
+        disk_reset(disk);
+        continue;
+      }
+
+      // Check LBA48 support (word 83, bit 10)
+      disk->supports_lba48 = (buffer[83] & (1 << 10)) != 0;
+
+      // Get sector count
+      if (disk->supports_lba48) {
+        disk->sector_count = *((uint64_t *)&buffer[100]); // Words 100-103
+      } else {
+        disk->sector_count = *((uint32_t *)&buffer[60]); // Words 60-61
+      }
+
+      disk->initialized = 1;
+      disk->physical_disk = NULL;
+      char msg[64];
+      snprintf(msg, sizeof(msg),
+               "Disk initialized: %llu sectors, LBA48: %u, drive: 0x%x\r\n",
+               disk->sector_count, disk->supports_lba48, drive_number);
+      terminal_puts(&main_terminal, msg);
+      return DISK_ERR_NONE;
     }
 
-    if (disk_wait_drq(disk, ticks_since_boot) != 0) {
-      disk_reset(disk);
-      continue;
-    }
-
-    uint16_t buffer[256];
-    pio_read16(ATA_DATA_PORT, buffer, 256);
-
-    // Check if device exists and data is valid
-    if (buffer[0] == 0 || buffer[0] == 0xFFFF) {
-      terminal_puts(&main_terminal, "Invalid disk identification\r\n");
-      disk_reset(disk);
-      continue;
-    }
-
-    // Check LBA48 support (word 83, bit 10)
-    disk->supports_lba48 = (buffer[83] & (1 << 10)) != 0;
-
-    // Get sector count
-    if (disk->supports_lba48) {
-      disk->sector_count = *((uint64_t *)&buffer[100]); // Words 100-103
-    } else {
-      disk->sector_count = *((uint32_t *)&buffer[60]); // Words 60-61
-    }
-
-    disk->initialized = 1;
-    disk->physical_disk = NULL;
-    char msg[64];
-    snprintf(msg, sizeof(msg),
-             "Disk initialized: %llu sectors, LBA48: %u, drive: 0x%x\r\n",
-             disk->sector_count, disk->supports_lba48, drive_number);
-    terminal_puts(&main_terminal, msg);
-    return DISK_ERR_NONE;
+    terminal_puts(&main_terminal, "Failed to initialize disk after retries\r\n");
+    return DISK_ERR_ATA;
   }
-
-  terminal_puts(&main_terminal, "Failed to initialize disk after retries\r\n");
-  return DISK_ERR_ATA;
+  
+  return DISK_ERR_DEVICE_NOT_PRESENT;
 }
 
 disk_err_t disk_init_from_partition(disk_t *partition_disk,
@@ -1081,7 +1081,34 @@ disk_err_t disk_read_dispatch(disk_t *disk, uint64_t lba, uint32_t count,
     return sata_to_legacy_disk_read(disk, actual_lba, count, buffer);
   }
 
-  // IDE: usar función directa con actual_lba
+  if (disk->type == DEVICE_TYPE_PATA_DISK) {
+    // Convertir drive_number a bus/drive
+    uint8_t bus = (disk->drive_number < 2) ? 0 : 1;
+    uint8_t drive = (disk->drive_number < 2) ? disk->drive_number : (disk->drive_number - 2);
+    
+    // Buscar el disco en el driver IDE
+    for (uint8_t i = 0; i < ide_get_disk_count(); i++) {
+      ide_disk_t *ide_disk = ide_get_disk_info(i);
+      if (ide_disk && ide_disk->bus == bus && ide_disk->drive == drive && ide_disk->present) {
+        // Verificar límites
+        if (actual_lba + count > ide_disk->sector_count) {
+          return DISK_ERR_LBA_OUT_OF_RANGE;
+        }
+        
+        // Usar driver IDE para lectura
+        if (ide_read_sectors(ide_disk, actual_lba, count, buffer) == 0) {
+          return DISK_ERR_NONE;
+        } else {
+          return DISK_ERR_ATA;
+        }
+      }
+    }
+    
+    // Si no se encontró en el driver IDE, usar implementación tradicional
+    terminal_printf(&main_terminal, "DISK: IDE disk not in driver, using legacy read\n");
+  }
+
+  // Implementación IDE tradicional (fallback)
   // NOTA: No usar disk_read() recursivamente, usar la implementación real
   if (!disk || !disk->initialized || !buffer || count == 0) {
     return DISK_ERR_INVALID_PARAM;
@@ -1219,6 +1246,36 @@ disk_err_t disk_write_dispatch(disk_t *disk, uint64_t lba, uint32_t count,
   if (disk_is_usb(disk)) {
     terminal_printf(&main_terminal, "DISK: Routing to USB disk\n");
     return usb_disk_write(disk, actual_lba, count, buffer);
+  }
+
+  // NUEVO: Manejar discos IDE usando el driver
+  if (disk->type == DEVICE_TYPE_PATA_DISK) {
+    // Convertir drive_number a bus/drive
+    uint8_t bus = (disk->drive_number < 2) ? 0 : 1;
+    uint8_t drive = (disk->drive_number < 2) ? disk->drive_number : (disk->drive_number - 2);
+    
+    // Buscar el disco en el driver IDE
+    for (uint8_t i = 0; i < ide_get_disk_count(); i++) {
+      ide_disk_t *ide_disk = ide_get_disk_info(i);
+      if (ide_disk && ide_disk->bus == bus && ide_disk->drive == drive && ide_disk->present) {
+        // Verificar límites
+        if (actual_lba + count > ide_disk->sector_count) {
+          terminal_printf(&main_terminal, "DISK: LBA out of range for IDE disk\n");
+          return DISK_ERR_LBA_OUT_OF_RANGE;
+        }
+        
+        // Usar driver IDE para escritura
+        if (ide_write_sectors(ide_disk, actual_lba, count, buffer) == 0) {
+          return DISK_ERR_NONE;
+        } else {
+          return DISK_ERR_ATA;
+        }
+      }
+    }
+    
+    // Si no se encontró en el driver IDE, usar implementación tradicional
+    terminal_printf(&main_terminal, "DISK: IDE disk not in driver, using legacy write\n");
+    goto ide_write_path;
   }
 
   // DETECCIÓN MEJORADA DE SATA
@@ -1535,8 +1592,31 @@ disk_err_t disk_flush_dispatch(disk_t *disk) {
     }
   }
 
+  // NUEVO: IDE device usando driver
+  if (disk->type == DEVICE_TYPE_PATA_DISK) {
+    // Convertir drive_number a bus/drive
+    uint8_t bus = (disk->drive_number < 2) ? 0 : 1;
+    uint8_t drive = (disk->drive_number < 2) ? disk->drive_number : (disk->drive_number - 2);
+    
+    // Buscar el disco en el driver IDE
+    for (uint8_t i = 0; i < ide_get_disk_count(); i++) {
+      ide_disk_t *ide_disk = ide_get_disk_info(i);
+      if (ide_disk && ide_disk->bus == bus && ide_disk->drive == drive && ide_disk->present) {
+        terminal_puts(&main_terminal, "DISK: IDE device flush via driver\n");
+        if (ide_flush_cache(ide_disk) == 0) {
+          return DISK_ERR_NONE;
+        } else {
+          return DISK_ERR_ATA;
+        }
+      }
+    }
+    
+    // Si no se encontró en el driver IDE, usar flush tradicional
+    terminal_puts(&main_terminal, "DISK: IDE device flush (legacy)\n");
+  }
+
   // IDE device (default)
-  terminal_puts(&main_terminal, "DISK: IDE device flush\n");
+  terminal_puts(&main_terminal, "DISK: IDE device flush (legacy fallback)\n");
   return disk_flush(disk);
 }
 
@@ -1673,7 +1753,29 @@ void disk_scan_all_buses(void) {
   const char *bus_names[] = {"Primary", "Secondary"};
   const char *drive_names[] = {"Master", "Slave"};
 
-  // Escanear primary y secondary bus
+  // NUEVO: Primero listar dispositivos del driver IDE
+  if (ide_get_disk_count() > 0) {
+    terminal_puts(&main_terminal, "\r\nIDE Driver Devices:\r\n");
+    for (uint8_t i = 0; i < ide_get_disk_count(); i++) {
+      ide_disk_t *ide_disk = ide_get_disk_info(i);
+      if (ide_disk && ide_disk->present) {
+        detected_device_t *dev = &detected_devices[detected_device_count];
+        dev->bus = ide_disk->bus;
+        dev->drive = ide_disk->drive;
+        dev->type = DEVICE_TYPE_PATA_DISK;
+        dev->present = true;
+        snprintf(dev->description, sizeof(dev->description), "IDE: %s", ide_disk->model);
+        
+        terminal_printf(&main_terminal, "  %s %s: %s\r\n",
+                        bus_names[ide_disk->bus],
+                        drive_names[ide_disk->drive],
+                        ide_disk->model);
+        detected_device_count++;
+      }
+    }
+  }
+
+  // Escanear primary y secondary bus para dispositivos no detectados por el driver
   for (uint8_t bus = 0; bus < 2; bus++) {
     uint16_t io_base = (bus == 0) ? ATA_PRIMARY_IO : ATA_SECONDARY_IO;
 
@@ -1681,6 +1783,21 @@ void disk_scan_all_buses(void) {
                     bus_names[bus], io_base);
 
     for (uint8_t drive = 0; drive < 2; drive++) {
+      // Verificar si ya fue detectado por el driver IDE
+      bool already_detected = false;
+      for (int i = 0; i < detected_device_count; i++) {
+        if (detected_devices[i].bus == bus && detected_devices[i].drive == drive) {
+          already_detected = true;
+          break;
+        }
+      }
+      
+      if (already_detected) {
+        terminal_printf(&main_terminal, "  %s: Already detected by IDE driver\r\n",
+                       drive_names[drive]);
+        continue;
+      }
+
       terminal_printf(&main_terminal, "  %s: ", drive_names[drive]);
 
       uint8_t drive_number = (bus << 1) | drive;
@@ -1699,8 +1816,8 @@ void disk_scan_all_buses(void) {
         break;
 
       case DEVICE_TYPE_PATA_DISK:
-        terminal_puts(&main_terminal, "PATA Hard Disk\r\n");
-        snprintf(dev->description, sizeof(dev->description), "PATA Disk");
+        terminal_puts(&main_terminal, "PATA Hard Disk (not in driver)\r\n");
+        snprintf(dev->description, sizeof(dev->description), "PATA Disk (legacy)");
         detected_device_count++;
         break;
 

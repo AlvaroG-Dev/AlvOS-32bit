@@ -30,6 +30,9 @@
 #include "terminal.h"
 #include "tmpfs.h"
 #include "vfs.h"
+#include "ide.h"
+#include "chardev.h"
+#include "chardev_vfs.h"
 
 // Global definition of BootInfo.
 BootInfo boot_info;
@@ -86,6 +89,7 @@ void unmount_callback(const char *mountpoint, const char *fs_name, void *arg) {
 void shutdown(void) {
   terminal_printf(&main_terminal, "\n\nSystem shutdown initiated\r\n");
   serial_write_string(COM1_BASE, "System shutdown initiated\r\n");
+  terminal_destroy(&main_terminal);
   boot_log_init();
   boot_log_start("Initializing System Shutdown");
   boot_log_info("Disabling Interrupts...");
@@ -158,7 +162,6 @@ void shutdown(void) {
   boot_log_error();
   boot_log_warn("System halted. Safe to power off.\r\n");
   boot_log_finish();
-  terminal_destroy(&main_terminal);
   // Halt final
   while (1) {
     __asm__ volatile("cli; hlt");
@@ -182,6 +185,11 @@ void initialize_acpi_pci(void) {
   }
   // Inicializar PCI
   pci_init();
+  driver_instance_t *pci_drv = pci_driver_create("pci_bus");
+  if (pci_drv) {
+    driver_init(pci_drv, NULL);
+    driver_start(pci_drv);
+  }
   boot_log_ok();
   // Inicializar ACPI
   boot_log_start("Initializing ACPI subsystem");
@@ -248,36 +256,45 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
   g_pitch_pixels = pitch_pixels;
   g_screen_width = width;
   g_screen_height = height;
-  // 1. Inicializar memoria
-  if (boot_info.mmap) {
-    pmm_init(boot_info.mmap);
-    boot_log_ok();
-  } else {
-    boot_log_error();
-  }
-  mmu_init();
+  
   // ============================================
   // FASE DE BOOT CON MENSAJES FORMATEADOS
   // ============================================
+
+  
+  // 1. Inicializar memoria
+  if (boot_info.mmap) {
+    pmm_init(boot_info.mmap);
+  } else {
+    while (1) {
+    }
+  }
+  
+  mmu_init();
+  
   size_t heap_size = STATIC_HEAP_SIZE;
   heap_init(kernel_heap, heap_size);
   pmm_exclude_kernel_heap(kernel_heap, heap_size);
-  boot_log_start("Initializing Virtual Memory Manager");
+  
   vmm_init();
-  boot_log_ok();
+  
   // Inicializar framebuffer básico
   fb_init(g_framebuffer, width, height, pitch, bpp);
-  terminal_init(&main_terminal);
-  // boot_log_init();
+  // INICIALIZAR BOOT LOG PRIMERO
+  boot_log_init();
   // 2. Inicializar GDT, IDT
   boot_log_start("Initializing GDT");
   gdt_init();
   boot_log_ok();
+  
   boot_log_start("Initializing IDT");
   idt_init();
   boot_log_ok();
+  
+  boot_log_start("Initializing CPUID");
   cpuid_init();
   boot_log_ok();
+  
   boot_log_start("Initializing PIT timer (for calibration)");
   // Inicializar PIT a 100Hz temporalmente
   uint32_t divisor = 1193180 / 100;
@@ -285,11 +302,12 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
   outb(0x40, (uint8_t)(divisor & 0xFF));
   outb(0x40, (uint8_t)((divisor >> 8) & 0xFF));
   boot_log_ok();
+  
   // 13. Inicializar drivers
   boot_log_start("Initializing driver system");
   driver_system_init();
-  keyboard_set_handler(keyboard_terminal_handler);
   boot_log_ok();
+  
   // 14. Cargar layout de teclado
   boot_log_start("Loading keyboard layout");
   if (keyboard_load_layout("/dev/ES-KBD.KBD", "ES-QWERTY") == 0) {
@@ -298,29 +316,64 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
     boot_log_ok();
   } else {
     boot_log_warn("Using default layout");
+    boot_log_ok();
   }
+  
   initialize_acpi_pci();
+  
   // NUEVO: Ahora sí inicializar el timer (usará APIC si está disponible)
   boot_log_start("Initializing timer");
   __asm__ volatile("cli");
   pit_init(100); // Esto usará APIC timer si está disponible
+  kernel_delay_init(100); // 100Hz
+  kernel_calibrate_delay();
+  boot_log_ok();
+  
   // 7. Inicializar ACPI/PCI/APIC (MODIFICADO)
+  boot_log_start("Configuring interrupt system");
   irq_setup_apic();
+  boot_log_ok();
+  
   // 3. Inicializar teclado
   boot_log_start("Initializing keyboard");
   keyboard_init();
   boot_log_ok();
+  kernel_safe_delay(500);
+  
+  boot_log_start("Initializing character devices");
+  chardev_init();
+  boot_log_ok();
+  kernel_safe_delay(500);
+  
   // 5. Inicializar serial
   boot_log_start("Initializing serial ports");
   serial_init();
+  kernel_safe_delay(500);
+  driver_instance_t *serial_drv = serial_driver_create("com_ports");
+  if (serial_drv) {
+    driver_init(serial_drv, NULL);
+    driver_start(serial_drv);
+  }
   boot_log_ok();
+  kernel_safe_delay(500);
+  
   // 6. Inicializar VFS
   boot_log_start("Initializing VFS");
   vfs_init();
+  boot_log_show_asterisks(0);
+  kernel_safe_delay(100);
   vfs_register_fs(&tmpfs_type);
+  boot_log_show_asterisks(1);
   vfs_register_fs(&fat32_fs_type);
+  kernel_safe_delay(100);
   vfs_register_fs(&sysfs_type);
+  boot_log_show_asterisks(2);
+  vfs_register_fs(&devfs_type);
+  kernel_safe_delay(100);
+  boot_log_show_asterisks(0);
   boot_log_ok();
+  kernel_safe_delay(100);
+  
   // 8. Inicializar SATA/AHCI
   boot_log_start("Initializing SATA/AHCI subsystem");
   bool sata_available = false;
@@ -332,6 +385,7 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
     boot_log_info("SATA/AHCI not available");
     boot_log_error();
   }
+  
   // 9. Inicializar ATAPI
   boot_log_start("Initializing ATAPI subsystem");
   bool atapi_available = false;
@@ -343,26 +397,45 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
     boot_log_info("ATAPI not available");
     boot_log_error();
   }
+  
+  boot_log_start("Initializing IDE driver subsystem");
+  if (ide_driver_register_type() == 0) {
+      driver_instance_t *ide_drv = ide_driver_create("ide0");
+      if (ide_drv) {
+          driver_init(ide_drv, NULL);
+          driver_start(ide_drv);
+          boot_log_ok();
+      } else {
+          boot_log_error();
+      }
+  } else {
+      boot_log_error();
+  }
+  
   // 10. Montar sistemas de archivos
   bool home_mounted = false;
+  
   boot_log_start("Mounting root filesystem");
   if (vfs_mount("/", "tmpfs", NULL) == VFS_OK) {
     boot_log_ok();
   } else {
     boot_log_error();
   }
+  
   boot_log_start("Mounting /dev filesystem");
-  if (vfs_mount("/dev", "tmpfs", NULL) == VFS_OK) {
+  if (vfs_mount("/dev", "devfs", NULL) == VFS_OK) {
     boot_log_ok();
   } else {
     boot_log_error();
   }
+  
   boot_log_start("Mounting /ramfs filesystem");
   if (vfs_mount("/ramfs", "tmpfs", NULL) == VFS_OK) {
     boot_log_ok();
   } else {
     boot_log_error();
   }
+  
   boot_log_start("Mounting /sys info filesystem");
   if (vfs_mount("/sys", "sysfs", NULL) == VFS_OK) {
     boot_log_ok();
@@ -373,17 +446,22 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
   // Intentar montar disco persistente
   boot_log_start("Searching for persistent storage");
   bool disk_hardware_initialized = false;
+  
   // Probar SATA con soporte multi-disco
   if (sata_available) {
+    boot_log_show_asterisks(1);
     disk_t *sata_disk = (disk_t *)kernel_malloc(sizeof(disk_t));
     if (sata_disk && sata_to_legacy_disk_init(sata_disk, 0) == DISK_ERR_NONE) {
       disk_hardware_initialized = true;
       memcpy(&main_disk, sata_disk, sizeof(disk_t));
       boot_log_info("SATA disk 0 initialized as main disk");
+      kernel_free(sata_disk);
     }
   }
+  
   if (!home_mounted && !disk_hardware_initialized) {
     boot_log_info("Trying IDE disk");
+    boot_log_show_asterisks(2);
     disk_err_t ide_init = disk_init(&main_disk, 0);
     if (ide_init == DISK_ERR_NONE && main_disk.initialized) {
       disk_hardware_initialized = true;
@@ -401,10 +479,12 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
       boot_log_warn("IDE disk init failed (error %d).", ide_init);
     }
   }
+  
   // Fallback a ATAPI
   if (!home_mounted && !disk_hardware_initialized && atapi_available &&
       atapi_get_device_count() > 0) {
     boot_log_info("Trying ATAPI device");
+    boot_log_show_asterisks(0);
     if (disk_init_atapi(&main_disk, 0) == DISK_ERR_NONE &&
         main_disk.initialized) {
       disk_hardware_initialized = true;
@@ -427,6 +507,7 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
       boot_log_warn("ATAPI init failed.");
     }
   }
+  
   // Fallback final a tmpfs
   if (!home_mounted) {
     boot_log_info("Using tmpfs for /home");
@@ -438,42 +519,68 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
       boot_log_warn("No disk hardware detected.");
     }
   }
+  
+  boot_log_ok();
+  
   sata_disk_debug_port(4);
+  
   // 11. Inicializar logging
   boot_log_start("Initializing logging system");
   log_init();
   boot_log_ok();
+  
   // Inicializar gestor de particiones
+  boot_log_start("Initializing partition manager");
   partition_manager_init();
   disk_scan_all_buses();
   disk_list_detected_devices();
+  boot_log_ok();
+  
   // Escanear disco principal al inicio
+  boot_log_start("Scanning disk for partitions");
   partition_manager_scan_disk(&main_disk, 0);
+  boot_log_ok();
+  
   // Verificar tabla de particiones
+  boot_log_start("Verifying partition table");
   if (partition_manager_verify_partition_table(0)) {
-    terminal_puts(&main_terminal, "Partition table verification: PASSED\r\n");
+    boot_log_info("Partition table verification: PASSED");
+    boot_log_ok();
   } else {
-    terminal_puts(&main_terminal, "Partition table verification: FAILED\r\n");
+    boot_log_info("Partition table verification: FAILED");
+    boot_log_error();
   }
+  
   boot_log_start("Auto-mounting partitions");
   partition_manager_auto_mount_all();
   boot_log_ok();
+  
+  boot_log_start("Initializing system calls");
   syscall_init();
+  boot_log_ok();
+  
   // 15. Inicializar mouse
   // boot_log_start("Initializing PS/2 mouse");
   // mouse_init(g_screen_width, g_screen_height);
   // boot_log_ok();
+  
   // Finalizar boot y mostrar mensaje
   boot_log_finish();
+  
   // 12. Inicializar multitarea
-  boot_log_ok();
+  boot_log_start("Initializing multitasking system");
+  serial_write_string(COM1_BASE, "MicroKernel OS\r\n");
   task_init();
+  boot_log_ok();
+  
   // ============================================
   // INICIAR TERMINAL NORMAL
   // ============================================
   // Limpiar pantalla
   set_colors(COLOR_WHITE, COLOR_BLACK);
+  
   // Inicializar terminal
+  boot_log_start("Initializing terminal");
   terminal_puts(&main_terminal, "\n");
   terminal_puts(&main_terminal,
                 "===============================================\n");
@@ -484,8 +591,18 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
   terminal_printf(&main_terminal, "System ready. Type 'help' for commands.\n");
   terminal_puts(&main_terminal, "\r\n=== Partition Management Demo ===\r\n");
   terminal_puts(&main_terminal, "Starting scheduler...\n");
+  boot_log_ok();
+  
+  boot_log_start("Enabling task profiling");
   task_profiling_enable();
+  boot_log_ok();
+  
+  boot_log_start("Initializing message system");
   message_system_init();
+  boot_log_ok();
+  
+  boot_log_finish();
+
   // disk_io_daemon_init();
   task_t *mem_defrag =
       task_create("Memory Defrag", memory_defrag_task, NULL, TASK_PRIORITY_LOW);
@@ -641,7 +758,9 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
 static void main_loop_task(void *arg) {
   (void)arg;
   uint32_t last_update = 0;
+  terminal_init(&main_terminal);
   terminal_printf(&main_terminal, "[MAIN_LOOP] Task started\r\n");
+  keyboard_set_handler(keyboard_terminal_handler);
   while (1) {
     uint32_t current_time = ticks_since_boot * 10; // 10ms per tick a 100Hz
     // Actualizar cada 50ms (5 ticks)

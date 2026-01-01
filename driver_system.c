@@ -343,7 +343,6 @@ int driver_stop(driver_instance_t *drv) {
     return -1;
 
   if (drv->state != DRIVER_STATE_ACTIVE) {
-    boot_log_warn("WARNING: Driver %s not active\r\n", drv->name);
     return 0;
   }
 

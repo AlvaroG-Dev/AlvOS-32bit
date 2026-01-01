@@ -53,6 +53,17 @@ char serial_read_char(uint16_t port);
 void serial_printf(uint16_t port, const char *fmt, ...);
 int serial_can_write(uint16_t port);
 int serial_can_read(uint16_t port);
+int serial_available(uint16_t port);
+int serial_read_nonblock(uint16_t port);
+void serial_unmask_pic(int irq);
+void serial_dump_status(uint16_t port);
+int serial_queue_available(uint16_t port);
+int serial_get_rx_queue_available(uint16_t port);
+char serial_peek_rx_queue(uint16_t port, int index);
+void serial_clear_rx_queue(uint16_t port);
+
+void cmd_serial_test(const char *args);
+void cmd_serial_read(const char *args);
 
 // Driver registration functions
 int serial_driver_register_type(void);
