@@ -4,7 +4,6 @@
 #include "terminal.h"
 #include "string.h"
 #include "task_utils.h"
-#include "boot_log.h"
 #include "irq.h"
 #include "log.h"
 
@@ -481,16 +480,10 @@ void task_cleanup_zombies(void) {
         if ((current->state == TASK_ZOMBIE || current->state == TASK_FINISHED) &&
             current != scheduler.idle_task) {
             
-            if (boot_state.boot_phase) {
-                boot_log_info("Cleaning up task: %s (ID: %u, state: %s)\n", 
-                    current->name, current->task_id,
-                    current->state == TASK_ZOMBIE ? "ZOMBIE" : "FINISHED");
-            } else {
-                log_message(LOG_INFO, 
-                    "Cleaning up task: %s (ID: %u, state: %s)\n", 
-                    current->name, current->task_id,
-                    current->state == TASK_ZOMBIE ? "ZOMBIE" : "FINISHED");
-            }
+            log_message(LOG_INFO, 
+                "Cleaning up task: %s (ID: %u, state: %s)\n", 
+                current->name, current->task_id,
+                current->state == TASK_ZOMBIE ? "ZOMBIE" : "FINISHED");
             task_destroy(current);
             
             if (current == start) {

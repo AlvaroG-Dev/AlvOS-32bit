@@ -5,7 +5,6 @@
 #include "vfs.h"
 #include "memory.h"
 #include "irq.h"
-#include "boot_log.h"
 #include <stdarg.h>
 
 extern Terminal main_terminal;
@@ -61,20 +60,12 @@ void log_set_path(const char *new_path) {
     log_fd = vfs_open(log_path, VFS_O_RDWR | VFS_O_CREAT);
     if (log_fd < 0) {
         log_initialized = false;
-        if (boot_is_active()) {
-            // Durante boot, reportar con boot_log
-            boot_log_info("Failed to open log file");
-        } else {
-            terminal_printf(&main_terminal, "[log] Failed to open new path %s\r\n", log_path);
-        }
+        terminal_printf(&main_terminal, "[log] Failed to open new path %s\r\n", log_path);
         return;
     }
 
     log_initialized = true;
-    
-    if (!boot_is_active()) {
-        terminal_printf(&main_terminal, "[log] Path changed to %s\r\n", log_path);
-    }
+    terminal_printf(&main_terminal, "[log] Path changed to %s\r\n", log_path);
 }
 
 // ========================================================================
@@ -173,9 +164,7 @@ int log_read(char *buffer, uint32_t size, uint32_t offset) {
     
     int fd = vfs_open(log_path, VFS_O_RDONLY);
     if (fd < 0) {
-        if (!boot_is_active()) {
-            terminal_puts(&main_terminal, "[log] Cannot open log file for reading\r\n");
-        }
+        terminal_puts(&main_terminal, "[log] Cannot open log file for reading\r\n");
         return -1;
     }
 
@@ -238,8 +227,6 @@ int log_read_tail(char *buffer, uint32_t size, uint32_t lines) {
 // ========================================================================
 
 void log_dump(void) {
-    if (boot_is_active()) return; // No dumping durante boot
-    
     char buffer[4096];
     int read = log_read(buffer, sizeof(buffer) - 1, 0);
     
@@ -254,8 +241,6 @@ void log_dump(void) {
 }
 
 void log_dump_tail(uint32_t lines) {
-    if (boot_is_active()) return;
-    
     char buffer[4096];
     int read = log_read_tail(buffer, sizeof(buffer) - 1, lines);
     
@@ -274,8 +259,6 @@ void log_dump_tail(uint32_t lines) {
 // ========================================================================
 
 void log_test(void) {
-    if (boot_is_active()) return;
-    
     terminal_puts(&main_terminal, "[log] Running logging system test\r\n");
 
     log_info("Test info message");

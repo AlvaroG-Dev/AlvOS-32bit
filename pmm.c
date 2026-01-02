@@ -18,7 +18,6 @@ pmm_bitmap_t pmm_bitmap = {0};
 
 void pmm_init(struct multiboot_tag_mmap *mmap_tag) {
   if (!mmap_tag) {
-    boot_log_error();
     return;
   }
 
@@ -125,24 +124,14 @@ void pmm_init(struct multiboot_tag_mmap *mmap_tag) {
 
       // Reducir tamaño de la región
       mem_regions[i].length -= bitmap_pages_needed * PAGE_SIZE;
-
-      boot_log_info("PMM initialized: %u pages total, bitmap at 0x%08x",
-                    total_pages, bitmap_addr);
-      boot_log_ok();
       return;
     }
   }
-
-  boot_log_error();
-  boot_log_info("PMM: Could not allocate bitmap");
 }
 
 void pmm_exclude_kernel_heap(void *heap_start, size_t heap_size) {
   uint64_t heap_begin = ALIGN_4KB_DOWN((uintptr_t)heap_start);
   uint64_t heap_end = ALIGN_4KB_UP(heap_begin + heap_size);
-
-  boot_log_info("Excluding kernel heap: 0x%08x-0x%08x", (uint32_t)heap_begin,
-                (uint32_t)heap_end);
 
   for (uint32_t i = 0; i < mem_region_count; i++) {
     uint64_t region_start = mem_regions[i].base;

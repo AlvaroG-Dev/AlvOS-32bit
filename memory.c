@@ -38,9 +38,6 @@ void heap_init(void *heap_memory, size_t heap_size) {
   free_list->size = heap_size - sizeof(heap_block_t);
   free_list->free = 1;
   free_list->next = NULL;
-
-  boot_log_info("Heap initialized at 0x%08x, size: %u KB",
-                (uint32_t)kernel_heap_start, heap_size / 1024);
 }
 
 void *kernel_malloc(size_t size) {

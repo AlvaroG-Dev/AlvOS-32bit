@@ -13,6 +13,7 @@
 #include "task_utils.h"
 #include "terminal.h"
 #include "vfs.h"
+#include "dma.h"
 
 // Global ACPI information
 acpi_info_t acpi_info = {0};
@@ -865,49 +866,21 @@ void acpi_power_off(void) {
   // fadt=%p\r\n",
   //                acpi_info.initialized, acpi_info.fadt);
 
-  if (!acpi_info.initialized) {
-    boot_log_warn("ACPI: Power off failed - ACPI not initialized\r\n");
-    boot_log_error();
-    return;
-  }
-
-  if (!acpi_info.fadt) {
-    boot_log_warn("ACPI: Power off failed - FADT not found\r\n");
-    boot_log_error();
-    return;
-  }
-
   acpi_pm_info_t *pm = &acpi_info.pm_info;
-
-  boot_log_info("ACPI: Initiating ACPI power off sequence...\r\n");
-
   // Verificar que tenemos los recursos necesarios
   if (!pm->pm1a_control_port) {
-    boot_log_info("ACPI: No PM1A control port available for power off\r\n");
-    boot_log_error();
     goto fallback_methods;
   }
 
   // Asegurar que ACPI está habilitado
   if (!pm->acpi_enabled) {
-    boot_log_info("ACPI: Enabling ACPI for power off...\r\n");
     if (!acpi_enable()) {
-      boot_log_warn("ACPI: Cannot enable ACPI for power off\r\n");
-      boot_log_error();
       goto fallback_methods;
     }
   }
-
-  // Mostrar información de debug
-  boot_log_info("ACPI: Using S5 sleep types A=%u, B=%u\r\n",
-                pm->s5_sleep_type_a, pm->s5_sleep_type_b);
-  boot_log_info("ACPI: PM1A Control Port: 0x%x\r\n", pm->pm1a_control_port);
-
   // Preparar para S5 (soft power off)
   uint16_t sleep_type_a = (pm->s5_sleep_type_a << 10);
   uint16_t sleep_type_b = (pm->s5_sleep_type_b << 10);
-
-  boot_log_info("ACPI: Writing sleep command to PM1A...\r\n");
 
   // Deshabilitar interrupciones antes del apagado
   __asm__ volatile("cli");
@@ -918,15 +891,10 @@ void acpi_power_off(void) {
     pm1_control |= sleep_type_a;          // Set S5 sleep type A
     pm1_control |= ACPI_PM1_CNT_SLP_EN;   // Enable sleep
 
-    boot_log_info("ACPI: Writing 0x%04x to PM1A port 0x%x\r\n", pm1_control,
-                  pm->pm1a_control_port);
-
     outw(pm->pm1a_control_port, pm1_control);
 
     // Si hay un segundo controlador PM1B, también configurarlo
     if (pm->pm1b_control_port) {
-      boot_log_info("ACPI: Also writing to PM1B port 0x%x\r\n",
-                    pm->pm1b_control_port);
       uint16_t pm1b_control = inw(pm->pm1b_control_port);
       pm1b_control &= ~ACPI_PM1_CNT_SLP_TYP;
       pm1b_control |= sleep_type_b;
@@ -937,32 +905,21 @@ void acpi_power_off(void) {
     // Esperar un momento para que el comando tenga efecto
     for (volatile int i = 0; i < 1000000; i++)
       ;
-
-    // Si llegamos aquí, el apagado ACPI falló
-    boot_log_warn(
-        "ACPI: ACPI power off command sent but system did not power off\r\n");
-    boot_log_error();
   }
 
 fallback_methods:
   // Fallback: intentar apagado por otros métodos
-  boot_log_warn("ACPI: Attempting fallback shutdown methods...\r\n");
 
   // Método 1: QEMU/Bochs (funciona en muchos emuladores)
-  boot_log_warn("ACPI: Trying QEMU/Bochs method (port 0x604)...\r\n");
   outw(0x604, 0x2000);
   for (volatile int i = 0; i < 100000; i++)
     ;
 
   // Método 2: VirtualBox
-  boot_log_warn("ACPI: Trying VirtualBox method (port 0x4004)...\r\n");
   outw(0x4004, 0x3400);
   for (volatile int i = 0; i < 100000; i++)
     ;
-
   // Si nada funciona, halt
-  boot_log_warn("ACPI: All shutdown methods failed. System halted.\r\n");
-  boot_log_error();
   while (1) {
     __asm__ volatile("cli; hlt");
   }
@@ -983,63 +940,50 @@ void acpi_reboot(void) {
   terminal_printf(&main_terminal, "System reboot initiated\r\n");
   serial_write_string(COM1_BASE, "System reboot initiated\r\n");
 
-  // 2. Stop the scheduler
+  // 1. Deshabilitar interrupciones
+  __asm__ volatile("cli");
+  
+  // 2. Detener el scheduler
   if (scheduler.scheduler_enabled) {
     scheduler_stop();
-    terminal_printf(&main_terminal, "Scheduler stopped\r\n");
-    serial_write_string(COM1_BASE, "Scheduler stopped\r\n");
+    
   }
-
-  // 3. Terminate all tasks (except idle)
+  // 3. Terminar todas las tareas (excepto idle)
   task_t *current = scheduler.task_list;
   if (current) {
     do {
       task_t *next = current->next;
       if (current != scheduler.idle_task) {
-        terminal_printf(&main_terminal, "Terminating task %s (ID: %u)\r\n",
-                        current->name, current->task_id);
-        serial_write_string(COM1_BASE, "Terminating task\r\n");
         task_destroy(current);
       }
       current = next;
     } while (current != scheduler.task_list);
   }
+  
   task_cleanup_zombies();
-  terminal_printf(&main_terminal, "All tasks terminated (except idle)\r\n");
-  serial_write_string(COM1_BASE, "All tasks terminated (except idle)\r\n");
+  
 
-  // 4. Clean up driver system
+  // 4. Desmontar sistemas de archivos (DEBE ser antes de limpiar drivers para
+  // poder flashear caches)
+  vfs_list_mounts(unmount_callback, &unmount_data);
+  
+  // 5. Limpiar sistema de drivers
   driver_system_cleanup();
-  terminal_printf(&main_terminal, "Driver system cleaned up\r\n");
-  serial_write_string(COM1_BASE, "Driver system cleaned up\r\n");
-
-  // 5. Unmount all filesystems
-  vfs_list_mounts(unmount_callback, &reboot_data);
-
-  if (reboot_data.errors > 0) {
-    terminal_printf(&main_terminal,
-                    "Warning: %d filesystems failed to unmount\n",
-                    reboot_data.errors);
-  }
-  disk_flush_dispatch(&main_disk);
-  terminal_printf(&main_terminal, "All filesystems unmounted\r\n");
-  serial_write_string(COM1_BASE, "All filesystems unmounted\r\n");
-
-  // 6. Clean up modules
+  
+  // 6. Limpiar módulos
   module_loader_cleanup();
-  terminal_printf(&main_terminal, "Modules cleaned up\r\n");
-  serial_write_string(COM1_BASE, "Modules cleaned up\r\n");
-
-  // 7. Disable PICs
-  outb(PIC1_DATA, 0xFF); // Mask all IRQs on master PIC
-  outb(PIC2_DATA, 0xFF); // Mask all IRQs on slave PIC
-  terminal_printf(&main_terminal, "PICs disabled\r\n");
-  serial_write_string(COM1_BASE, "PICs disabled\r\n");
+  
+  // 7. Deshabilitar PICs
+  outb(PIC1_DATA, 0xFF);
+  outb(PIC2_DATA, 0xFF);
+  
+  // 8. Reportar estadísticas finales del heap
+  dma_cleanup();
 
   // 8. Brief delay to ensure all I/O completes
   for (volatile int i = 0; i < 1000000; i++)
     ;
-
+  terminal_destroy(&main_terminal);
   // 9. Attempt ACPI reset
   bool acpi_reset_success = false;
   terminal_puts(&main_terminal,

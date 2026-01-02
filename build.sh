@@ -82,7 +82,6 @@ compile "installer.c" "$GCC $GCC_OPTS -c installer.c -o build/installer.o"
 compile "mbr.c" "$GCC $GCC_OPTS -c mbr.c -o build/mbr.o"
 compile "partition.c" "$GCC $GCC_OPTS -c partition.c -o build/partition.o"
 compile "partition_manager.c" "$GCC $GCC_OPTS -c partition_manager.c -o build/partition_manager.o"
-compile "boot_log.c" "$GCC $GCC_OPTS -c boot_log.c -o build/boot_log.o"
 compile "mouse.c" "$GCC $GCC_OPTS -c mouse.c -o build/mouse.o"
 compile "apic.c" "$GCC $GCC_OPTS -c apic.c -o build/apic.o"
 compile "text_editor.c" "$GCC $GCC_OPTS -c text_editor.c -o build/text_editor.o"
@@ -107,7 +106,7 @@ ld -m elf_i386 -T linker.ld -o build/kernel.bin \
     build/pci.o build/acpi.o build/dma.o build/ahci.o build/sata_disk.o \
     build/atapi.o build/usb_core.o build/usb_disk_wrapper.o \
     build/uhci.o build/usb_mass_storage.o build/ehci.o build/usb_commands.o \
-    build/partition.o build/mbr.o build/installer.o build/boot_log.o \
+    build/partition.o build/mbr.o build/installer.o \
     build/mouse.o build/partition_manager.o build/apic.o build/mini_parser.o \
     build/text_editor.o build/syscalls.o build/syscall_asm.o build/exec.o \
     build/sysfs.o build/devfs.o build/chardev.o build/chardev_vfs.o

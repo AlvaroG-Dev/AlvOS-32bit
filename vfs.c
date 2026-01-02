@@ -1,6 +1,5 @@
 // vfs.c - Fixed version with proper mount point handling
 #include "vfs.h"
-#include "boot_log.h"
 #include "disk.h"
 #include "serial.h"
 #include "string.h"
@@ -995,9 +994,6 @@ int vfs_unmount(const char *mountpoint) {
     if (fst && fst->unmount) {
       int ret = fst->unmount(sb);
       if (ret != VFS_OK) {
-        boot_log_info("VFS: FS-specific unmount failed for %s (error %d)\r\n",
-                      normalized, ret);
-        boot_log_error();
         // Restaurar refcount ya que falló
         sb->refcount++;
         return ret;

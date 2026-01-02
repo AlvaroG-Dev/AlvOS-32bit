@@ -1,7 +1,6 @@
 #ifndef KERNEL_H
 #define KERNEL_H
 
-#include "boot_log.h"
 #include "disk.h"
 #include "installer.h"
 #include "memory.h"
@@ -35,6 +34,7 @@ typedef struct {
 
 extern BootInfo boot_info;
 extern Terminal main_terminal;
+extern struct unmount_callback_data unmount_data;
 
 // Punto de entrada del kernel (llamado desde el bootloader)
 void cmain(uint32_t magic, struct multiboot_tag *mb_info);

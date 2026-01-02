@@ -1,7 +1,6 @@
 // driver_system.c - Generic driver system implementation
 #include "driver_system.h"
 #include "atapi.h"
-#include "boot_log.h"
 #include "keyboard.h"
 #include "memory.h"
 #include "mouse.h"
@@ -129,13 +128,11 @@ void driver_system_cleanup(void) {
       current->ops->cleanup(current);
     }
 
-    boot_log_info("Destroyed driver: %s\r\n", current->name);
     free_driver_instance(current);
     current = next;
   }
 
   memset(&driver_system, 0, sizeof(driver_system));
-  boot_log_info("Driver system cleaned up\r\n");
 }
 
 int driver_register_type(const driver_type_info_t *type_info) {
@@ -352,11 +349,7 @@ int driver_stop(driver_instance_t *drv) {
   }
 
   drv->state = DRIVER_STATE_LOADED;
-  if (boot_state.boot_phase) {
-    boot_log_info("Driver %s stopped\r\n", drv->name);
-  } else {
-    terminal_printf(&main_terminal, "Driver %s stopped\r\n", drv->name);
-  }
+  terminal_printf(&main_terminal, "Driver %s stopped\r\n", drv->name);
   return result;
 }
 

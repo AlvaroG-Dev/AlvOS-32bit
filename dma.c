@@ -108,7 +108,6 @@ void dma_cleanup(void) {
     outb(DMA_MULTI_CHANNEL_MASK_1, 0x0F);  // Mask all channels 4-7
     
     dma_initialized = false;
-    boot_log_info("DMA subsystem cleaned up\r\n");
 }
 
 // ========================================================================
