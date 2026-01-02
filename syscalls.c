@@ -1,9 +1,10 @@
-// syscalls.c - VERSIÓN EXTENDIDA CON MÁS SYSCALLS (CORREGIDA)
+// syscalls.c - VERSIÓN COMPLETA Y CORREGIDA
 #include "syscalls.h"
+#include "driver_system.h"
 #include "idt.h"
 #include "irq.h"
 #include "kernel.h"
-#include "keyboard.h" // Para funciones de teclado
+#include "keyboard.h"
 #include "mmu.h"
 #include "string.h"
 #include "task.h"
@@ -17,10 +18,12 @@ extern vfs_file_t *fd_table[VFS_MAX_FDS];
 extern int mount_count;
 static char cwd_buffer[VFS_PATH_MAX] = "/";
 
-// Variables globales locales
-static int open_files[VFS_MAX_FDS] = {0};
+// Función auxiliar para verificar si un FD es válido y está abierto
+static bool is_valid_fd(int fd) {
+  return (fd >= 0 && fd < VFS_MAX_FDS && fd_table[fd] != NULL);
+}
 
-// Funciones auxiliares mejoradas
+// Funciones auxiliares mejoradas para seguridad
 bool validate_user_pointer(uint32_t ptr, uint32_t size) {
   if (ptr == 0)
     return false;
@@ -123,11 +126,6 @@ int copy_string_to_user(uint32_t user_dst, const char *kernel_src,
   return copy_to_user(user_dst, (void *)kernel_src, len + 1);
 }
 
-// Función auxiliar para verificar si un FD es válido y está abierto
-static bool is_valid_fd(int fd) {
-  return (fd >= 0 && fd < VFS_MAX_FDS && fd_table[fd] != NULL);
-}
-
 // Handler de syscall principal
 void syscall_handler(struct regs *r) {
   uint32_t syscall_num = r->eax;
@@ -141,7 +139,7 @@ void syscall_handler(struct regs *r) {
 
   switch (syscall_num) {
   // ============================================
-  // SYSCALLS EXISTENTES (NO MODIFICADAS)
+  // SYSCALLS ESENCIALES DEL SISTEMA
   // ============================================
   case SYSCALL_EXIT: {
     int exit_code = (int)r->ebx;
@@ -177,12 +175,12 @@ void syscall_handler(struct regs *r) {
       break;
     }
 
-    if (fd == 1 || fd == 2) {
+    if (fd == 1 || fd == 2) { // stdout/stderr
       for (size_t i = 0; i < count; i++) {
         terminal_putchar(&main_terminal, kernel_buffer[i]);
       }
       result = count;
-    } else if (fd == 0) {
+    } else if (fd == 0) { // stdin
       result = (uint32_t)-EBADF;
     } else if (is_valid_fd(fd)) {
       int32_t vfs_result = vfs_write(fd, kernel_buffer, count);
@@ -213,12 +211,10 @@ void syscall_handler(struct regs *r) {
 
     size_t bytes_read = 0;
 
-    if (fd == 0) {
-      // stdin - lee del teclado
+    if (fd == 0) { // stdin - leer del teclado
       for (bytes_read = 0; bytes_read < count; bytes_read++) {
         int key = keyboard_getkey_nonblock();
         if (key == -1) {
-          // No hay más teclas, esperar un poco
           task_sleep(1);
           if (keyboard_available()) {
             key = keyboard_getkey_nonblock();
@@ -237,7 +233,7 @@ void syscall_handler(struct regs *r) {
           kernel_buffer[bytes_read++] = (char)key;
         }
       }
-    } else if (fd == 1 || fd == 2) {
+    } else if (fd == 1 || fd == 2) { // stdout/stderr
       result = (uint32_t)-EBADF;
       kernel_free(kernel_buffer);
       break;
@@ -288,42 +284,35 @@ void syscall_handler(struct regs *r) {
     break;
 
   // ============================================
-  // NUEVAS SYSCALLS DE TECLADO
+  // SYSCALLS DE TECLADO
   // ============================================
   case SYSCALL_READKEY: {
-    // Leer una tecla (bloqueante)
     int key = -1;
     while (key == -1) {
       key = keyboard_getkey_nonblock();
-      if (key == -1) {
-        task_sleep(10); // Esperar 10ms
-      }
+      if (key == -1)
+        task_sleep(10);
     }
     result = (uint32_t)key;
     break;
   }
 
-  case SYSCALL_KEY_AVAILABLE: {
-    // Verificar si hay teclas disponibles
+  case SYSCALL_KEY_AVAILABLE:
     result = (uint32_t)keyboard_available();
     break;
-  }
 
   case SYSCALL_GETC: {
-    // Similar a getchar() - lee un carácter
     int key = -1;
     while (key == -1) {
       key = keyboard_getkey_nonblock();
-      if (key == -1) {
+      if (key == -1)
         task_sleep(10);
-      }
     }
     result = (uint32_t)key;
     break;
   }
 
   case SYSCALL_GETS: {
-    // Lee una línea completa
     uint32_t buf_ptr = r->ebx;
     size_t max_len = r->ecx;
 
@@ -339,7 +328,6 @@ void syscall_handler(struct regs *r) {
     }
 
     memset(kernel_buffer, 0, max_len);
-
     size_t pos = 0;
     bool done = false;
 
@@ -347,9 +335,8 @@ void syscall_handler(struct regs *r) {
       int key = -1;
       while (key == -1) {
         key = keyboard_getkey_nonblock();
-        if (key == -1) {
+        if (key == -1)
           task_sleep(10);
-        }
       }
 
       if (key == '\n') {
@@ -359,7 +346,6 @@ void syscall_handler(struct regs *r) {
       } else if (key == '\b') {
         if (pos > 0) {
           pos--;
-          // Enviar backspace a la terminal también
           terminal_putchar(&main_terminal, '\b');
         }
       } else if (key >= 32 && key < 127) {
@@ -368,10 +354,7 @@ void syscall_handler(struct regs *r) {
       }
     }
 
-    // Asegurar terminación
     kernel_buffer[max_len - 1] = '\0';
-
-    // Copiar a usuario
     int copied = copy_to_user(buf_ptr, kernel_buffer, max_len);
     if (copied < 0) {
       result = (uint32_t)-EFAULT;
@@ -383,21 +366,17 @@ void syscall_handler(struct regs *r) {
     break;
   }
 
-  case SYSCALL_KBHIT: {
-    // Verificar si hay tecla sin leer
+  case SYSCALL_KBHIT:
     result = (uint32_t)keyboard_available();
     break;
-  }
 
-  case SYSCALL_KBFLUSH: {
-    // Limpiar buffer del teclado
+  case SYSCALL_KBFLUSH:
     keyboard_clear_buffer();
     result = 0;
     break;
-  }
 
   // ============================================
-  // NUEVAS SYSCALLS DE ARCHIVOS Y DIRECTORIOS
+  // SYSCALLS DE ARCHIVOS Y DIRECTORIOS
   // ============================================
   case SYSCALL_OPEN: {
     uint32_t path_ptr = r->ebx;
@@ -421,8 +400,7 @@ void syscall_handler(struct regs *r) {
       break;
     }
 
-    if (fd < 3) {
-      // No se pueden cerrar stdin/stdout/stderr
+    if (fd < 3) { // stdin/stdout/stderr
       result = (uint32_t)-EBADF;
     } else {
       int ret = vfs_close(fd);
@@ -458,7 +436,6 @@ void syscall_handler(struct regs *r) {
       break;
     }
 
-    // Verificar que el directorio existe
     const char *rel;
     vfs_superblock_t *sb = find_mount_for_path(kernel_path, &rel);
     if (!sb) {
@@ -483,7 +460,6 @@ void syscall_handler(struct regs *r) {
       node->ops->release(node);
     }
 
-    // Actualizar CWD
     strncpy(cwd_buffer, kernel_path, VFS_PATH_MAX - 1);
     cwd_buffer[VFS_PATH_MAX - 1] = '\0';
     result = 0;
@@ -531,7 +507,7 @@ void syscall_handler(struct regs *r) {
   case SYSCALL_SEEK: {
     int fd = (int)r->ebx;
     int offset = (int)r->ecx;
-    int whence = (int)r->edx; // 0=SEEK_SET, 1=SEEK_CUR, 2=SEEK_END
+    int whence = (int)r->edx;
 
     if (!is_valid_fd(fd)) {
       result = (uint32_t)-EBADF;
@@ -548,7 +524,6 @@ void syscall_handler(struct regs *r) {
       f->offset += offset;
       break;
     case 2: // SEEK_END
-      // Necesitaríamos el tamaño del archivo
       result = (uint32_t)-ENOSYS;
       break;
     default:
@@ -572,6 +547,51 @@ void syscall_handler(struct regs *r) {
 
     vfs_file_t *f = fd_table[fd];
     result = f->offset;
+    break;
+  }
+
+  // ============================================
+  // SYSCALLS DE DISPOSITIVOS (IOCTL)
+  // ============================================
+  case SYSCALL_IOCTL: {
+    uint32_t ioctl_info_ptr = r->ebx;
+
+    // Estructura simple para ioctl
+    struct {
+      char name[DRIVER_NAME_MAX];
+      uint32_t cmd;
+      uint32_t arg_size;
+      uint8_t arg[256];
+    } ioctl_info;
+
+    // Copiar desde usuario
+    if (copy_from_user(&ioctl_info, ioctl_info_ptr, sizeof(ioctl_info)) < 0) {
+      result = (uint32_t)-EFAULT;
+      break;
+    }
+
+    // Buscar driver
+    driver_instance_t *drv = driver_find_by_name(ioctl_info.name);
+    if (!drv) {
+      result = (uint32_t)-ENODEV;
+      break;
+    }
+
+    // Verificar que esté activo
+    if (drv->state != DRIVER_STATE_ACTIVE) {
+      result = (uint32_t)-EBUSY;
+      break;
+    }
+
+    // Verificar que tenga ioctl
+    if (!drv->ops || !drv->ops->ioctl) {
+      result = (uint32_t)-ENOTTY;
+      break;
+    }
+
+    // Ejecutar ioctl
+    void *arg = (ioctl_info.arg_size > 0) ? ioctl_info.arg : NULL;
+    result = drv->ops->ioctl(drv, ioctl_info.cmd, arg);
     break;
   }
 
@@ -608,7 +628,6 @@ void syscall_handler(struct regs *r) {
   case SYSCALL_FORK:
   case SYSCALL_EXECVE:
   case SYSCALL_RMDIR:
-  case SYSCALL_IOCTL:
   case SYSCALL_GETPPID:
   case SYSCALL_GETUID:
   case SYSCALL_GETGID:
@@ -647,7 +666,6 @@ void syscall_handler(struct regs *r) {
   case SYSCALL_FCHOWN:
   case SYSCALL_UTIME:
   case SYSCALL_SYNC:
-    // TODO: Implementar en el futuro
     result = (uint32_t)-ENOSYS;
     break;
 

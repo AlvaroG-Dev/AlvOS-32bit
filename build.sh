@@ -161,6 +161,7 @@ fi
 echo -e "${BLUE}Creacion de ISO completadas con exito!${RESET}"
 
 echo "Compilando programa de prueba..."
+rm hello.bin hello.o
 
 # 1. Primero, compila el objeto
 i386-elf-gcc -m32 -ffreestanding -nostdlib -fno-pie -fno-stack-protector \

@@ -71,7 +71,7 @@
 #define SYSCALL_UTIME 0x3F         // Cambiar tiempos de acceso/modificación
 #define SYSCALL_SYNC 0x40          // Sincronizar filesystem
 
-// ✅ Definir códigos de error
+// ✅ Definir códigos de error (versión simplificada)
 #define EPERM 1
 #define ENOENT 2
 #define ESRCH 3

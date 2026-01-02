@@ -3155,23 +3155,24 @@ void terminal_execute(Terminal *term, const char *cmd) {
     int read_this_time;
     int has_content = 0;
     int max_read = 8192; // Límite por defecto para archivos normales
-    
+
     // Límites especiales para dispositivos de carácter
-    if (strstr(full_path, "/dev/zero") || strstr(full_path, "/dev/random") || 
+    if (strstr(full_path, "/dev/zero") || strstr(full_path, "/dev/random") ||
         strstr(full_path, "/dev/urandom")) {
-        max_read = 4096; // Limitar a 4KB para dispositivos infinitos
-        terminal_printf(term, "Reading from device %s (limited to %d bytes)...\r\n", 
-                       full_path, max_read);
-    }
-    
-    // Para /dev/null, sabemos que siempre será EOF
-    if (strstr(full_path, "/dev/null")) {
-        terminal_printf(term, "/dev/null: always returns EOF (0 bytes)\r\n");
-        vfs_close(fd);
-        return;
+      max_read = 4096; // Limitar a 4KB para dispositivos infinitos
+      terminal_printf(term,
+                      "Reading from device %s (limited to %d bytes)...\r\n",
+                      full_path, max_read);
     }
 
-    while (total_read < max_read && 
+    // Para /dev/null, sabemos que siempre será EOF
+    if (strstr(full_path, "/dev/null")) {
+      terminal_printf(term, "/dev/null: always returns EOF (0 bytes)\r\n");
+      vfs_close(fd);
+      return;
+    }
+
+    while (total_read < max_read &&
            (read_this_time = vfs_read(fd, buffer, sizeof(buffer) - 1)) > 0) {
       total_read += read_this_time;
 
@@ -3203,8 +3204,9 @@ void terminal_execute(Terminal *term, const char *cmd) {
     }
 
     if (total_read >= max_read) {
-        terminal_printf(term, "(stopped after %d bytes - device produces infinite data)\r\n", 
-                       max_read);
+      terminal_printf(
+          term, "(stopped after %d bytes - device produces infinite data)\r\n",
+          max_read);
     }
 
     vfs_close(fd);
@@ -3254,11 +3256,15 @@ void terminal_execute(Terminal *term, const char *cmd) {
                       full_path, count);
       for (uint32_t i = 0; i < count; i++) {
         const char *type_str = "dir";
-        if (dirents[i].type == VFS_NODE_FILE) type_str = "file";
-        else if (dirents[i].type == VFS_NODE_CHRDEV) type_str = "chr";
-        else if (dirents[i].type == VFS_NODE_BLKDEV) type_str = "blk";
-        else if (dirents[i].type == VFS_NODE_SYMLINK) type_str = "sym";
-        
+        if (dirents[i].type == VFS_NODE_FILE)
+          type_str = "file";
+        else if (dirents[i].type == VFS_NODE_CHRDEV)
+          type_str = "chr";
+        else if (dirents[i].type == VFS_NODE_BLKDEV)
+          type_str = "blk";
+        else if (dirents[i].type == VFS_NODE_SYMLINK)
+          type_str = "sym";
+
         terminal_printf(term, "%s (%s)\r\n", dirents[i].name, type_str);
       }
     } else {
@@ -3504,8 +3510,7 @@ void terminal_execute(Terminal *term, const char *cmd) {
     }
 
     terminal_printf(term, "umount: Successfully unmounted %s\r\n", normalized);
-  }
-  else if (strcmp(command, "part") == 0) {
+  } else if (strcmp(command, "part") == 0) {
     handle_part_command(term, argc, argv);
   } else if (strcmp(command, "shutdown") == 0) {
     terminal_puts(term, "Initiating system shutdown...\r\n");
