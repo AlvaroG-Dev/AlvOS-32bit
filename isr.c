@@ -11,6 +11,8 @@
 SystemState system_state;
 uint32_t last_fault_address = 0;
 uint32_t last_error_code = 0;
+extern void task_switch_context(cpu_context_t *old_context,
+                                cpu_context_t *new_context);
 
 // Tabla de mensajes de excepción extendida
 const char *exception_messages[] = {
@@ -190,51 +192,128 @@ static void handle_page_fault(struct regs *r) {
   last_error_code = r->err_code;
 
   // **DETECTAR SI ES UNA FALLA EN MODO USUARIO**
-  bool user_mode = (r->err_code & 0x4) ? true : false;
+  bool user_mode = (r->cs & 0x03) == 0x03; // Usar CS, no err_code
   const char *mode = user_mode ? "User" : "Kernel";
 
   terminal_printf(&main_terminal, "\n*** PAGE FAULT in %s mode ***\r\n", mode);
   terminal_printf(&main_terminal, "  Fault address: 0x%08x\r\n", fault_address);
   terminal_printf(&main_terminal, "  Error code: 0x%08x\r\n", r->err_code);
   terminal_printf(&main_terminal, "  EIP: 0x%08x\r\n", r->eip);
+  terminal_printf(&main_terminal, "  CS: 0x%04x (Ring %d)\r\n", r->cs,
+                  r->cs & 0x03);
   terminal_printf(&main_terminal, "  Current CR3: 0x%08x\r\n",
                   mmu_get_current_cr3());
 
-  // **SI ES EN MODO USUARIO, MATAR LA TAREA Y RESTAURAR KERNEL**
+  // **SI ES EN MODO USUARIO, MATAR LA TAREA Y HACER CONTEXT SWITCH**
   if (user_mode && scheduler.current_task) {
     terminal_printf(&main_terminal, "  Terminating user task: %s\r\n",
                     scheduler.current_task->name);
 
-    // **RESTAURAR CR3 DEL KERNEL INMEDIATAMENTE**
+    task_t *faulting_task = scheduler.current_task;
+
+    // **1. Restaurar CR3 del kernel ANTES de modificar estructuras**
     mmu_load_cr3(mmu_get_kernel_pd());
-    terminal_printf(&main_terminal, "  Restored kernel CR3: 0x%08x\r\n",
-                    mmu_get_current_cr3());
 
-    // Terminar la tarea
-    task_destroy(scheduler.current_task);
+    // **2. Marcar la tarea como muerta pero NO destruirla aún**
+    faulting_task->state = TASK_ZOMBIE;
 
-    // Volver a la tarea idle
-    scheduler.current_task = scheduler.idle_task;
-    if (scheduler.current_task) {
-      scheduler.current_task->state = TASK_RUNNING;
+    // **3. Buscar siguiente tarea para ejecutar (no puede ser la misma)**
+    task_t *next_task = scheduler.idle_task;
+
+    if (scheduler.task_list) {
+      task_t *t = scheduler.task_list;
+      do {
+        if (t != faulting_task && t->state == TASK_READY) {
+          next_task = t;
+          break;
+        }
+        t = t->next;
+      } while (t != scheduler.task_list);
     }
 
-    terminal_printf(&main_terminal, "  Returned to kernel mode\r\n");
-    return; // NO hacer panic, solo terminar la tarea
+    // **4. Cambiar al scheduler current_task ANTES de cualquier retorno**
+    scheduler.current_task = next_task;
+    next_task->state = TASK_RUNNING;
+
+    terminal_printf(&main_terminal, "  Switching to task: %s\r\n",
+                    next_task->name);
+
+    // **5. Forzar un cambio de contexto inmediato**
+    // En lugar de retornar de la interrupción, saltamos al scheduler
+    task_switch_context(&faulting_task->context, &next_task->context);
+
+    // **NUNCA LLEGAMOS AQUÍ - task_switch_to no retorna**
+    __builtin_unreachable();
   }
 
   // Para fallas en modo kernel, hacer panic normal
   char msg[256];
-  snprintf(msg, sizeof(msg), "Page Fault at 0x%08x\nMode: %s\nError: 0x%08x",
-           fault_address, mode, r->err_code);
+  snprintf(msg, sizeof(msg),
+           "Page Fault at 0x%08x\nMode: %s\nError: 0x%08x\nEIP: 0x%08x",
+           fault_address, mode, r->err_code, r->eip);
   panic_screen(msg, r);
 }
 
 static void handle_general_protection_fault(struct regs *r) {
+  // **DETECTAR SI ES UNA GPF EN MODO USUARIO**
+  bool user_mode = (r->cs & 0x03) == 0x03;
+  const char *mode = user_mode ? "User" : "Kernel";
+
+  last_error_code = r->err_code;
+
+  terminal_printf(&main_terminal,
+                  "\n*** GENERAL PROTECTION FAULT in %s mode ***\r\n", mode);
+  terminal_printf(&main_terminal, "  Error code: 0x%08x\r\n", r->err_code);
+  terminal_printf(&main_terminal, "  EIP: 0x%08x\r\n", r->eip);
+  terminal_printf(&main_terminal, "  CS: 0x%04x (Ring %d)\r\n", r->cs,
+                  r->cs & 0x03);
+
+  // **SI ES EN MODO USUARIO, MATAR LA TAREA Y HACER CONTEXT SWITCH**
+  if (user_mode && scheduler.current_task) {
+    terminal_printf(&main_terminal, "  Terminating user task: %s\r\n",
+                    scheduler.current_task->name);
+
+    task_t *faulting_task = scheduler.current_task;
+
+    // **1. Restaurar CR3 del kernel (si es necesario)**
+    mmu_load_cr3(mmu_get_kernel_pd());
+
+    // **2. Marcar la tarea como muerta**
+    faulting_task->state = TASK_ZOMBIE;
+
+    // **3. Buscar siguiente tarea**
+    task_t *next_task = scheduler.idle_task;
+
+    if (scheduler.task_list) {
+      task_t *t = scheduler.task_list;
+      do {
+        if (t != faulting_task && t->state == TASK_READY) {
+          next_task = t;
+          break;
+        }
+        t = t->next;
+      } while (t != scheduler.task_list);
+    }
+
+    // **4. Cambiar current_task**
+    scheduler.current_task = next_task;
+    next_task->state = TASK_RUNNING;
+
+    terminal_printf(&main_terminal, "  Switching to task: %s\r\n",
+                    next_task->name);
+
+    // **5. Forzar cambio de contexto**
+    task_switch_context(&faulting_task->context, &next_task->context);
+
+    // **NUNCA LLEGAMOS AQUÍ**
+    __builtin_unreachable();
+  }
+
+  // **SI ES EN MODO KERNEL, HACER PANIC**
   char msg[256];
   snprintf(msg, sizeof(msg),
-           "General Protection Fault\nError Code: 0x%08x\nEIP: 0x%08x",
-           r->err_code, r->eip);
+           "General Protection Fault\nMode: %s\nError: 0x%08x\nEIP: 0x%08x",
+           mode, r->err_code, r->eip);
   panic_screen(msg, r);
 }
 
@@ -308,60 +387,94 @@ void print_task_info(Terminal *term) {
   terminal_puts(term, "\nCurrent Task: Kernel\n");
 }
 
-// Manejador principal de ISRs
+// Manejador principal de ISRs - ACTUALIZADO
 void isr_handler(struct regs *r) {
   // Actualizar estado del sistema
   system_state.last_exception = r->int_no;
   system_state.exception_count++;
 
-  int is_critical = (r->int_no == 8 || r->int_no == 10 || r->int_no == 11 ||
-                     r->int_no == 12 || r->int_no == 13 || r->int_no == 14);
+  // DETECTAR MODO ACTUAL (kernel o usuario)
+  bool user_mode = (r->cs & 0x03) == 0x03;
 
-  if (is_critical) {
-    // Manejar críticas con handlers específicos y panic screen
-    switch (r->int_no) {
-    case 14:
-      handle_page_fault(r);
-      break;
-    case 13:
-      handle_general_protection_fault(r);
-      break;
-    case 8:
-      handle_double_fault(r);
-      break;
-    default: {
+  // Manejar excepciones críticas
+  switch (r->int_no) {
+  case 14: // Page Fault
+    handle_page_fault(r);
+    break;
+
+  case 13: // General Protection Fault
+    handle_general_protection_fault(r);
+    break;
+
+  case 8: // Double Fault
+    handle_double_fault(r);
+    break;
+
+  case 10: // Invalid TSS
+  case 11: // Segment Not Present
+  case 12: // Stack Fault
+    // Estas también pueden ocurrir en modo usuario
+    if (user_mode && scheduler.current_task) {
+      // Para modo usuario, terminar la tarea
+      terminal_printf(&main_terminal,
+                      "Exception %d in user mode, terminating task %s\r\n",
+                      r->int_no, scheduler.current_task->name);
+
+      // Restaurar kernel CR3
+      mmu_load_cr3(mmu_get_kernel_pd());
+
+      // Terminar tarea
+      task_destroy(scheduler.current_task);
+      scheduler.current_task = scheduler.idle_task;
+      if (scheduler.current_task) {
+        scheduler.current_task->state = TASK_RUNNING;
+      }
+      return;
+    } else {
+      // Para modo kernel, panic
       char msg[128];
       snprintf(msg, sizeof(msg), "%s\nError Code: 0x%08x",
                exception_messages[r->int_no], r->err_code);
       panic_screen(msg, r);
     }
-    }
-  } else {
-    // Para no críticas: Log en terminal e intentar recuperación
+    break;
+
+  default:
+    // Para otras excepciones: Log en terminal
     char buffer[128];
     snprintf(buffer, sizeof(buffer),
-             "\n\nException 0x%02x (%s) occurred\n"
-             "Error Code: 0x%08x\n"
-             "EIP: 0x%08x\n",
+             "\nException 0x%02x (%s) in %s mode\n"
+             "Error Code: 0x%08x\nEIP: 0x%08x\n",
              r->int_no,
              r->int_no < 32 ? exception_messages[r->int_no] : "Unknown",
-             r->err_code, r->eip);
+             user_mode ? "User" : "Kernel", r->err_code, r->eip);
     terminal_puts(&main_terminal, buffer);
 
-    print_registers(&main_terminal, r);
+    // Intentar recuperación para algunas excepciones no críticas
+    if (user_mode) {
+      // En modo usuario, excepciones no críticas pueden terminar la tarea
+      if (scheduler.current_task) {
+        terminal_printf(&main_terminal, "Terminating user task: %s\r\n",
+                        scheduler.current_task->name);
 
-    // Intentar recuperación: Por ejemplo, para divide by zero (0), setear eax=0
-    // y ajustar eip para skip
-    if (r->int_no == 0) { // Divide by zero
-      r->eax = 0;         // Setear resultado a 0
-      r->eip +=
-          2; // Skip la instrucción (asumiendo div simple, ajusta según código)
+        mmu_load_cr3(mmu_get_kernel_pd());
+        task_destroy(scheduler.current_task);
+        scheduler.current_task = scheduler.idle_task;
+        if (scheduler.current_task) {
+          scheduler.current_task->state = TASK_RUNNING;
+        }
+      }
+    } else if (r->int_no == 0) { // Divide by zero en modo kernel
+      // Recuperación para divide by zero
+      r->eax = 0;
+      r->eip += 2; // Skip instrucción DIV/IDIV (2 bytes típicos)
       terminal_puts(&main_terminal,
-                    "Recovered from Divide by Zero by setting result to 0\n");
-      return; // Continuar ejecución
+                    "Recovered from Divide by Zero in kernel mode\n");
+    } else {
+      // Otras excepciones en modo kernel: continuar con cuidado
+      terminal_puts(&main_terminal,
+                    "Attempting to continue in kernel mode...\n");
     }
-
-    // Para otras, mostrar y continuar (puede causar loops)
-    terminal_puts(&main_terminal, "\nAttempting to continue...\n");
+    break;
   }
 }
