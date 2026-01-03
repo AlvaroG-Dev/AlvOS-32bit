@@ -2,16 +2,16 @@
 #include "arp.h"
 #include "e1000.h"
 #include "kernel.h"
-#include "memutils.h"
+
 #include "network.h"
 #include "string.h"
 #include "terminal.h"
 
-
-// Configuración IP estática por defecto
-static ip_addr_t our_ip = {192, 168, 1, 100};
+// Configuración IP estática por defecto (VirtualBox NAT friendly)
+// Use 10.0.2.15 for VirtualBox/QEMU NAT default
+static ip_addr_t our_ip = {10, 0, 2, 15};
 static ip_addr_t netmask = {255, 255, 255, 0};
-static ip_addr_t gateway = {192, 168, 1, 1};
+static ip_addr_t gateway = {10, 0, 2, 2};
 
 // Calcular checksum IP
 uint16_t ip_checksum(void *data, uint16_t length) {
@@ -128,8 +128,7 @@ bool ip_process_packet(uint8_t *packet, uint32_t length, ip_addr_t *src_ip,
   ethernet_header_t *eth = (ethernet_header_t *)packet;
 
   // Verificar que es IP
-  uint16_t ethertype =
-      (eth->type << 8) | (eth->type >> 8); // Convertir endianness
+  uint16_t ethertype = ntohs(eth->type);
   if (ethertype != ETHERTYPE_IP) {
     return false;
   }
@@ -161,7 +160,18 @@ bool ip_process_packet(uint8_t *packet, uint32_t length, ip_addr_t *src_ip,
   }
 
   // Actualizar cache ARP con el remitente
-  arp_add_entry(ip->source_ip, eth->src);
+  // CORRECTION: Only add to ARP cache if the sender is on the same subnet!
+  bool is_local_sender = true;
+  for (int i = 0; i < 4; i++) {
+    if ((ip->source_ip[i] & netmask[i]) != (our_ip[i] & netmask[i])) {
+      is_local_sender = false;
+      break;
+    }
+  }
+
+  if (is_local_sender) {
+    arp_add_entry(ip->source_ip, eth->src);
+  }
 
   return true;
 }

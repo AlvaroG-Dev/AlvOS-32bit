@@ -88,6 +88,10 @@ static bool e1000_detect_device(void) {
 
   e1000_device.irq_line = device->interrupt_line;
 
+  // Habilitar Bus Mastering explícitamente (CRÍTICO para DMA)
+  pci_enable_bus_mastering(device);
+  terminal_puts(&main_terminal, "[E1000] PCI Bus Mastering ENABLED\r\n");
+
   return true;
 }
 
@@ -264,12 +268,15 @@ static void e1000_init_rx(void) {
   // Configurar receive descriptor ring
   uint32_t rx_desc_phys = (uint32_t)e1000_device.rx_descs;
   e1000_write_reg(E1000_REG_RDBAL, rx_desc_phys & 0xFFFFFFFF);
-  e1000_write_reg(E1000_REG_RDBAH, (rx_desc_phys >> 32) & 0xFFFFFFFF);
+  e1000_write_reg(E1000_REG_RDBAH, 0); // 32-bit address, high part is 0
   e1000_write_reg(E1000_REG_RDLEN, sizeof(e1000_rx_desc_t) * E1000_NUM_RX_DESC);
 
   // Configurar buffers de recepción
   for (int i = 0; i < E1000_NUM_RX_DESC; i++) {
-    e1000_device.rx_descs[i].buffer_addr = (uint64_t)e1000_device.rx_buffers[i];
+    // Asegurar que usamos dirección física real
+    uint32_t buffer_phys =
+        mmu_virtual_to_physical((uint32_t)e1000_device.rx_buffers[i]);
+    e1000_device.rx_descs[i].buffer_addr = (uint64_t)buffer_phys;
     e1000_device.rx_descs[i].status = 0;
   }
 
@@ -282,6 +289,7 @@ static void e1000_init_rx(void) {
   uint32_t rctl = e1000_read_reg(E1000_REG_RCTL);
   rctl |= E1000_RCTL_EN;          // Habilitar recepción
   rctl |= E1000_RCTL_BAM;         // Aceptar broadcast
+  rctl |= E1000_RCTL_UPE;         // Unicast Promiscuous Mode (Fix for some VMs)
   rctl |= E1000_RCTL_SECRC;       // Strip Ethernet CRC
   rctl |= E1000_RCTL_LPE;         // Permitir paquetes largos
   rctl &= ~E1000_RCTL_BSIZE_2048; // Buffer size
@@ -330,12 +338,9 @@ static void e1000_init_tx(void) {
     // IMPORTANTE: kernel_malloc devuelve dirección virtual
     // Necesitamos convertirla a física
     uint32_t buffer_virt = (uint32_t)e1000_device.tx_buffers[i];
-    uint32_t buffer_phys = buffer_virt; // Si tienes identidad mapping
+    uint32_t buffer_phys = mmu_virtual_to_physical(buffer_virt);
 
-    // Si tienes paginación, necesitas una función como:
-    // buffer_phys = vmm_virt_to_phys(buffer_virt);
-
-    desc->buffer_addr = buffer_phys;
+    desc->buffer_addr = (uint64_t)buffer_phys;
     desc->length = 0;
     desc->cmd = 0;
     desc->status = E1000_TXD_STAT_DD; // Marcar como "done" inicialmente
@@ -375,15 +380,20 @@ static void e1000_enable_interrupts(void) {
   e1000_write_reg(E1000_REG_ICR, 0xFFFFFFFF);
 
   // Habilitar interrupciones específicas
+  /*
   uint32_t ims = E1000_ICR_TXDW | // Transmit descriptor written back
                  E1000_ICR_RXT0 | // Receive timer
                  E1000_ICR_RXO |  // Receive overrun
                  E1000_ICR_LSC;   // Link status change
 
   e1000_write_reg(E1000_REG_IMS, ims);
+  */
 
-  terminal_printf(&main_terminal, "[E1000] Interrupts enabled (IRQ: %d)\r\n",
-                  e1000_device.irq_line);
+  // Disable interrupts for polling mode stability
+  e1000_write_reg(E1000_REG_IMC, 0xFFFFFFFF);
+
+  terminal_printf(&main_terminal,
+                  "[E1000] Interrupts DISABLED (Polling mode)\r\n");
 }
 
 bool e1000_init(void) {
@@ -447,20 +457,26 @@ bool e1000_init(void) {
 // ===================================================
 
 bool e1000_send_packet(const uint8_t *data, uint32_t length) {
+  uint32_t flags;
+  __asm__ __volatile__("pushf\n\tcli\n\tpop %0" : "=r"(flags));
+
   if (!e1000_device.initialized) {
     terminal_puts(&main_terminal, "[E1000] Device not initialized\r\n");
+    __asm__ __volatile__("push %0\n\tpopf" : : "r"(flags));
     return false;
   }
 
   if (length > E1000_MAX_PKT_SIZE || length == 0) {
     terminal_printf(&main_terminal, "[E1000] Invalid packet length: %u\r\n",
                     length);
+    __asm__ __volatile__("push %0\n\tpopf" : : "r"(flags));
     return false;
   }
 
   // Verificar si el link está up
   if (!e1000_is_link_up()) {
     terminal_puts(&main_terminal, "[E1000] Link is down, cannot send\r\n");
+    __asm__ __volatile__("push %0\n\tpopf" : : "r"(flags));
     return false;
   }
 
@@ -469,8 +485,8 @@ bool e1000_send_packet(const uint8_t *data, uint32_t length) {
   e1000_tx_desc_t *desc = &e1000_device.tx_descs[tx_idx];
 
   // DEBUG: Mostrar estado del descriptor
-  terminal_printf(&main_terminal, "[E1000] TX idx=%u, status=0x%02x\r\n",
-                  tx_idx, desc->status);
+  // terminal_printf(&main_terminal, "[E1000] TX idx=%u, status=0x%02x\r\n",
+  //                tx_idx, desc->status);
 
   // Esperar a que el descriptor esté listo (DD bit = 1)
   int timeout = 1000000;
@@ -491,6 +507,7 @@ bool e1000_send_packet(const uint8_t *data, uint32_t length) {
     // Re-inicializar
     e1000_init_tx();
 
+    __asm__ __volatile__("push %0\n\tpopf" : : "r"(flags));
     return false;
   }
 
@@ -520,10 +537,11 @@ bool e1000_send_packet(const uint8_t *data, uint32_t length) {
   e1000_device.tx_packets++;
   e1000_device.tx_bytes += length;
 
-  terminal_printf(&main_terminal,
-                  "[E1000] Packet sent: %u bytes, next_idx=%u\r\n", length,
-                  next_idx);
+  // terminal_printf(&main_terminal,
+  //                 "[E1000] Packet sent: %u bytes, next_idx=%u\r\n", length,
+  //                 next_idx);
 
+  __asm__ __volatile__("push %0\n\tpopf" : : "r"(flags));
   return true;
 }
 
@@ -532,15 +550,22 @@ bool e1000_send_packet(const uint8_t *data, uint32_t length) {
 // ===================================================
 
 uint32_t e1000_receive_packet(uint8_t *buffer, uint32_t max_len) {
+  uint32_t flags;
+  __asm__ __volatile__("pushf\n\tcli\n\tpop %0" : "=r"(flags));
+
   if (!e1000_device.initialized) {
+    __asm__ __volatile__("push %0\n\tpopf" : : "r"(flags));
     return 0;
   }
 
   uint32_t rx_idx = e1000_device.rx_curr;
-  e1000_rx_desc_t *desc = &e1000_device.rx_descs[rx_idx];
+  // Usar volatile para asegurar que leemos desde memoria (RAM) y no cache
+  volatile e1000_rx_desc_t *desc =
+      (volatile e1000_rx_desc_t *)&e1000_device.rx_descs[rx_idx];
 
-  // Verificar si hay paquete disponible
+  // Verificar si hay paquete disponible (Check DD bit)
   if (!(desc->status & E1000_RXD_STAT_DD)) {
+    __asm__ __volatile__("push %0\n\tpopf" : : "r"(flags));
     return 0;
   }
 
@@ -549,28 +574,41 @@ uint32_t e1000_receive_packet(uint8_t *buffer, uint32_t max_len) {
   if (length == 0 || length > max_len) {
     // Limpiar descriptor
     desc->status = 0;
+
+    // Avanzar índice SW
+    uint32_t old_rx_idx = rx_idx;
     e1000_device.rx_curr = (rx_idx + 1) % E1000_NUM_RX_DESC;
-    e1000_write_reg(E1000_REG_RDT, rx_idx);
+
+    // Notificar al hardware que el descriptor "old_rx_idx" está libre de nuevo
+    // RDT debe apuntar al descriptor que el hardware NO debe usar todavía.
+    // Al escribir old_rx_idx, liberamos el descriptor para que el hardware lo
+    // use
+    e1000_write_reg(E1000_REG_RDT, old_rx_idx);
+
+    __asm__ __volatile__("push %0\n\tpopf" : : "r"(flags));
     return 0;
   }
 
-  // Copiar datos
+  // Copiar datos del buffer DMA al buffer del usuario
   memcpy(buffer, e1000_device.rx_buffers[rx_idx], length);
 
   // Limpiar descriptor para reuso
   desc->status = 0;
 
   // Actualizar tail pointer
-  rx_idx = (rx_idx + 1) % E1000_NUM_RX_DESC;
-  e1000_write_reg(E1000_REG_RDT, rx_idx);
-
-  // Actualizar índice
-  e1000_device.rx_curr = rx_idx;
+  // Avanzar índice SW y actualizar RDT al índice que acabamos de procesar
+  uint32_t old_rx_idx = rx_idx;
+  e1000_device.rx_curr = (rx_idx + 1) % E1000_NUM_RX_DESC;
+  e1000_write_reg(E1000_REG_RDT, old_rx_idx);
 
   // Estadísticas
   e1000_device.rx_packets++;
   e1000_device.rx_bytes += length;
 
+  // DEBUG: Packet received
+  // terminal_printf(&main_terminal, "[E1000] RX packet: %u bytes\r\n", length);
+
+  __asm__ __volatile__("push %0\n\tpopf" : : "r"(flags));
   return length;
 }
 

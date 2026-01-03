@@ -22,6 +22,7 @@
 #include "mmu.h"
 #include "module_loader.h"
 #include "network.h"
+#include "network_stack.h"
 #include "partition.h"
 #include "partition_manager.h"
 #include "pci.h"
@@ -577,6 +578,9 @@ static void main_loop_task(void *arg) {
       }
       last_update = current_time;
     }
+    // CRÍTICO: Procesar pila de red
+    network_stack_tick();
+
     // CRÍTICO: Dormir en lugar de yield inmediato
     // Esto permite que otras tareas se ejecuten
     task_sleep(1); // Dormir 10ms, luego el scheduler lo despertará

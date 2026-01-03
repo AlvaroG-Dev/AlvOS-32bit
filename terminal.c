@@ -2732,10 +2732,10 @@ void terminal_execute(Terminal *term, const char *cmd) {
       strncat(args, argv[i], sizeof(args) - strlen(args) - 1);
     }
   } else if (strcmp(command, "exec") == 0) {
-    terminal_printf(term, "exec: Loading program: %s\r\n", "/home/hello.bin");
+    terminal_printf(term, "exec: Loading program: %s\r\n", "/home/tree.bin");
 
     // Cargar y ejecutar
-    task_t *task = exec_load_and_run("/mnt/sda1/hello.bin");
+    task_t *task = exec_load_and_run("/home/tree.bin");
 
     if (task) {
       terminal_printf(term, "exec: Program started (PID %u)\r\n",

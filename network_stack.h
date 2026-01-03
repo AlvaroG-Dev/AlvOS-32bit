@@ -4,15 +4,14 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-
 // Direcciones IP
 typedef uint8_t ip_addr_t[4];
 
 // Constantes de red (ahora como arrays estáticos, no macros)
-static const ip_addr_t DEFAULT_IP_ADDR = {192, 168, 1, 100};
+static const ip_addr_t DEFAULT_IP_ADDR = {10, 0, 2, 15};
 static const ip_addr_t DEFAULT_NETMASK = {255, 255, 255, 0};
-static const ip_addr_t DEFAULT_GATEWAY = {192, 168, 1, 1};
-static const ip_addr_t DEFAULT_DNS = {8, 8, 8, 8};
+static const ip_addr_t DEFAULT_GATEWAY = {10, 0, 2, 2};
+static const ip_addr_t DEFAULT_DNS = {10, 0, 2, 3};
 
 // Estados de la pila de red
 typedef enum {

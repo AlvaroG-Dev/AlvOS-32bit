@@ -13,6 +13,7 @@
 #define E1000_REG_ICR 0x000C0      // Interrupt Cause Read
 #define E1000_REG_ICS 0x000C8      // Interrupt Cause Set
 #define E1000_REG_IMS 0x000D0      // Interrupt Mask Set/Read
+#define E1000_REG_IMC 0x000D8      // Interrupt Mask Clear
 #define E1000_REG_RCTL 0x00100     // Receive Control
 #define E1000_REG_TCTL 0x00400     // Transmit Control
 #define E1000_REG_TIPG 0x00410     // Transmit IPG

@@ -60,10 +60,7 @@ void network_stack_tick(void) {
         uint8_t protocol;
 
         // CORRECCIÓN: Convertir endianness
-        uint16_t ethertype = (eth->type << 8) | (eth->type >> 8);
-
-        if (ethertype == ETHERTYPE_IP &&
-            ip_process_packet(buffer, length, &src_ip, &protocol)) {
+        if (ip_process_packet(buffer, length, &src_ip, &protocol)) {
           // Determinar protocolo de capa 4
           uint8_t *ip_payload = buffer + sizeof(ethernet_header_t) + 20;
           uint32_t ip_payload_len = length - sizeof(ethernet_header_t) - 20;
@@ -101,6 +98,7 @@ void network_stack_tick(void) {
   if (ticks_since_boot - last_arp_cleanup >
       6000) { // 6000 ticks = 60 segundos a 100Hz
     // Podríamos implementar aging aquí
+    arp_cleanup_old_entries();
     last_arp_cleanup = ticks_since_boot;
   }
 }

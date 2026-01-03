@@ -40,5 +40,6 @@ bool arp_send_request(ip_addr_t target_ip);
 void arp_process_packet(uint8_t *packet, uint32_t length);
 bool arp_resolve(ip_addr_t ip, uint8_t *mac, bool send_request);
 void arp_show_cache(void);
+void arp_cleanup_old_entries(void);
 
 #endif // ARP_H
