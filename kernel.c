@@ -2,14 +2,18 @@
 #include "acpi.h"
 #include "apic.h"
 #include "atapi.h"
+#include "chardev.h"
+#include "chardev_vfs.h"
 #include "cpuid.h"
 #include "disk.h"
 #include "disk_io_daemon.h"
 #include "dma.h"
 #include "drawing.h"
 #include "driver_system.h"
+#include "e1000.h"
 #include "fat32.h"
 #include "gdt.h"
+#include "ide.h"
 #include "idt.h"
 #include "io.h"
 #include "irq.h"
@@ -17,6 +21,7 @@
 #include "log.h"
 #include "mmu.h"
 #include "module_loader.h"
+#include "network.h"
 #include "partition.h"
 #include "partition_manager.h"
 #include "pci.h"
@@ -29,9 +34,6 @@
 #include "terminal.h"
 #include "tmpfs.h"
 #include "vfs.h"
-#include "ide.h"
-#include "chardev.h"
-#include "chardev_vfs.h"
 
 // Global definition of BootInfo.
 BootInfo boot_info;
@@ -90,11 +92,10 @@ void shutdown(void) {
   terminal_destroy(&main_terminal);
   // 1. Deshabilitar interrupciones
   __asm__ volatile("cli");
-  
+
   // 2. Detener el scheduler
   if (scheduler.scheduler_enabled) {
     scheduler_stop();
-    
   }
   // 3. Terminar todas las tareas (excepto idle)
   task_t *current = scheduler.task_list;
@@ -107,27 +108,26 @@ void shutdown(void) {
       current = next;
     } while (current != scheduler.task_list);
   }
-  
+
   task_cleanup_zombies();
-  
 
   // 4. Desmontar sistemas de archivos (DEBE ser antes de limpiar drivers para
   // poder flashear caches)
   vfs_list_mounts(unmount_callback, &unmount_data);
-  
+
   // 5. Limpiar sistema de drivers
   driver_system_cleanup();
-  
+
   // 6. Limpiar módulos
   module_loader_cleanup();
-  
+
   // 7. Deshabilitar PICs
   outb(PIC1_DATA, 0xFF);
   outb(PIC2_DATA, 0xFF);
-  
+
   // 8. Reportar estadísticas finales del heap
   dma_cleanup();
-  
+
   heap_info_t heap_info = heap_stats();
   // 9. Intentar apagado ACPI
   if (acpi_is_supported()) {
@@ -157,7 +157,7 @@ void initialize_acpi_pci(void) {
     driver_init(pci_drv, NULL);
     driver_start(pci_drv);
   }
-  
+
   // Inicializar ACPI
   acpi_init();
   if (acpi_is_supported()) {
@@ -166,7 +166,6 @@ void initialize_acpi_pci(void) {
   }
   // NUEVO: Inicializar APIC si está disponible
   if (apic_init()) {
-
   }
 }
 
@@ -207,12 +206,11 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
   g_pitch_pixels = pitch_pixels;
   g_screen_width = width;
   g_screen_height = height;
-  
+
   // ============================================
   // FASE DE BOOT CON MENSAJES FORMATEADOS
   // ============================================
 
-  
   // 1. Inicializar memoria
   if (boot_info.mmap) {
     pmm_init(boot_info.mmap);
@@ -220,40 +218,40 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
     while (1) {
     }
   }
-  
+
   mmu_init();
-  
+
   size_t heap_size = STATIC_HEAP_SIZE;
   heap_init(kernel_heap, heap_size);
   pmm_exclude_kernel_heap(kernel_heap, heap_size);
-  
+
   vmm_init();
-  
+
   // Inicializar framebuffer básico
   fb_init(g_framebuffer, width, height, pitch, bpp);
   // 2. Inicializar GDT, IDT
   gdt_init();
-  
+
   idt_init();
-  
+
   cpuid_init();
-  
+
   // Inicializar PIT a 100Hz temporalmente
   uint32_t divisor = 1193180 / 100;
   outb(0x43, 0x36);
   outb(0x40, (uint8_t)(divisor & 0xFF));
   outb(0x40, (uint8_t)((divisor >> 8) & 0xFF));
-  
+  terminal_init(&main_terminal);
   // 13. Inicializar drivers
   driver_system_init();
-  
+
   // 14. Cargar layout de teclado
   if (keyboard_load_layout("/dev/ES-KBD.KBD", "ES-QWERTY") == 0) {
     keyboard_set_layout("ES-QWERTY");
   }
 
   initialize_acpi_pci();
-  
+
   // NUEVO: Ahora sí inicializar el timer (usará APIC si está disponible)
   __asm__ volatile("cli");
   pit_init(100); // Esto usará APIC timer si está disponible
@@ -263,16 +261,32 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
 
   // 3. Inicializar teclado
   keyboard_init();
-  
+
   chardev_init();
 
   // 5. Inicializar serial
   serial_init();
-  
+
   driver_instance_t *serial_drv = serial_driver_create("com_ports");
   if (serial_drv) {
     driver_init(serial_drv, NULL);
     driver_start(serial_drv);
+  }
+
+  // Registrar tipo de driver E1000
+  if (e1000_driver_register_type() != 0) {
+    terminal_puts(&main_terminal,
+                  "WARNING: Failed to register E1000 driver type\r\n");
+  }
+
+  // Inicializar capa de red
+  network_init();
+
+  // Crear instancia del driver
+  driver_instance_t *net_drv = e1000_driver_create("eth0");
+  if (net_drv) {
+    driver_init(net_drv, NULL);
+    driver_start(net_drv);
   }
 
   // 6. Inicializar VFS
@@ -281,30 +295,30 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
   vfs_register_fs(&fat32_fs_type);
   vfs_register_fs(&sysfs_type);
   vfs_register_fs(&devfs_type);
-  
+
   // 8. Inicializar SATA/AHCI
   bool sata_available = false;
   if (sata_disk_init()) {
     sata_available = true;
   }
-  
+
   // 9. Inicializar ATAPI
   bool atapi_available = false;
   if (atapi_init()) {
     atapi_available = true;
   }
-  
+
   if (ide_driver_register_type() == 0) {
-      driver_instance_t *ide_drv = ide_driver_create("ide0");
-      if (ide_drv) {
-          driver_init(ide_drv, NULL);
-          driver_start(ide_drv);
-      }
+    driver_instance_t *ide_drv = ide_driver_create("ide0");
+    if (ide_drv) {
+      driver_init(ide_drv, NULL);
+      driver_start(ide_drv);
+    }
   }
 
   // 10. Montar sistemas de archivos
   bool home_mounted = false;
-  
+
   vfs_mount("/", "tmpfs", NULL);
   vfs_mount("/dev", "devfs", NULL);
   vfs_mount("/ramfs", "tmpfs", NULL);
@@ -313,7 +327,7 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
 
   // Intentar montar disco persistente
   bool disk_hardware_initialized = false;
-  
+
   // Probar SATA con soporte multi-disco
   if (sata_available) {
     disk_t *sata_disk = (disk_t *)kernel_malloc(sizeof(disk_t));
@@ -323,7 +337,7 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
       kernel_free(sata_disk);
     }
   }
-  
+
   if (!home_mounted && !disk_hardware_initialized) {
     disk_err_t ide_init = disk_init(&main_disk, 0);
     if (ide_init == DISK_ERR_NONE && main_disk.initialized) {
@@ -335,7 +349,7 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
       }
     }
   }
-  
+
   // Fallback a ATAPI
   if (!home_mounted && !disk_hardware_initialized && atapi_available &&
       atapi_get_device_count() > 0) {
@@ -351,50 +365,47 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
       }
     }
   }
-  
+
   // Fallback final a tmpfs
   if (!home_mounted) {
     vfs_mount("/home", "tmpfs", NULL);
   }
-  
+
   sata_disk_debug_port(4);
-  
+
   // 11. Inicializar logging
   log_init();
-  
+
   // Inicializar gestor de particiones
   partition_manager_init();
   disk_scan_all_buses();
   disk_list_detected_devices();
-  
+
   // Escanear disco principal al inicio
   partition_manager_scan_disk(&main_disk, 0);
   partition_manager_auto_mount_all();
-  
+
   syscall_init();
-  
-  
+
   // 15. Inicializar mouse
   // mouse_init(g_screen_width, g_screen_height);
-  // 
-  
+  //
+
   // 12. Inicializar multitarea
   serial_write_string(COM1_BASE, "MicroKernel OS\r\n");
   task_init();
-  
-  
+
   // ============================================
   // INICIAR TERMINAL NORMAL
   // ============================================
   // Limpiar pantalla
   set_colors(COLOR_WHITE, COLOR_BLACK);
-  
+
   terminal_puts(&main_terminal, "Starting scheduler...\n");
-  
+
   task_profiling_enable();
-  
+
   message_system_init();
-  
 
   // disk_io_daemon_init();
   task_t *mem_defrag =
@@ -545,7 +556,6 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
 static void main_loop_task(void *arg) {
   (void)arg;
   uint32_t last_update = 0;
-  terminal_init(&main_terminal);
   terminal_printf(&main_terminal, "[MAIN_LOOP] Task started\r\n");
   keyboard_set_handler(keyboard_terminal_handler);
   while (1) {

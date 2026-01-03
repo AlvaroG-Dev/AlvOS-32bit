@@ -20,7 +20,8 @@ static uint8_t registered_driver_count = 0;
 // ========================================================================
 
 bool usb_init(void) {
-  if (usb_initialized) return true;
+  if (usb_initialized)
+    return true;
 
   terminal_puts(&main_terminal, "Initializing USB subsystem...\r\n");
 

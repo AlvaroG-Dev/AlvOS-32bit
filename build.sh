@@ -92,6 +92,12 @@ compile "sysfs.c" "$GCC $GCC_OPTS -c sysfs.c -o build/sysfs.o"
 compile "devfs.c" "$GCC $GCC_OPTS -c devfs.c -o build/devfs.o"
 compile "chardev.c" "$GCC $GCC_OPTS -c chardev.c -o build/chardev.o"
 compile "chardev_vfs.c" "$GCC $GCC_OPTS -c chardev_vfs.c -o build/chardev_vfs.o"
+compile "e1000.c" "$GCC $GCC_OPTS -c e1000.c -o build/e1000.o"
+compile "network.c" "$GCC $GCC_OPTS -c network.c -o build/network.o"
+compile "ipv4.c" "$GCC $GCC_OPTS -c ipv4.c -o build/ipv4.o"
+compile "arp.c" "$GCC $GCC_OPTS -c arp.c -o build/arp.o"
+compile "network_stack.c" "$GCC $GCC_OPTS -c network_stack.c -o build/network_stack.o"
+compile "icmp.c" "$GCC $GCC_OPTS -c icmp.c -o build/icmp.o"
 
 # Enlazado con linker.ld
 echo -e "${GREEN}Enlazando kernel.bin...${RESET}"
@@ -109,7 +115,9 @@ ld -m elf_i386 -T linker.ld -o build/kernel.bin \
     build/partition.o build/mbr.o build/installer.o \
     build/mouse.o build/partition_manager.o build/apic.o build/mini_parser.o \
     build/text_editor.o build/syscalls.o build/syscall_asm.o build/exec.o \
-    build/sysfs.o build/devfs.o build/chardev.o build/chardev_vfs.o
+    build/sysfs.o build/devfs.o build/chardev.o build/chardev_vfs.o \
+    build/e1000.o build/network.o build/ipv4.o build/arp.o build/network_stack.o \
+    build/icmp.o
 
 if [ $? -ne 0 ]; then
     echo -e "${RED}Error en el enlazado con linker.ld${RESET}"

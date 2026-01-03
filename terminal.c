@@ -2,14 +2,17 @@
 #include "acpi.h"
 #include "ahci.h"
 #include "apic.h"
+#include "arp.h"
 #include "cpuid.h"
 #include "disk.h"
 #include "disk_io_daemon.h"
 #include "dma.h"
 #include "driver_system.h"
+#include "e1000.h"
 #include "exec.h"
 #include "fat32.h"
 #include "gdt.h"
+#include "icmp.h"
 #include "installer.h"
 #include "irq.h"
 #include "kernel.h"
@@ -18,6 +21,8 @@
 #include "mini_parser.h"
 #include "mmu.h"
 #include "module_loader.h"
+#include "network.h"
+#include "network_stack.h"
 #include "partition.h"
 #include "partition_manager.h"
 #include "pci.h"
@@ -2877,23 +2882,292 @@ void terminal_execute(Terminal *term, const char *cmd) {
   }
   if (strcmp(command, "apic") == 0) {
     apic_print_info();
-  }
-  if (strcmp(command, "lsdrv") == 0) {
-    driver_list_all();
-  } else if (strcmp(command, "edit") == 0) {
+  } else if (strcmp(command, "net-init") == 0) {
+    network_stack_init();
+    terminal_puts(term, "Network stack initialized\r\n");
+  } else if (strcmp(command, "ifconfig") == 0) {
+    network_print_config();
+  } else if (strcmp(command, "ip") == 0) {
+    if (argc == 1) {
+      // Mostrar configuración
+      network_print_config();
+    } else if (argc >= 4 && strcmp(argv[1], "set") == 0) {
+      // ip set <ip> <mask> <gateway>
+      ip_addr_t ip, mask, gw;
+
+      if (string_to_ip(argv[2], ip) && string_to_ip(argv[3], mask) &&
+          string_to_ip(argv[4], gw)) {
+
+        network_set_static_ip(ip, mask, gw);
+        terminal_puts(term, "IP configuration updated\r\n");
+      } else {
+        terminal_puts(term, "Invalid IP address format\r\n");
+        terminal_puts(term,
+                      "Example: 192.168.1.100 255.255.255.0 192.168.1.1\r\n");
+      }
+    } else if (argc == 2 && strcmp(argv[1], "dhcp") == 0) {
+      terminal_puts(term, "DHCP not implemented yet\r\n");
+      terminal_puts(term, "Use: ip set <ip> <mask> <gateway>\r\n");
+    } else {
+      terminal_puts(term, "Usage:\r\n");
+      terminal_puts(term, "  ip                    - Show configuration\r\n");
+      terminal_puts(term, "  ip set <ip> <mask> <gateway>\r\n");
+      terminal_puts(
+          term, "Example: ip set 192.168.1.100 255.255.255.0 192.168.1.1\r\n");
+    }
+  } else if (strcmp(command, "arp") == 0) {
+    if (argc == 1) {
+      arp_show_cache();
+    } else if (argc == 3 && strcmp(argv[1], "resolve") == 0) {
+      ip_addr_t target_ip;
+      if (string_to_ip(argv[2], target_ip)) {
+        uint8_t mac[6];
+        terminal_printf(term, "Resolving ARP for %s...\r\n", argv[2]);
+
+        if (arp_resolve(target_ip, mac, true)) {
+          terminal_printf(term, "Found: %02x:%02x:%02x:%02x:%02x:%02x\r\n",
+                          mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        } else {
+          terminal_puts(term, "ARP resolution failed\r\n");
+        }
+      } else {
+        terminal_puts(term, "Invalid IP address\r\n");
+      }
+    } else if (argc == 2 && strcmp(argv[1], "flush") == 0) {
+      // Necesitarías implementar arp_flush_cache()
+      terminal_puts(term, "ARP flush not implemented\r\n");
+    } else {
+      terminal_puts(term, "Usage:\r\n");
+      terminal_puts(term, "  arp                    - Show ARP cache\r\n");
+      terminal_puts(term, "  arp resolve <ip>       - Resolve IP to MAC\r\n");
+    }
+  } else if (strcmp(command, "ping") == 0) {
     if (argc < 2) {
-      terminal_printf(term, "Uso: edit <archivo>\r\n");
+      terminal_puts(term, "Usage: ping <ip_address>\r\n");
+      terminal_puts(term, "Example: ping 192.168.1.1\r\n");
+      terminal_puts(term, "Common targets:\r\n");
+      terminal_puts(term, "  192.168.1.1    - Router/Gateway\r\n");
+      terminal_puts(term, "  8.8.8.8        - Google DNS\r\n");
+      terminal_puts(term, "  1.1.1.1        - Cloudflare DNS\r\n");
       return;
     }
 
-    // Opción 2: Ejecutar en tarea separada (si prefieres multitarea)
-    task_t *editor_task = create_editor_task(argv[1]);
-    if (!editor_task) {
-      terminal_printf(term, "Error: No se pudo crear tarea del editor\r\n");
+    ip_addr_t target_ip;
+    if (!string_to_ip(argv[1], target_ip)) {
+      terminal_printf(term, "Invalid IP address: %s\r\n", argv[1]);
+      return;
     }
 
-    return;
-  } else if (strcmp(command, "echo") == 0) {
+    terminal_printf(term, "PING %s with 64 bytes of data:\r\n", argv[1]);
+
+    // Enviar 4 pings
+    for (int i = 1; i <= 4; i++) {
+      terminal_printf(term, "Sending ping #%d... ", i);
+
+      // Crear datos para el ping (timestamp)
+      uint8_t ping_data[32];
+      uint32_t *timestamp = (uint32_t *)ping_data;
+      *timestamp = ticks_since_boot;
+
+      // Enviar ping
+      if (icmp_send_request(target_ip, 1234, i, ping_data, sizeof(ping_data))) {
+        terminal_puts(term, "Sent\r\n");
+      } else {
+        terminal_puts(term, "Failed to send\r\n");
+      }
+
+      // Esperar 1 segundo (100 ticks)
+      for (int j = 0; j < 100; j++) {
+        // Procesar paquetes recibidos
+        network_stack_tick();
+
+        // Pequeña espera
+        for (volatile int k = 0; k < 10000; k++)
+          ;
+      }
+    }
+
+    terminal_puts(term, "\r\nPing statistics complete\r\n");
+  } else if (strcmp(command, "net-sniff") == 0) {
+    terminal_puts(term, "Starting network sniffer (Ctrl+C to stop)...\r\n");
+    terminal_puts(
+        term,
+        "Timestamp   Source MAC         Dest MAC           Type    Length\r\n");
+    terminal_puts(term, "------------------------------------------------------"
+                        "------------------\r\n");
+
+    uint32_t start_time = ticks_since_boot;
+    int packet_count = 0;
+
+    // Sniffer por 10 segundos
+    while ((ticks_since_boot - start_time) < 1000) { // 10 segundos
+      uint8_t buffer[1522];
+      uint32_t length = e1000_receive_packet(buffer, sizeof(buffer));
+
+      if (length > 0) {
+        packet_count++;
+
+        ethernet_header_t *eth = (ethernet_header_t *)buffer;
+        uint16_t ethertype = (eth->type << 8) | (eth->type >> 8);
+
+        // Mostrar información del paquete
+        uint32_t elapsed = (ticks_since_boot - start_time) * 10; // en ms
+
+        terminal_printf(term, "%6u ms  ", elapsed);
+        terminal_printf(term, "%02x:%02x:%02x:%02x:%02x:%02x  ", eth->src[0],
+                        eth->src[1], eth->src[2], eth->src[3], eth->src[4],
+                        eth->src[5]);
+        terminal_printf(term, "%02x:%02x:%02x:%02x:%02x:%02x  ", eth->dest[0],
+                        eth->dest[1], eth->dest[2], eth->dest[3], eth->dest[4],
+                        eth->dest[5]);
+
+        // Determinar tipo
+        const char *type_str;
+        switch (ethertype) {
+        case 0x0800:
+          type_str = "IPv4";
+          break;
+        case 0x0806:
+          type_str = "ARP";
+          break;
+        case 0x86DD:
+          type_str = "IPv6";
+          break;
+        default:
+          if (ethertype <= 1500) {
+            type_str = "IEEE802.3";
+          } else {
+            type_str = "Unknown";
+          }
+          break;
+        }
+
+        terminal_printf(term, "%-8s  %4u bytes\r\n", type_str, length);
+      }
+
+      // Pequeña pausa
+      for (volatile int i = 0; i < 1000; i++)
+        ;
+    }
+
+    terminal_printf(term, "\r\nCaptured %d packets in 10 seconds\r\n",
+                    packet_count);
+  } else if (strcmp(command, "net-stats") == 0) {
+    // Mostrar estadísticas detalladas
+    terminal_puts(term, "\r\n=== Network Statistics ===\r\n");
+
+    // Estadísticas del driver E1000
+    e1000_print_stats();
+
+    // Cache ARP
+    terminal_puts(term, "\r\n=== ARP Statistics ===\r\n");
+    arp_show_cache();
+
+    // Configuración IP
+    network_print_config();
+  } else if (strcmp(command, "net-diag") == 0) {
+    // Diagnóstico completo de red
+    terminal_puts(term, "\r\n=== Network Diagnostic ===\r\n");
+
+    // 1. Verificar driver
+    terminal_puts(term, "1. Network Driver: ");
+    if (e1000_device.initialized) {
+      terminal_puts(term, "OK (E1000 initialized)\r\n");
+    } else {
+      terminal_puts(term, "FAILED (Driver not initialized)\r\n");
+      terminal_puts(term, "   Run: net-init\r\n");
+    }
+
+    // 2. Verificar link
+    terminal_puts(term, "2. Link Status: ");
+    if (e1000_is_link_up()) {
+      terminal_puts(term, "UP\r\n");
+    } else {
+      terminal_puts(term, "DOWN (Check cable/QEMU network config)\r\n");
+    }
+
+    // 3. Verificar IP config
+    terminal_puts(term, "3. IP Configuration: ");
+    network_config_t config;
+    network_get_config(&config);
+
+    if (config.state >= NET_STATE_IP_CONFIGURED) {
+      char ip_str[16];
+      ip_to_string(config.ip_address, ip_str);
+      terminal_printf(term, "OK (%s)\r\n", ip_str);
+    } else {
+      terminal_puts(term, "NOT CONFIGURED\r\n");
+      terminal_puts(
+          term, "   Run: ip set 192.168.1.100 255.255.255.0 192.168.1.1\r\n");
+    }
+
+    // 4. Probar ARP
+    terminal_puts(term, "4. ARP Resolution: ");
+    ip_addr_t gateway_ip = {192, 168, 1, 1};
+    uint8_t gateway_mac[6];
+
+    if (arp_resolve(gateway_ip, gateway_mac, false)) {
+      terminal_printf(term,
+                      "OK (Gateway MAC: %02x:%02x:%02x:%02x:%02x:%02x)\r\n",
+                      gateway_mac[0], gateway_mac[1], gateway_mac[2],
+                      gateway_mac[3], gateway_mac[4], gateway_mac[5]);
+    } else {
+      terminal_puts(term, "Gateway not in cache\r\n");
+      terminal_puts(term, "   Run: ping 192.168.1.1 to populate ARP cache\r\n");
+    }
+
+    terminal_puts(term, "\r\nDiagnostic complete.\r\n");
+  } else if (strcmp(command, "net-loopback") == 0) {
+    // Prueba de loopback interno
+    terminal_puts(term, "Starting internal loopback test...\r\n");
+
+    uint8_t test_data[] = "Loopback test packet";
+    ip_addr_t loopback_ip = {127, 0, 0, 1};
+
+    for (int i = 0; i < 5; i++) {
+      terminal_printf(term, "Sending packet %d... ", i + 1);
+
+      if (icmp_send_request(loopback_ip, 9999, i, test_data,
+                            sizeof(test_data))) {
+        terminal_puts(term, "Sent\r\n");
+      } else {
+        terminal_puts(term, "Failed\r\n");
+      }
+
+      // Esperar y procesar
+      for (int j = 0; j < 50; j++) {
+        network_stack_tick();
+        for (volatile int k = 0; k < 10000; k++)
+          ;
+      }
+    }
+
+    terminal_puts(term, "Loopback test complete\r\n");
+  } else if (strcmp(command, "net-help") == 0) {
+    terminal_puts(term, "\r\n=== Network Commands ===\r\n");
+    terminal_puts(term, "net-init        - Initialize network stack\r\n");
+    terminal_puts(term, "ifconfig        - Show network configuration\r\n");
+    terminal_puts(term, "ip              - Configure IP address\r\n");
+    terminal_puts(term, "arp             - Show/resolve ARP cache\r\n");
+    terminal_puts(term, "ping <ip>       - Ping an IP address\r\n");
+    terminal_puts(term, "net-sniff       - Sniff network traffic (10 sec)\r\n");
+    terminal_puts(term, "net-stats       - Show network statistics\r\n");
+    terminal_puts(term, "net-diag        - Run network diagnostic\r\n");
+    terminal_puts(term, "net-loopback    - Internal loopback test\r\n");
+    terminal_puts(term, "net-test        - Send raw Ethernet test packet\r\n");
+    terminal_puts(term, "net-status      - Show E1000 driver status\r\n");
+    terminal_puts(term, "net-help        - This help message\r\n");
+    terminal_puts(term, "\r\n=== Quick Start ===\r\n");
+    terminal_puts(term,
+                  "1. net-init                    # Initialize stack\r\n");
+    terminal_puts(term,
+                  "2. ip set 192.168.1.100 255.255.255.0 192.168.1.1\r\n");
+    terminal_puts(term,
+                  "3. ping 192.168.1.1            # Test connectivity\r\n");
+    terminal_puts(term, "4. net-stats                   # View statistics\r\n");
+  }
+
+  else if (strcmp(command, "echo") == 0) {
     terminal_puts(term, args);
     terminal_puts(term, "\r\n");
   } else if (strcmp(command, "setfg") == 0) {
