@@ -2425,8 +2425,9 @@ void test_user_mode_simple(void) {
   terminal_printf(&main_terminal, "Creating user task at 0x%08x...\r\n",
                   user_code_addr);
 
-  task_t *user_task = task_create_user("simple_user", (void *)user_code_addr,
-                                       NULL, TASK_PRIORITY_NORMAL);
+  task_t *user_task =
+      task_create_user("simple_user", (void *)user_code_addr, NULL,
+                       sizeof(simple_user_code), TASK_PRIORITY_NORMAL);
 
   if (user_task) {
     terminal_printf(&main_terminal,
@@ -2732,11 +2733,15 @@ void terminal_execute(Terminal *term, const char *cmd) {
       }
       strncat(args, argv[i], sizeof(args) - strlen(args) - 1);
     }
-  } else if (strcmp(command, "exec") == 0) {
-    terminal_printf(term, "exec: Loading program: %s\r\n", "/home/hello.bin");
+  }
+
+  // --- DISPATCHER DE COMANDOS CORREGIDO ---
+  if (strcmp(command, "exec") == 0) {
+    const char *program_path = (argc > 1) ? argv[1] : "/home/hello.bin";
+    terminal_printf(term, "exec: Loading program: %s\r\n", program_path);
 
     // Cargar y ejecutar
-    task_t *task = exec_load_and_run("/home/hello.bin");
+    task_t *task = exec_load_and_run(program_path);
 
     if (task) {
       terminal_printf(term, "exec: Program started (PID %u)\r\n",

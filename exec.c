@@ -525,8 +525,8 @@ task_t *exec_load_and_run(const char *path) {
                   load_addr);
 
   // Crear tarea usando task_create_user
-  task_t *task =
-      task_create_user(name, (void *)load_addr, NULL, TASK_PRIORITY_NORMAL);
+  task_t *task = task_create_user(name, (void *)load_addr, NULL, file_size,
+                                  TASK_PRIORITY_NORMAL);
 
   if (!task) {
     terminal_printf(&main_terminal, ANSI_COLOR_RED

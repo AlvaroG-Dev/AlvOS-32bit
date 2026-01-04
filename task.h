@@ -149,7 +149,7 @@ void cleanup_task(void *arg);
 
 // USER MODE
 task_t *task_create_user(const char *name, void *user_code_addr, void *arg,
-                         task_priority_t priority);
+                         uint32_t code_size, task_priority_t priority);
 void task_setup_user_mode(task_t *task, void (*entry_point)(void *), void *arg,
                           void *user_stack);
 // Macros útiles

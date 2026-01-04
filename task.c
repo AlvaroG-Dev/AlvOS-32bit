@@ -680,7 +680,7 @@ static void user_mode_entry_wrapper(void *arg) {
 // ============================================================================
 
 task_t *task_create_user(const char *name, void *user_code_addr, void *arg,
-                         task_priority_t priority) {
+                         uint32_t code_size, task_priority_t priority) {
   terminal_printf(&main_terminal,
                   "[USER_CREATE] Creating user task: %s at 0x%08x\r\n", name,
                   (uint32_t)user_code_addr);
@@ -912,7 +912,7 @@ task_t *task_create_user(const char *name, void *user_code_addr, void *arg,
   task->user_stack_size = aligned_stack_size;
   task->user_entry_point = user_code_addr;
   task->user_code_base = user_code_addr;
-  task->user_code_size = 8192;
+  task->user_code_size = code_size;
   task->flags |= TASK_FLAG_USER_MODE;
 
   // --- INICIALIZAR TABLA DE DESCRIPTORES ---
