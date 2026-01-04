@@ -1,26 +1,31 @@
 // syscalls.c - VERSIÓN COMPLETA Y CORREGIDA
 #include "syscalls.h"
+#include "dns.h"
 #include "driver_system.h"
 #include "idt.h"
 #include "irq.h"
 #include "kernel.h"
 #include "keyboard.h"
 #include "mmu.h"
+#include "network.h"
 #include "string.h"
 #include "task.h"
+#include "tcp.h"
 #include "terminal.h"
 #include "vfs.h"
 
 extern void syscall_entry(void);
 
 // Declarar variables externas de vfs.c
-extern vfs_file_t *fd_table[VFS_MAX_FDS];
 extern int mount_count;
 static char cwd_buffer[VFS_PATH_MAX] = "/";
 
 // Función auxiliar para verificar si un FD es válido y está abierto
 static bool is_valid_fd(int fd) {
-  return (fd >= 0 && fd < VFS_MAX_FDS && fd_table[fd] != NULL);
+  task_t *curr = scheduler.current_task;
+  if (!curr || fd < 0 || fd >= VFS_MAX_FDS)
+    return false;
+  return (curr->fd_table[fd] != NULL);
 }
 
 // Funciones auxiliares mejoradas para seguridad
@@ -514,7 +519,7 @@ void syscall_handler(struct regs *r) {
       break;
     }
 
-    vfs_file_t *f = fd_table[fd];
+    vfs_file_t *f = current->fd_table[fd];
 
     switch (whence) {
     case 0: // SEEK_SET
@@ -545,7 +550,7 @@ void syscall_handler(struct regs *r) {
       break;
     }
 
-    vfs_file_t *f = fd_table[fd];
+    vfs_file_t *f = current->fd_table[fd];
     result = f->offset;
     break;
   }
@@ -611,7 +616,7 @@ void syscall_handler(struct regs *r) {
 
     strcpy(info.sysname, "MicroKernelOS");
     strcpy(info.nodename, "localhost");
-    strcpy(info.release, "0.1.0");
+    strcpy(info.release, "0.2.0");
     strcpy(info.version, "Built " __DATE__ " " __TIME__);
     strcpy(info.machine, "i386");
     strcpy(info.domainname, "local");
@@ -622,8 +627,91 @@ void syscall_handler(struct regs *r) {
   }
 
   // ============================================
-  // SYSCALLS STUB - PARA IMPLEMENTACIÓN FUTURA
+  // SYSCALLS DE RED 🌐
   // ============================================
+  case SYSCALL_DNS_RESOLVE: {
+    uint32_t host_ptr = r->ebx;
+    uint32_t ip_ptr = r->ecx;
+    char kernel_host[256];
+    if (copy_string_from_user(kernel_host, host_ptr, 256) < 0) {
+      result = (uint32_t)-EFAULT;
+      break;
+    }
+    ip_addr_t server_ip;
+    if (dns_resolve(kernel_host, server_ip)) {
+      if (copy_to_user(ip_ptr, server_ip, 4) < 0)
+        result = (uint32_t)-EFAULT;
+      else
+        result = 0;
+    } else
+      result = (uint32_t)-ENOENT;
+    break;
+  }
+
+  case SYSCALL_CONNECT: {
+    uint32_t ip_ptr = r->ebx;
+    uint16_t port = (uint16_t)r->ecx;
+    ip_addr_t server_ip;
+    if (copy_from_user(server_ip, ip_ptr, 4) < 0) {
+      result = (uint32_t)-EFAULT;
+      break;
+    }
+    int socket_id = tcp_connect(server_ip, port);
+    result = (socket_id >= 0) ? (uint32_t)socket_id : (uint32_t)-ECONNREFUSED;
+    break;
+  }
+
+  case SYSCALL_SEND: {
+    int socket_id = (int)r->ebx;
+    uint32_t buf_ptr = r->ecx;
+    uint32_t len = r->edx;
+    if (!validate_user_pointer(buf_ptr, len)) {
+      result = (uint32_t)-EFAULT;
+      break;
+    }
+    uint8_t *kernel_buf = kernel_malloc(len);
+    if (!kernel_buf) {
+      result = (uint32_t)-ENOMEM;
+      break;
+    }
+    if (copy_from_user(kernel_buf, buf_ptr, len) < 0) {
+      kernel_free(kernel_buf);
+      result = (uint32_t)-EFAULT;
+      break;
+    }
+    int sent = tcp_send(socket_id, kernel_buf, len);
+    kernel_free(kernel_buf);
+    result = (sent >= 0) ? (uint32_t)sent : (uint32_t)-EIO;
+    break;
+  }
+
+  case SYSCALL_RECV: {
+    int socket_id = (int)r->ebx;
+    uint32_t buf_ptr = r->ecx;
+    uint32_t len = r->edx;
+    if (!validate_user_pointer(buf_ptr, len)) {
+      result = (uint32_t)-EFAULT;
+      break;
+    }
+    uint8_t *kernel_buf = kernel_malloc(len);
+    if (!kernel_buf) {
+      result = (uint32_t)-ENOMEM;
+      break;
+    }
+    int received = tcp_receive(socket_id, kernel_buf, len);
+    if (received > 0) {
+      if (copy_to_user(buf_ptr, kernel_buf, received) < 0)
+        result = (uint32_t)-EFAULT;
+      else
+        result = (uint32_t)received;
+    } else if (received == -2)
+      result = 0; // EOF
+    else
+      result = (uint32_t)-EAGAIN;
+    kernel_free(kernel_buf);
+    break;
+  }
+
   case SYSCALL_STAT:
   case SYSCALL_FORK:
   case SYSCALL_EXECVE:

@@ -290,6 +290,7 @@ bool arp_resolve(ip_addr_t ip, uint8_t *mac, bool send_request) {
       uint32_t loop_count = 0;
       const uint32_t max_loops = 2000000;
 
+      __asm__ __volatile__("sti");
       while (loop_count < max_loops) {
         // Verificar timeout por tiempo
         if (ticks_since_boot > start_time &&

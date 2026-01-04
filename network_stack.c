@@ -1,13 +1,19 @@
+
 #include "network_stack.h"
 #include "arp.h"
+#include "dns.h"
 #include "e1000.h"
 #include "icmp.h"
 #include "ipv4.h"
 #include "irq.h"
 #include "kernel.h"
 #include "network.h"
+#include "network_daemon.h"
 #include "string.h"
+#include "task.h"
+#include "tcp.h"
 #include "terminal.h"
+#include "udp.h"
 
 static network_config_t net_config;
 
@@ -26,6 +32,9 @@ void network_stack_init(void) {
 
   // Inicializar subsistemas
   arp_init();
+  udp_init();
+  tcp_init(); // Added TCP init
+  dns_init();
 
   // Configurar IP
   ip_set_address(net_config.ip_address, net_config.netmask, net_config.gateway);
@@ -34,6 +43,21 @@ void network_stack_init(void) {
 
   terminal_puts(&main_terminal, "[NET] Network stack initialized\r\n");
   network_print_config();
+
+  // Iniciar daemon de red para procesamiento asíncrono de paquetes
+  if (scheduler.scheduler_enabled) {
+    if (network_daemon_start()) {
+      terminal_puts(&main_terminal,
+                    "[NET] Network daemon started successfully\r\n");
+    } else {
+      terminal_puts(&main_terminal,
+                    "[NET] Warning: Failed to start network daemon\r\n");
+    }
+  } else {
+    terminal_puts(
+        &main_terminal,
+        "[NET] Scheduler not enabled, network daemon will not start\r\n");
+  }
 }
 
 // Procesar paquetes recibidos
@@ -71,11 +95,11 @@ void network_stack_tick(void) {
             break;
 
           case IP_PROTOCOL_TCP:
-            // TCP vendrá después
+            tcp_input(ip_payload, ip_payload_len, src_ip);
             break;
 
           case IP_PROTOCOL_UDP:
-            // UDP vendrá después
+            udp_input(ip_payload, ip_payload_len, src_ip);
             break;
 
           default:
@@ -93,7 +117,7 @@ void network_stack_tick(void) {
       }
     }
   }
-
+  tcp_maintenance();
   // Limpiar cache ARP periódicamente (cada 60 segundos)
   if (ticks_since_boot - last_arp_cleanup >
       6000) { // 6000 ticks = 60 segundos a 100Hz

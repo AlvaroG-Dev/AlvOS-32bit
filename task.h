@@ -3,6 +3,7 @@
 
 #include "isr.h"
 #include "memory.h"
+#include "vfs.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -26,8 +27,8 @@ typedef enum {
 } task_priority_t;
 
 // Tamaño del stack para cada tarea
-#define TASK_STACK_SIZE (16 * 1024)
-#define USER_STACK_SIZE (8 * 1024) // Stack más pequeño para usuario
+#define TASK_STACK_SIZE (32 * 1024)
+#define USER_STACK_SIZE (16 * 1024) // Stack más grande para usuario
 #define MAX_TASKS 32
 #define TASK_NAME_MAX 32
 
@@ -98,6 +99,8 @@ typedef struct task {
   // Valor de retorno
   int exit_code; // Código de salida
 
+  // Tabla de descriptores de archivos por proceso
+  struct vfs_file *fd_table[VFS_MAX_FDS];
 } task_t;
 
 // Planificador de tareas

@@ -7,11 +7,13 @@
 #include "disk.h"
 #include "disk_io_daemon.h"
 #include "dma.h"
+#include "dns.h"
 #include "driver_system.h"
 #include "e1000.h"
 #include "exec.h"
 #include "fat32.h"
 #include "gdt.h"
+#include "http.h"
 #include "icmp.h"
 #include "installer.h"
 #include "irq.h"
@@ -36,7 +38,6 @@
 #include "text_editor.h"
 #include "vfs.h"
 
-extern vfs_file_t *fd_table[VFS_MAX_FDS];
 extern vfs_superblock_t *mount_table[VFS_MAX_MOUNTS];
 extern char mount_points[VFS_MAX_MOUNTS][VFS_PATH_MAX];
 extern ahci_controller_t ahci_controller;
@@ -2732,10 +2733,10 @@ void terminal_execute(Terminal *term, const char *cmd) {
       strncat(args, argv[i], sizeof(args) - strlen(args) - 1);
     }
   } else if (strcmp(command, "exec") == 0) {
-    terminal_printf(term, "exec: Loading program: %s\r\n", "/home/tree.bin");
+    terminal_printf(term, "exec: Loading program: %s\r\n", "/home/hello.bin");
 
     // Cargar y ejecutar
-    task_t *task = exec_load_and_run("/home/tree.bin");
+    task_t *task = exec_load_and_run("/home/hello.bin");
 
     if (task) {
       terminal_printf(term, "exec: Program started (PID %u)\r\n",
@@ -2988,70 +2989,6 @@ void terminal_execute(Terminal *term, const char *cmd) {
     }
 
     terminal_puts(term, "\r\nPing statistics complete\r\n");
-  } else if (strcmp(command, "net-sniff") == 0) {
-    terminal_puts(term, "Starting network sniffer (Ctrl+C to stop)...\r\n");
-    terminal_puts(
-        term,
-        "Timestamp   Source MAC         Dest MAC           Type    Length\r\n");
-    terminal_puts(term, "------------------------------------------------------"
-                        "------------------\r\n");
-
-    uint32_t start_time = ticks_since_boot;
-    int packet_count = 0;
-
-    // Sniffer por 10 segundos
-    while ((ticks_since_boot - start_time) < 1000) { // 10 segundos
-      uint8_t buffer[1522];
-      uint32_t length = e1000_receive_packet(buffer, sizeof(buffer));
-
-      if (length > 0) {
-        packet_count++;
-
-        ethernet_header_t *eth = (ethernet_header_t *)buffer;
-        uint16_t ethertype = (eth->type << 8) | (eth->type >> 8);
-
-        // Mostrar información del paquete
-        uint32_t elapsed = (ticks_since_boot - start_time) * 10; // en ms
-
-        terminal_printf(term, "%6u ms  ", elapsed);
-        terminal_printf(term, "%02x:%02x:%02x:%02x:%02x:%02x  ", eth->src[0],
-                        eth->src[1], eth->src[2], eth->src[3], eth->src[4],
-                        eth->src[5]);
-        terminal_printf(term, "%02x:%02x:%02x:%02x:%02x:%02x  ", eth->dest[0],
-                        eth->dest[1], eth->dest[2], eth->dest[3], eth->dest[4],
-                        eth->dest[5]);
-
-        // Determinar tipo
-        const char *type_str;
-        switch (ethertype) {
-        case 0x0800:
-          type_str = "IPv4";
-          break;
-        case 0x0806:
-          type_str = "ARP";
-          break;
-        case 0x86DD:
-          type_str = "IPv6";
-          break;
-        default:
-          if (ethertype <= 1500) {
-            type_str = "IEEE802.3";
-          } else {
-            type_str = "Unknown";
-          }
-          break;
-        }
-
-        terminal_printf(term, "%-8s  %4u bytes\r\n", type_str, length);
-      }
-
-      // Pequeña pausa
-      for (volatile int i = 0; i < 1000; i++)
-        ;
-    }
-
-    terminal_printf(term, "\r\nCaptured %d packets in 10 seconds\r\n",
-                    packet_count);
   } else if (strcmp(command, "net-stats") == 0) {
     // Mostrar estadísticas detalladas
     terminal_puts(term, "\r\n=== Network Statistics ===\r\n");
@@ -3143,6 +3080,36 @@ void terminal_execute(Terminal *term, const char *cmd) {
     }
 
     terminal_puts(term, "Loopback test complete\r\n");
+  } else if (strcmp(command, "lookup") == 0) {
+    if (args[0] == '\0') {
+      terminal_puts(term, "Usage: lookup <hostname>\r\n");
+    } else {
+      ip_addr_t ip;
+      if (dns_resolve(args, ip)) {
+        terminal_printf(term, "%s has address %d.%d.%d.%d\r\n", args, ip[0],
+                        ip[1], ip[2], ip[3]);
+      } else {
+        terminal_printf(term, "Could not resolve %s\r\n", args);
+      }
+    }
+  } else if (strcmp(command, "wget") == 0) {
+    // args tiene toda la línea de argumentos. Necesitamos separarlos.
+    // Uso: wget http://url /path/local
+    char url[256];
+    char path[256];
+
+    // Parseo manual simple
+    char *space = strchr(args, ' ');
+    if (!space) {
+      terminal_puts(term, "Usage: wget <url> <dest_path>\r\n");
+    } else {
+      int url_len = space - args;
+      strncpy(url, args, url_len);
+      url[url_len] = 0;
+      strcpy(path, space + 1);
+
+      http_download(url, path);
+    }
   } else if (strcmp(command, "net-help") == 0) {
     terminal_puts(term, "\r\n=== Network Commands ===\r\n");
     terminal_puts(term, "net-init        - Initialize network stack\r\n");

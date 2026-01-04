@@ -171,6 +171,7 @@ bool e1000_is_link_up(void);
 void e1000_handle_interrupt(void);
 void e1000_print_stats(void);
 void e1000_check_status(void);
+void e1000_reset_tx_ring(void);
 
 extern e1000_device_t e1000_device;
 

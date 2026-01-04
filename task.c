@@ -316,14 +316,14 @@ void task_sleep(uint32_t ms) {
     return;
   }
 
-  uint32_t wake_tick =
-      ticks_since_boot + (ms / 10); // Convertir ms a ticks (100Hz)
+  // ✅ FIX: Asegurar al menos 1 tick de sueño y redondear hacia arriba
+  uint32_t ticks_to_sleep = (ms + 9) / 10;
+  if (ticks_to_sleep == 0)
+    ticks_to_sleep = 1;
+
+  uint32_t wake_tick = ticks_since_boot + ticks_to_sleep;
   scheduler.current_task->sleep_until = wake_tick;
   scheduler.current_task->state = TASK_SLEEPING;
-
-  // terminal_printf(&main_terminal, "[SLEEP] Task %s sleeping for %u ms (until
-  // tick %u)\r\n",
-  //                scheduler.current_task->name, ms, wake_tick);
 
   // Ceder el CPU inmediatamente
   task_yield();
@@ -914,6 +914,15 @@ task_t *task_create_user(const char *name, void *user_code_addr, void *arg,
   task->user_code_base = user_code_addr;
   task->user_code_size = 8192;
   task->flags |= TASK_FLAG_USER_MODE;
+
+  // --- INICIALIZAR TABLA DE DESCRIPTORES ---
+  for (int i = 0; i < VFS_MAX_FDS; i++) {
+    task->fd_table[i] = NULL;
+  }
+  // Reservar 0, 1, 2 para que vfs_open empiece en el 3
+  task->fd_table[0] = (struct vfs_file *)0x1; // Dummy stdin
+  task->fd_table[1] = (struct vfs_file *)0x1; // Dummy stdout
+  task->fd_table[2] = (struct vfs_file *)0x1; // Dummy stderr
 
   // 10. Verificar que el contexto de kernel esté correcto
   if (task->context.eip != (uint32_t)user_mode_entry_wrapper) {

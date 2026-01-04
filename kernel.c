@@ -50,7 +50,6 @@ Terminal main_terminal;
 disk_t main_disk;
 extern vfs_fs_type_t fat32_fs_type;
 extern vfs_fs_type_t sysfs_type;
-extern vfs_file_t *fd_table[VFS_MAX_FDS];
 extern vfs_superblock_t *mount_table[VFS_MAX_MOUNTS];
 extern char mount_points[VFS_MAX_MOUNTS][VFS_PATH_MAX];
 extern int mount_count;

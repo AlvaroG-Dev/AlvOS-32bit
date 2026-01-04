@@ -1,229 +1,145 @@
-// minimal_ioctl_test.c - ~1500 bytes, usa "com_ports"
-#include <stdint.h>
+/* hello.c - Versión Limpia y PIC para AlvOS
+   - Optimizada para la nueva gestión de FDs del kernel.
+   - 100% Position Independent Code.
+   - Sin "escudo" de descriptores (el kernel ya lo hace).
+*/
 
-void _start(void) {
-  char buffer[128];
-  char *p;
-  int result;
+__asm__(".code32\n"
+        ".text\n"
+        ".global _start\n"
+        "_start:\n"
+        "    # 1. Obtener base real para PIC\n"
+        "    call .Lget_pc\n"
+        ".Lget_pc:\n"
+        "    pop %ebp\n"
+        "    sub $.Lget_pc, %ebp\n"
 
-  // 1. Mostrar mensaje inicial
-  p = buffer;
-  *p++ = 'I';
-  *p++ = 'O';
-  *p++ = 'C';
-  *p++ = 'T';
-  *p++ = 'L';
-  *p++ = ' ';
-  *p++ = 'T';
-  *p++ = 'e';
-  *p++ = 's';
-  *p++ = 't';
-  *p++ = '\n';
-  *p++ = '=';
-  *p++ = '=';
-  *p++ = '=';
-  *p++ = '\n';
+        "    pushal\n"
+        "    sub $1100, %esp\n" // Buffer de red en [esp]
 
-  __asm__("int $0x80" : : "a"(1), "b"(1), "c"(buffer), "d"(p - buffer));
+        "    # 2. DNS -> google.com\n"
+        "    lea msg_dns(%ebp), %ecx\n"
+        "    mov $msg_dns_len, %edx\n"
+        "    call .Lprint_term\n"
+        "    \n"
+        "    lea host_str(%ebp), %ebx\n"
+        "    lea 1024(%esp), %ecx\n" // Espacio para la IP
+        "    mov $0x45, %eax\n"
+        "    int $0x80\n"
+        "    test %eax, %eax\n"
+        "    jnz .Ldns_err\n"
 
-  // 2. Probar Serial Driver (com_ports)
-  p = buffer;
-  *p++ = '1';
-  *p++ = '.';
-  *p++ = ' ';
-  *p++ = 'S';
-  *p++ = 'e';
-  *p++ = 'r';
-  *p++ = 'i';
-  *p++ = 'a';
-  *p++ = 'l';
-  *p++ = ' ';
-  *p++ = '(';
-  *p++ = 'c';
-  *p++ = 'o';
-  *p++ = 'm';
-  *p++ = '_';
-  *p++ = 'p';
-  *p++ = 'o';
-  *p++ = 'r';
-  *p++ = 't';
-  *p++ = 's';
-  *p++ = ')';
-  *p++ = ':';
-  *p++ = ' ';
+        "    # 3. CONNECT -> Puerto 80\n"
+        "    lea msg_conn(%ebp), %ecx\n"
+        "    mov $msg_conn_len, %edx\n"
+        "    call .Lprint_term\n"
+        "    \n"
+        "    lea 1024(%esp), %ebx\n"
+        "    mov $80, %ecx\n"
+        "    mov $0x42, %eax\n"
+        "    int $0x80\n"
+        "    cmp $0, %eax\n"
+        "    jl .Lconn_err\n"
+        "    mov %eax, %esi\n" // ESI = socket descriptor (será >= 3)
 
-  __asm__("int $0x80" : : "a"(1), "b"(1), "c"(buffer), "d"(p - buffer));
+        "    # 4. OPEN -> /home/goog.txt (WRONLY=2 | CREAT=8 = 10)\n"
+        "    lea file_str(%ebp), %ebx\n"
+        "    mov $10, %ecx\n"
+        "    mov $0x07, %eax\n"
+        "    int $0x80\n"
+        "    cmp $0, %eax\n"
+        "    jl .Lfile_err\n"
+        "    mov %eax, %edi\n" // EDI = archivo (será >= 4)
 
-  // Preparar IOCTL para com_ports
-  char ioctl_buf[296] = {0}; // 32 + 4 + 4 + 256
+        "    # 5. SEND -> Request HTTP\n"
+        "    mov %esi, %ebx\n" // sock
+        "    lea req_str(%ebp), %ecx\n"
+        "    mov $(req_str_end - req_str), %edx\n"
+        "    mov $0x43, %eax\n"
+        "    int $0x80\n"
 
-  // Nombre: "com_ports" (9 caracteres)
-  ioctl_buf[0] = 'c';
-  ioctl_buf[1] = 'o';
-  ioctl_buf[2] = 'm';
-  ioctl_buf[3] = '_';
-  ioctl_buf[4] = 'p';
-  ioctl_buf[5] = 'o';
-  ioctl_buf[6] = 'r';
-  ioctl_buf[7] = 't';
-  ioctl_buf[8] = 's';
+        "    # 6. RECV/WRITE LOOP\n"
+        "    lea msg_recv(%ebp), %ecx\n"
+        "    mov $msg_recv_len, %edx\n"
+        "    call .Lprint_term\n"
 
-  // Comando: 0x1001 (escribir a COM1)
-  uint32_t *cmd_ptr = (uint32_t *)(ioctl_buf + 32);
-  *cmd_ptr = 0x1001;
+        ".Lloop:\n"
+        "    mov %esi, %ebx\n" // socket
+        "    mov %esp, %ecx\n" // buffer
+        "    mov $1024, %edx\n"
+        "    mov $0x44, %eax\n"
+        "    int $0x80\n"
+        "    cmp $0, %eax\n"
+        "    jle .Ldone\n"
 
-  // Mensaje: "Hi!"
-  char msg[] = "Hi from user!\r\n";
-  int msg_len = 0;
-  while (msg[msg_len])
-    msg_len++;
+        "    # Escribir en DISCO (EDI)\n"
+        "    mov %eax, %edx\n" // n_bytes
+        "    mov %edi, %ebx\n" // file_fd
+        "    mov %esp, %ecx\n" // buffer
+        "    mov $0x01, %eax\n"
+        "    int $0x80\n"
 
-  uint32_t *size_ptr = (uint32_t *)(ioctl_buf + 36);
-  *size_ptr = msg_len;
+        "    # Feedback en PANTALLA\n"
+        "    mov $1, %ebx\n" // stdout
+        "    lea dot_str(%ebp), %ecx\n"
+        "    mov $1, %edx\n"
+        "    mov $0x01, %eax\n"
+        "    int $0x80\n"
+        "    jmp .Lloop\n"
 
-  // Copiar mensaje
-  char *arg_ptr = ioctl_buf + 40;
-  for (int i = 0; i < msg_len; i++) {
-    arg_ptr[i] = msg[i];
-  }
+        ".Ldone:\n"
+        "    # 7. Cerrar y Salir\n"
+        "    mov %edi, %ebx\n"
+        "    mov $0x08, %eax\n"
+        "    int $0x80\n"
+        "    mov %esi, %ebx\n"
+        "    mov $0x08, %eax\n"
+        "    int $0x80\n"
+        "    lea msg_ok(%ebp), %ecx\n"
+        "    mov $msg_ok_len, %edx\n"
+        "    call .Lprint_term\n"
+        "    jmp .Lexit\n"
 
-  // Llamar IOCTL
-  __asm__("int $0x80" : "=a"(result) : "a"(0x19), "b"((uint32_t)ioctl_buf));
+        ".Ldns_err:  lea err_dns(%ebp), %ecx; mov $err_dns_len, %edx; call "
+        ".Lprint_term; jmp .Lexit\n"
+        ".Lconn_err: lea err_conn(%ebp), %ecx; mov $err_conn_len, %edx; call "
+        ".Lprint_term; jmp .Lexit\n"
+        ".Lfile_err: lea err_file(%ebp), %ecx; mov $err_file_len, %edx; call "
+        ".Lprint_term; jmp .Lexit\n"
 
-  // Mostrar resultado
-  p = buffer;
-  if (result == 0) {
-    *p++ = 'O';
-    *p++ = 'K';
-    *p++ = '\n';
-  } else {
-    *p++ = 'E';
-    *p++ = 'r';
-    *p++ = 'r';
-    *p++ = ':';
+        ".Lexit:\n"
+        "    add $1100, %esp\n"
+        "    popal\n"
+        "    xor %ebx, %ebx\n"
+        "    mov $0x00, %eax\n"
+        "    int $0x80\n"
 
-    // Convertir error a decimal simple
-    int err = -result;
-    if (err > 99)
-      err = 99;
+        "    # Auxiliar: Print a terminal (fd 1)\n"
+        ".Lprint_term:\n"
+        "    pushal\n"
+        "    mov $1, %ebx\n"
+        "    mov $0x01, %eax\n"
+        "    int $0x80\n"
+        "    popal\n"
+        "    ret\n"
 
-    if (err >= 10) {
-      *p++ = '0' + (err / 10);
-      *p++ = '0' + (err % 10);
-    } else if (err > 0) {
-      *p++ = '0' + err;
-    } else {
-      *p++ = '0';
-    }
-    *p++ = '\n';
-  }
-
-  __asm__("int $0x80" : : "a"(1), "b"(1), "c"(buffer), "d"(p - buffer));
-
-  // 3. Probar Keyboard Driver
-  p = buffer;
-  *p++ = '2';
-  *p++ = '.';
-  *p++ = ' ';
-  *p++ = 'K';
-  *p++ = 'e';
-  *p++ = 'y';
-  *p++ = 'b';
-  *p++ = 'o';
-  *p++ = 'a';
-  *p++ = 'r';
-  *p++ = 'd';
-  *p++ = ':';
-  *p++ = ' ';
-
-  __asm__("int $0x80" : : "a"(1), "b"(1), "c"(buffer), "d"(p - buffer));
-
-  // Preparar IOCTL para keyboard
-  char ioctl_buf2[296] = {0};
-
-  // Nombre: "system-keyboard"
-  ioctl_buf2[0] = 's';
-  ioctl_buf2[1] = 'y';
-  ioctl_buf2[2] = 's';
-  ioctl_buf2[3] = 't';
-  ioctl_buf2[4] = 'e';
-  ioctl_buf2[5] = 'm';
-  ioctl_buf2[6] = '-';
-  ioctl_buf2[7] = 'k';
-  ioctl_buf2[8] = 'e';
-  ioctl_buf2[9] = 'y';
-  ioctl_buf2[10] = 'b';
-  ioctl_buf2[11] = 'o';
-  ioctl_buf2[12] = 'a';
-  ioctl_buf2[13] = 'r';
-  ioctl_buf2[14] = 'd';
-
-  // Comando: 0x1001 (KBD_IOCTL_SET_LAYOUT)
-  cmd_ptr = (uint32_t *)(ioctl_buf2 + 32);
-  *cmd_ptr = 0x1001;
-
-  // Layout: "US-QWERTY"
-  char layout[] = "US-QWERTY";
-  int layout_len = 0;
-  while (layout[layout_len])
-    layout_len++;
-
-  size_ptr = (uint32_t *)(ioctl_buf2 + 36);
-  *size_ptr = layout_len;
-
-  // Copiar layout
-  arg_ptr = ioctl_buf2 + 40;
-  for (int i = 0; i < layout_len; i++) {
-    arg_ptr[i] = layout[i];
-  }
-
-  // Llamar IOCTL
-  __asm__("int $0x80" : "=a"(result) : "a"(0x19), "b"((uint32_t)ioctl_buf2));
-
-  // Mostrar resultado
-  p = buffer;
-  if (result == 0) {
-    *p++ = 'O';
-    *p++ = 'K';
-    *p++ = '\n';
-  } else {
-    *p++ = 'E';
-    *p++ = 'r';
-    *p++ = 'r';
-    *p++ = ':';
-
-    int err = -result;
-    if (err > 99)
-      err = 99;
-
-    if (err >= 10) {
-      *p++ = '0' + (err / 10);
-      *p++ = '0' + (err % 10);
-    } else if (err > 0) {
-      *p++ = '0' + err;
-    } else {
-      *p++ = '0';
-    }
-    *p++ = '\n';
-  }
-
-  __asm__("int $0x80" : : "a"(1), "b"(1), "c"(buffer), "d"(p - buffer));
-
-  // 4. Mensaje final y salir
-  p = buffer;
-  *p++ = '=';
-  *p++ = '=';
-  *p++ = '=';
-  *p++ = '\n';
-  *p++ = 'D';
-  *p++ = 'o';
-  *p++ = 'n';
-  *p++ = 'e';
-  *p++ = '!';
-  *p++ = '\n';
-
-  __asm__("int $0x80" : : "a"(1), "b"(1), "c"(buffer), "d"(p - buffer));
-
-  // Salir
-  __asm__("int $0x80" : : "a"(0), "b"(0));
-}
+        "host_str: .asciz \"google.com\"\n"
+        "file_str: .asciz \"/home/goog.txt\"\n"
+        "dot_str:  .ascii \".\"\n"
+        "msg_dns:  .ascii \"[HTTP] Resolving...\\r\\n\"\n"
+        "msg_dns_len = . - msg_dns\n"
+        "msg_conn: .ascii \"[HTTP] Connecting...\\r\\n\"\n"
+        "msg_conn_len = . - msg_conn\n"
+        "msg_recv: .ascii \"[HTTP] Receiving: \"\n"
+        "msg_recv_len = . - msg_recv\n"
+        "msg_ok:   .ascii \"\\r\\n[HTTP] Saved to /home/goog.txt\\r\\n\"\n"
+        "msg_ok_len = . - msg_ok\n"
+        "err_dns:  .ascii \"[ERR] DNS\\r\\n\"\n"
+        "err_dns_len = . - err_dns\n"
+        "err_conn: .ascii \"[ERR] Connection\\r\\n\"\n"
+        "err_conn_len = . - err_conn\n"
+        "err_file: .ascii \"[ERR] File Create\\r\\n\"\n"
+        "err_file_len = . - err_file\n"
+        "req_str:  .ascii \"GET /index.html HTTP/1.0\\r\\nHost: "
+        "google.com\\r\\nConnection: close\\r\\n\\r\\n\"\n"
+        "req_str_end:\n");

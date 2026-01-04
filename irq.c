@@ -51,14 +51,14 @@ void timer_irq_handler() {
   ticks++;
   ticks_since_boot++;
 
-  // ✅ FIX: Scheduler tick ANTES de EOI
-  // Esto evita race conditions
+  // ✅ EOI ANTES de scheduler_tick
+  // Esto es CRÍTICO: si el scheduler cambia de tarea, el APIC/PIC
+  // debe saber que la interrupción ya fue servida para no bloquear el timer
+  pic_send_eoi(0);
+
   if (scheduler.scheduler_enabled) {
     scheduler_tick();
   }
-
-  // ✅ EOI al final
-  pic_send_eoi(0);
 }
 
 void mouse_irq_handler() {
@@ -195,8 +195,8 @@ void irq_setup_apic(void) {
   // COM2 - IRQ 3
   uint32_t gsi_serial2 = apic_irq_to_gsi(3);
   ioapic_set_irq(gsi_serial2, 51, false);
-  terminal_printf(&main_terminal,
-                  "    IRQ 3 -> GSI %u -> Vector 51 (COM2)\r\n", gsi_serial2);
+  terminal_printf(&main_terminal, "    IRQ 3 -> GSI %u -> Vector 51 (COM2)\r\n",
+                  gsi_serial2);
   extern void irq51_entry();
   idt_set_gate(51, (uintptr_t)irq51_entry, 0x08,
                IDT_FLAG_PRESENT | IDT_FLAG_RING0 | IDT_FLAG_INTERRUPT32);
@@ -204,8 +204,8 @@ void irq_setup_apic(void) {
   // COM1 - IRQ 4
   uint32_t gsi_serial1 = apic_irq_to_gsi(4);
   ioapic_set_irq(gsi_serial1, 52, false);
-  terminal_printf(&main_terminal,
-                  "    IRQ 4 -> GSI %u -> Vector 52 (COM1)\r\n", gsi_serial1);
+  terminal_printf(&main_terminal, "    IRQ 4 -> GSI %u -> Vector 52 (COM1)\r\n",
+                  gsi_serial1);
   extern void irq52_entry();
   idt_set_gate(52, (uintptr_t)irq52_entry, 0x08,
                IDT_FLAG_PRESENT | IDT_FLAG_RING0 | IDT_FLAG_INTERRUPT32);
@@ -284,10 +284,11 @@ void irq_setup_apic(void) {
  * @note Debe llamarse después de que el timer esté configurado
  */
 void kernel_delay_init(uint32_t freq_hz) {
-    timer_frequency = freq_hz;
-    timer_initialized = true;
-    
-    terminal_printf(&main_terminal, "Delay: Timer frequency set to %u Hz\n", freq_hz);
+  timer_frequency = freq_hz;
+  timer_initialized = true;
+
+  terminal_printf(&main_terminal, "Delay: Timer frequency set to %u Hz\n",
+                  freq_hz);
 }
 
 /**
@@ -296,63 +297,67 @@ void kernel_delay_init(uint32_t freq_hz) {
  * @note Solo usar durante boot o en contextos de kernel donde no hay multitarea
  */
 void kernel_delay(uint32_t milliseconds) {
-    if (milliseconds == 0) return;
-    
-    // Si el scheduler está activo, usar task_sleep en su lugar
-    if (scheduler.scheduler_enabled) {
-        terminal_printf(&main_terminal, "Delay: Scheduler active, using task_sleep() instead\n");
-        task_sleep(milliseconds / 10); // Convertir a ticks (10ms por tick)
-        return;
+  if (milliseconds == 0)
+    return;
+
+  // Si el scheduler está activo, usar task_sleep en su lugar
+  if (scheduler.scheduler_enabled) {
+    terminal_printf(&main_terminal,
+                    "Delay: Scheduler active, using task_sleep() instead\n");
+    task_sleep(milliseconds / 10); // Convertir a ticks (10ms por tick)
+    return;
+  }
+
+  // Si el timer no está inicializado, usar delays simples
+  if (!timer_initialized || timer_frequency == 0) {
+    terminal_printf(&main_terminal,
+                    "Delay: Timer not initialized, using simple delay\n");
+
+    // Calcular ciclos aproximados para el delay
+    uint32_t delay_cycles = milliseconds * 1000; // Aproximación muy básica
+    for (volatile uint32_t i = 0; i < delay_cycles; i++) {
+      __asm__ volatile("pause");
     }
-    
-    // Si el timer no está inicializado, usar delays simples
-    if (!timer_initialized || timer_frequency == 0) {
-        terminal_printf(&main_terminal, "Delay: Timer not initialized, using simple delay\n");
-        
-        // Calcular ciclos aproximados para el delay
-        uint32_t delay_cycles = milliseconds * 1000; // Aproximación muy básica
-        for (volatile uint32_t i = 0; i < delay_cycles; i++) {
-            __asm__ volatile("pause");
-        }
-        return;
+    return;
+  }
+
+  // Calcular ticks basado en frecuencia del timer
+  uint32_t ticks_needed;
+  if (timer_frequency >= 1000) {
+    // Frecuencia alta (ej: 1000Hz = 1ms por tick)
+    ticks_needed = (milliseconds * timer_frequency) / 1000;
+  } else {
+    // Frecuencia baja (ej: 100Hz = 10ms por tick)
+    ticks_needed = milliseconds / (1000 / timer_frequency);
+  }
+
+  // Asegurar al menos 1 tick
+  if (ticks_needed == 0)
+    ticks_needed = 1;
+
+  uint32_t start_ticks = ticks_since_boot;
+  uint32_t target_ticks = start_ticks + ticks_needed;
+
+  // Manejar overflow de ticks
+  if (target_ticks < start_ticks) {
+    // Overflow - esperar hasta que ticks_since_boot también haga overflow
+    while (ticks_since_boot > start_ticks) {
+      __asm__ volatile("pause");
     }
-    
-    // Calcular ticks basado en frecuencia del timer
-    uint32_t ticks_needed;
-    if (timer_frequency >= 1000) {
-        // Frecuencia alta (ej: 1000Hz = 1ms por tick)
-        ticks_needed = (milliseconds * timer_frequency) / 1000;
+    start_ticks = ticks_since_boot;
+    target_ticks = start_ticks + ticks_needed;
+  }
+
+  // Espera activa con HLT para ahorrar energía
+  while (ticks_since_boot < target_ticks) {
+    if (milliseconds > 10) {
+      // Para delays largos, usar HLT
+      __asm__ volatile("sti; hlt; cli");
     } else {
-        // Frecuencia baja (ej: 100Hz = 10ms por tick)
-        ticks_needed = milliseconds / (1000 / timer_frequency);
+      // Para delays cortos, usar pause
+      __asm__ volatile("pause");
     }
-    
-    // Asegurar al menos 1 tick
-    if (ticks_needed == 0) ticks_needed = 1;
-    
-    uint32_t start_ticks = ticks_since_boot;
-    uint32_t target_ticks = start_ticks + ticks_needed;
-    
-    // Manejar overflow de ticks
-    if (target_ticks < start_ticks) {
-        // Overflow - esperar hasta que ticks_since_boot también haga overflow
-        while (ticks_since_boot > start_ticks) {
-            __asm__ volatile("pause");
-        }
-        start_ticks = ticks_since_boot;
-        target_ticks = start_ticks + ticks_needed;
-    }
-    
-    // Espera activa con HLT para ahorrar energía
-    while (ticks_since_boot < target_ticks) {
-        if (milliseconds > 10) {
-            // Para delays largos, usar HLT
-            __asm__ volatile("sti; hlt; cli");
-        } else {
-            // Para delays cortos, usar pause
-            __asm__ volatile("pause");
-        }
-    }
+  }
 }
 
 /**
@@ -360,51 +365,53 @@ void kernel_delay(uint32_t milliseconds) {
  * @param microseconds Microsegundos a esperar
  */
 void kernel_delay_us(uint32_t microseconds) {
-    if (microseconds == 0) return;
-    
-    // Si scheduler activo, convertir a ticks
-    if (scheduler.scheduler_enabled) {
-        uint32_t ms = (microseconds + 999) / 1000; // Redondear hacia arriba a ms
-        task_sleep(ms / 10); // Convertir a ticks
-        return;
+  if (microseconds == 0)
+    return;
+
+  // Si scheduler activo, convertir a ticks
+  if (scheduler.scheduler_enabled) {
+    uint32_t ms = (microseconds + 999) / 1000; // Redondear hacia arriba a ms
+    task_sleep(ms / 10);                       // Convertir a ticks
+    return;
+  }
+
+  // Para delays muy cortos, usar loops de CPU
+  if (microseconds < 100) {
+    uint32_t delay_cycles = microseconds * 3; // Calibración aproximada
+    for (volatile uint32_t i = 0; i < delay_cycles; i++) {
+      __asm__ volatile("pause");
     }
-    
-    // Para delays muy cortos, usar loops de CPU
-    if (microseconds < 100) {
-        uint32_t delay_cycles = microseconds * 3; // Calibración aproximada
-        for (volatile uint32_t i = 0; i < delay_cycles; i++) {
-            __asm__ volatile("pause");
-        }
-        return;
+    return;
+  }
+
+  // Para delays más largos, usar timer
+  if (timer_initialized && timer_frequency > 0) {
+    uint32_t ticks_needed = (microseconds * timer_frequency) / 1000000;
+    if (ticks_needed == 0)
+      ticks_needed = 1;
+
+    uint32_t start_ticks = ticks_since_boot;
+    uint32_t target_ticks = start_ticks + ticks_needed;
+
+    // Manejar overflow
+    if (target_ticks < start_ticks) {
+      while (ticks_since_boot > start_ticks) {
+        __asm__ volatile("pause");
+      }
+      start_ticks = ticks_since_boot;
+      target_ticks = start_ticks + ticks_needed;
     }
-    
-    // Para delays más largos, usar timer
-    if (timer_initialized && timer_frequency > 0) {
-        uint32_t ticks_needed = (microseconds * timer_frequency) / 1000000;
-        if (ticks_needed == 0) ticks_needed = 1;
-        
-        uint32_t start_ticks = ticks_since_boot;
-        uint32_t target_ticks = start_ticks + ticks_needed;
-        
-        // Manejar overflow
-        if (target_ticks < start_ticks) {
-            while (ticks_since_boot > start_ticks) {
-                __asm__ volatile("pause");
-            }
-            start_ticks = ticks_since_boot;
-            target_ticks = start_ticks + ticks_needed;
-        }
-        
-        while (ticks_since_boot < target_ticks) {
-            __asm__ volatile("pause");
-        }
-    } else {
-        // Fallback: delay basado en loops
-        uint32_t delay_cycles = microseconds * 3; // Calibración aproximada
-        for (volatile uint32_t i = 0; i < delay_cycles; i++) {
-            __asm__ volatile("pause");
-        }
+
+    while (ticks_since_boot < target_ticks) {
+      __asm__ volatile("pause");
     }
+  } else {
+    // Fallback: delay basado en loops
+    uint32_t delay_cycles = microseconds * 3; // Calibración aproximada
+    for (volatile uint32_t i = 0; i < delay_cycles; i++) {
+      __asm__ volatile("pause");
+    }
+  }
 }
 
 /**
@@ -413,15 +420,16 @@ void kernel_delay_us(uint32_t microseconds) {
  * @note Esta es la función principal que deberías usar
  */
 void kernel_safe_delay(uint32_t milliseconds) {
-    if (milliseconds == 0) return;
-    
-    if (scheduler.scheduler_enabled) {
-        // Usar task_sleep cuando scheduler está activo
-        task_sleep((milliseconds + 9) / 10); // Convertir a ticks (10ms por tick)
-    } else {
-        // Usar kernel_delay cuando scheduler no está activo
-        kernel_delay(milliseconds);
-    }
+  if (milliseconds == 0)
+    return;
+
+  if (scheduler.scheduler_enabled) {
+    // Usar task_sleep cuando scheduler está activo
+    task_sleep((milliseconds + 9) / 10); // Convertir a ticks (10ms por tick)
+  } else {
+    // Usar kernel_delay cuando scheduler no está activo
+    kernel_delay(milliseconds);
+  }
 }
 
 /**
@@ -429,14 +437,16 @@ void kernel_safe_delay(uint32_t milliseconds) {
  * @param milliseconds Milisegundos a esperar
  */
 void kernel_active_delay(uint32_t milliseconds) {
-    if (milliseconds == 0) return;
-    
-    uint32_t target_ticks = ticks_since_boot + (milliseconds / 10); // 10ms por tick
-    
-    while (ticks_since_boot < target_ticks) {
-        // Permitir que las interrupciones se procesen
-        __asm__ volatile("sti; nop; cli");
-    }
+  if (milliseconds == 0)
+    return;
+
+  uint32_t target_ticks =
+      ticks_since_boot + (milliseconds / 10); // 10ms por tick
+
+  while (ticks_since_boot < target_ticks) {
+    // Permitir que las interrupciones se procesen
+    __asm__ volatile("sti; nop; cli");
+  }
 }
 
 /**
@@ -446,50 +456,53 @@ void kernel_active_delay(uint32_t milliseconds) {
  * @return true si la condición se cumplió, false si timeout
  */
 bool kernel_delay_condition(uint32_t milliseconds, bool (*condition)(void)) {
-    if (milliseconds == 0) return condition();
-    
-    uint32_t target_ticks = ticks_since_boot + (milliseconds / 10);
-    
-    while (ticks_since_boot < target_ticks) {
-        if (condition()) {
-            return true;
-        }
-        
-        // Pequeña pausa para no saturar la CPU
-        if (scheduler.scheduler_enabled) {
-            task_yield();
-        } else {
-            for (volatile int i = 0; i < 1000; i++) {
-                __asm__ volatile("pause");
-            }
-        }
+  if (milliseconds == 0)
+    return condition();
+
+  uint32_t target_ticks = ticks_since_boot + (milliseconds / 10);
+
+  while (ticks_since_boot < target_ticks) {
+    if (condition()) {
+      return true;
     }
-    
-    return condition(); // Última verificación
+
+    // Pequeña pausa para no saturar la CPU
+    if (scheduler.scheduler_enabled) {
+      task_yield();
+    } else {
+      for (volatile int i = 0; i < 1000; i++) {
+        __asm__ volatile("pause");
+      }
+    }
+  }
+
+  return condition(); // Última verificación
 }
 
 /**
  * @brief Calibrar delay para obtener mayor precisión
  */
 void kernel_calibrate_delay(void) {
-    terminal_puts(&main_terminal, "Delay: Calibrating delay functions...\n");
-    
-    // Medir 100ms usando ticks
-    uint32_t start_ticks = ticks_since_boot;
-    kernel_delay(100);
-    uint32_t elapsed_ticks = ticks_since_boot - start_ticks;
-    
-    terminal_printf(&main_terminal, "Delay: 100ms = %u ticks\n", elapsed_ticks);
-    
-    if (elapsed_ticks > 0) {
-        // Calcular frecuencia real
-        uint32_t actual_freq = (elapsed_ticks * 10); // Convertir a Hz
-        terminal_printf(&main_terminal, "Delay: Actual timer frequency: %u Hz\n", actual_freq);
-        
-        // Actualizar si es significativamente diferente
-        if (actual_freq != timer_frequency && actual_freq > 0) {
-            timer_frequency = actual_freq;
-            terminal_printf(&main_terminal, "Delay: Updated frequency to %u Hz\n", timer_frequency);
-        }
+  terminal_puts(&main_terminal, "Delay: Calibrating delay functions...\n");
+
+  // Medir 100ms usando ticks
+  uint32_t start_ticks = ticks_since_boot;
+  kernel_delay(100);
+  uint32_t elapsed_ticks = ticks_since_boot - start_ticks;
+
+  terminal_printf(&main_terminal, "Delay: 100ms = %u ticks\n", elapsed_ticks);
+
+  if (elapsed_ticks > 0) {
+    // Calcular frecuencia real
+    uint32_t actual_freq = (elapsed_ticks * 10); // Convertir a Hz
+    terminal_printf(&main_terminal, "Delay: Actual timer frequency: %u Hz\n",
+                    actual_freq);
+
+    // Actualizar si es significativamente diferente
+    if (actual_freq != timer_frequency && actual_freq > 0) {
+      timer_frequency = actual_freq;
+      terminal_printf(&main_terminal, "Delay: Updated frequency to %u Hz\n",
+                      timer_frequency);
     }
+  }
 }

@@ -70,6 +70,11 @@
 #define SYSCALL_FCHOWN 0x3E        // Cambiar propietario de archivo abierto
 #define SYSCALL_UTIME 0x3F         // Cambiar tiempos de acceso/modificación
 #define SYSCALL_SYNC 0x40          // Sincronizar filesystem
+#define SYSCALL_SOCKET 0x41        // Crear socket
+#define SYSCALL_CONNECT 0x42       // Conectar socket
+#define SYSCALL_SEND 0x43          // Enviar por socket
+#define SYSCALL_RECV 0x44          // Recibir de socket
+#define SYSCALL_DNS_RESOLVE 0x45   // Resolver host DNS
 
 // ✅ Definir códigos de error (versión simplificada)
 #define EPERM 1

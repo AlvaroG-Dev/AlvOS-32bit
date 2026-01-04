@@ -6,16 +6,16 @@
 #include <stdint.h>
 
 // Definiciones para los IRQs
-#define IRQ0  32
-#define IRQ1  33
-#define IRQ2  34
-#define IRQ3  35
-#define IRQ4  36
-#define IRQ5  37
-#define IRQ6  38
-#define IRQ7  39
-#define IRQ8  40
-#define IRQ9  41
+#define IRQ0 32
+#define IRQ1 33
+#define IRQ2 34
+#define IRQ3 35
+#define IRQ4 36
+#define IRQ5 37
+#define IRQ6 38
+#define IRQ7 39
+#define IRQ8 40
+#define IRQ9 41
 #define IRQ10 42
 #define IRQ11 43
 #define IRQ12 44
@@ -28,11 +28,11 @@ extern uintptr_t irq_stub_table[];
 extern volatile uint32_t ticks;
 extern volatile uint32_t ticks_since_boot;
 // Tipo para manejadores de IRQ
-typedef void (*irq_handler_t)(struct regs*);
+typedef void (*irq_handler_t)(struct regs *);
 
 // Funciones públicas
-void timer_irq_handler(void);             // <-- Debe estar visible
-void irq_common_handler(struct regs* r);
+void timer_irq_handler(void); // <-- Debe estar visible
+void irq_common_handler(struct regs *r);
 void pic_send_eoi(uint8_t irq);
 void pit_init(uint32_t frequency);
 void irq_setup_apic(void);

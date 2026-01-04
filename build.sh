@@ -98,6 +98,11 @@ compile "ipv4.c" "$GCC $GCC_OPTS -c ipv4.c -o build/ipv4.o"
 compile "arp.c" "$GCC $GCC_OPTS -c arp.c -o build/arp.o"
 compile "network_stack.c" "$GCC $GCC_OPTS -c network_stack.c -o build/network_stack.o"
 compile "icmp.c" "$GCC $GCC_OPTS -c icmp.c -o build/icmp.o"
+compile "udp.c" "$GCC $GCC_OPTS -c udp.c -o build/udp.o"
+compile "dns.c" "$GCC $GCC_OPTS -c dns.c -o build/dns.o"
+compile "tcp.c" "$GCC $GCC_OPTS -c tcp.c -o build/tcp.o"
+compile "http.c" "$GCC $GCC_OPTS -c http.c -o build/http.o"
+compile "network_daemon.c" "$GCC $GCC_OPTS -c network_daemon.c -o build/network_daemon.o"
 
 # Enlazado con linker.ld
 echo -e "${GREEN}Enlazando kernel.bin...${RESET}"
@@ -117,7 +122,8 @@ ld -m elf_i386 -T linker.ld -o build/kernel.bin \
     build/text_editor.o build/syscalls.o build/syscall_asm.o build/exec.o \
     build/sysfs.o build/devfs.o build/chardev.o build/chardev_vfs.o \
     build/e1000.o build/network.o build/ipv4.o build/arp.o build/network_stack.o \
-    build/icmp.o
+    build/icmp.o build/udp.o build/dns.o build/tcp.o build/http.o build/network_daemon.o \
+    
 
 if [ $? -ne 0 ]; then
     echo -e "${RED}Error en el enlazado con linker.ld${RESET}"

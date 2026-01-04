@@ -6,6 +6,8 @@
 #include "terminal.h"
 #include <stdint.h>
 
+#include "task.h"
+
 /* Usar tus allocators */
 extern void *kernel_malloc(size_t size);
 extern int kernel_free(void *p);
@@ -19,8 +21,7 @@ static int fs_count = 0;
 vfs_mount_info_t *mount_list = NULL;
 int mount_count = 0;
 
-/* FD table */
-vfs_file_t *fd_table[VFS_MAX_FDS];
+/* Global FD table REMOVED (now in task_t) */
 
 /* Helpers for allocation */
 static void *vfs_alloc(size_t s) { return kernel_malloc(s); }
@@ -29,8 +30,13 @@ static void vfs_free(void *p) { kernel_free(p); }
 // Función auxiliar para cerrar FDs asociados a un superblock
 int close_fds_for_mount(vfs_superblock_t *sb) {
   int closed = 0;
+  task_t *curr = scheduler.current_task;
+  if (!curr)
+    return VFS_ERR;
+
   for (int i = 0; i < VFS_MAX_FDS; i++) {
-    if (fd_table[i] && fd_table[i]->node && fd_table[i]->node->sb == sb) {
+    if (curr->fd_table[i] && (uint32_t)curr->fd_table[i] > 0x100 &&
+        curr->fd_table[i]->node && curr->fd_table[i]->node->sb == sb) {
       if (vfs_close(i) != VFS_OK) {
         terminal_printf(&main_terminal, "shutdown: Failed to close FD %d\r\n",
                         i);
@@ -130,8 +136,9 @@ void vfs_init(void) {
   fs_count = 0;
   mount_count = 0;
 
-  for (int i = 0; i < VFS_MAX_FDS; i++)
-    fd_table[i] = NULL;
+  mount_list = NULL;
+
+  // Ya no limpiamos fd_table global aquí
 
   // Limpiar lista de montajes
   vfs_mount_info_t *current = mount_list;
@@ -263,7 +270,8 @@ int vfs_mount(const char *mountpoint, const char *fsname, void *device) {
   if (!mountpoint || !fsname)
     return VFS_ERR;
 
-  terminal_printf(&main_terminal, "VFS: Mount attempt %s on %s...\n", fsname, mountpoint);
+  terminal_printf(&main_terminal, "VFS: Mount attempt %s on %s...\n", fsname,
+                  mountpoint);
 
   unsigned int f = vfs_lock_disable_irq();
 
@@ -317,11 +325,13 @@ int vfs_mount(const char *mountpoint, const char *fsname, void *device) {
       return VFS_ERR;
     }
 
-    terminal_printf(&main_terminal, "VFS: Parent SB found for %s\n", mountpoint);
+    terminal_printf(&main_terminal, "VFS: Parent SB found for %s\n",
+                    mountpoint);
 
     vfs_node_t *mount_dir = resolve_path_to_vnode(parent_sb, relpath);
     if (!mount_dir) {
-      terminal_printf(&main_terminal, "VFS: Node %s not found, creating...\n", relpath);
+      terminal_printf(&main_terminal, "VFS: Node %s not found, creating...\n",
+                      relpath);
       // Mount point doesn't exist, create it
       char parent_path[VFS_PATH_MAX];
       char name[VFS_NAME_MAX];
@@ -358,7 +368,8 @@ int vfs_mount(const char *mountpoint, const char *fsname, void *device) {
         }
         return VFS_ERR;
       }
-      terminal_printf(&main_terminal, "VFS: Directory %s created\n", mountpoint);
+      terminal_printf(&main_terminal, "VFS: Directory %s created\n",
+                      mountpoint);
 
       // Release the new directory node
       new_dir->refcount--;
@@ -519,9 +530,13 @@ vfs_node_t *resolve_path_to_vnode(vfs_superblock_t *sb, const char *relpath) {
 }
 
 static int allocate_fd(vfs_file_t *f) {
+  task_t *curr = scheduler.current_task;
+  if (!curr)
+    return -1;
+
   for (int i = 0; i < VFS_MAX_FDS; i++) {
-    if (!fd_table[i]) {
-      fd_table[i] = f;
+    if (!curr->fd_table[i]) {
+      curr->fd_table[i] = f;
       return i;
     }
   }
@@ -530,9 +545,10 @@ static int allocate_fd(vfs_file_t *f) {
 
 /* free fd */
 static void free_fd(int fd) {
-  if (fd < 0 || fd >= VFS_MAX_FDS)
+  task_t *curr = scheduler.current_task;
+  if (!curr || fd < 0 || fd >= VFS_MAX_FDS)
     return;
-  fd_table[fd] = NULL;
+  curr->fd_table[fd] = NULL;
 }
 
 int vfs_list_mounts(void (*callback)(const char *mountpoint,
@@ -723,33 +739,36 @@ void debug_hex_dump(const char *label, const char *str, size_t len) {
 
 /* vfs_read / vfs_write dispatch */
 int vfs_read(int fd, void *buf, uint32_t size) {
-  if (fd < 0 || fd >= VFS_MAX_FDS)
+  task_t *curr = scheduler.current_task;
+  if (!curr || fd < 0 || fd >= VFS_MAX_FDS)
     return -1;
-  vfs_file_t *f = fd_table[fd];
-  if (!f || !buf)
+  vfs_file_t *f = curr->fd_table[fd];
+  if (!f || (uint32_t)f <= 0x100 || !buf)
     return -1;
   if (!f->node || !f->node->ops || !f->node->ops->read)
     return -1;
-  
+
   // ✅ DEBUG
-  serial_printf(COM1_BASE, "vfs_read: fd=%d, size=%u, calling node->ops->read\r\n", 
-                fd, size);
-  
+  serial_printf(COM1_BASE,
+                "vfs_read: fd=%d, size=%u, calling node->ops->read\r\n", fd,
+                size);
+
   int got = f->node->ops->read(f->node, (uint8_t *)buf, size, f->offset);
-  
+
   // ✅ DEBUG
   serial_printf(COM1_BASE, "vfs_read: node->ops->read returned %d\r\n", got);
-  
+
   if (got > 0)
     f->offset += got;
   return got;
 }
 
 int vfs_write(int fd, const void *buf, uint32_t size) {
-  if (fd < 0 || fd >= VFS_MAX_FDS)
+  task_t *curr = scheduler.current_task;
+  if (!curr || fd < 0 || fd >= VFS_MAX_FDS)
     return -1;
-  vfs_file_t *f = fd_table[fd];
-  if (!f || !buf)
+  vfs_file_t *f = curr->fd_table[fd];
+  if (!f || (uint32_t)f <= 0x100 || !buf)
     return -1;
   if (!f->node || !f->node->ops || !f->node->ops->write)
     return -1;
@@ -762,10 +781,11 @@ int vfs_write(int fd, const void *buf, uint32_t size) {
 
 /* close */
 int vfs_close(int fd) {
-  if (fd < 0 || fd >= VFS_MAX_FDS)
+  task_t *curr = scheduler.current_task;
+  if (!curr || fd < 0 || fd >= VFS_MAX_FDS)
     return VFS_ERR;
-  vfs_file_t *f = fd_table[fd];
-  if (!f)
+  vfs_file_t *f = curr->fd_table[fd];
+  if (!f || (uint32_t)f <= 0x100)
     return VFS_ERR;
   /* decrease vnode refcount and call release if zero */
   if (f->node) {
@@ -782,13 +802,22 @@ int vfs_close(int fd) {
 
 /* unlink */
 int vfs_unlink(const char *path) {
+  task_t *curr = scheduler.current_task;
   if (!path)
     return VFS_ERR;
 
+  // Verificar si el archivo está abierto por el proceso actual
+  if (curr) {
+    for (int i = 0; i < VFS_MAX_FDS; i++) {
+      vfs_file_t *f = curr->fd_table[i];
+      if (f && (uint32_t)f > 0x100 && f->node) {
+        // Check if open (simplified)
+      }
+    }
+  }
+
   char normalized[VFS_PATH_MAX];
   if (vfs_normalize_path(path, normalized, VFS_PATH_MAX) != VFS_OK) {
-    terminal_printf(&main_terminal, "VFS: Failed to normalize path %s\r\n",
-                    path);
     return VFS_ERR;
   }
 
@@ -959,14 +988,22 @@ int vfs_unmount(const char *mountpoint) {
     return VFS_ERR;
   }
 
-  // ✅ Verificar FDs abiertos PARA ESTE SUPERBLOCK
+  // ✅ Verificar FDs abiertos PARA ESTE SUPERBLOCK en TODAS las tareas
   int open_fds = 0;
-  for (int i = 0; i < VFS_MAX_FDS; i++) {
-    if (fd_table[i] && fd_table[i]->node && fd_table[i]->node->sb == sb) {
-      open_fds++;
-      terminal_printf(&main_terminal, "VFS: FD %d still open for %s\r\n", i,
-                      normalized);
-    }
+  task_t *task_iter = scheduler.task_list;
+  if (task_iter) {
+    do {
+      for (int i = 0; i < VFS_MAX_FDS; i++) {
+        vfs_file_t *f = task_iter->fd_table[i];
+        if (f && (uint32_t)f > 0x100 && f->node && f->node->sb == sb) {
+          open_fds++;
+          terminal_printf(&main_terminal,
+                          "VFS: PID %d has FD %d open for %s\r\n",
+                          task_iter->task_id, i, normalized);
+        }
+      }
+      task_iter = task_iter->next;
+    } while (task_iter != scheduler.task_list);
   }
 
   if (open_fds > 0) {
