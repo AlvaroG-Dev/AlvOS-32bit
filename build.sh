@@ -53,7 +53,7 @@ compile "keyboard.c"   "$GCC $GCC_OPTS -c keyboard.c -o build/keyboard.o"
 compile "drawing.c"    "$GCC $GCC_OPTS -c drawing.c -o build/drawing.o"
 compile "terminal.c"   "$GCC $GCC_OPTS -c terminal.c -o build/terminal.o"
 compile "disk.c"       "$GCC $GCC_OPTS -c disk.c -o build/disk.o"
-compile "disk_io_daemon.c"       "$GCC $GCC_OPTS -c disk_io_daemon.c -o build/disk_io_daemon.o"
+compile "disk_io_daemon.c" "$GCC $GCC_OPTS -c disk_io_daemon.c -o build/disk_io_daemon.o"
 compile "vfs.c"        "$GCC $GCC_OPTS -c vfs.c -o build/vfs.o"
 compile "tmpfs.c"      "$GCC $GCC_OPTS -c tmpfs.c -o build/tmpfs.o"
 compile "fat32.c"      "$GCC $GCC_OPTS -c fat32.c -o build/fat32.o"
@@ -187,7 +187,20 @@ ld -m elf_i386 -Ttext 0x0 --oformat binary -e _start \
 
 # 3. (OPCIONAL) Verificar el binario resultante
 echo "Tamaño del binario: $(stat -c%s hello.bin) bytes"
-hexdump -C hello.bin | head -20
+
+# 1. Compilar con -fPIE (Genera código que no depende de direcciones fijas)
+gcc -m32 -march=i386 -fPIE -ffreestanding -c test_pie.c -o test_pie.o
+gcc -m32 -march=i386 -fPIE -ffreestanding -c args_test.c -o args_test.o
+
+# 2. Vincular con -pie (Crea un ejecutable relocalizable)
+ld -m elf_i386 -pie --entry _start test_pie.o -o test_pie.elf
+ld -m elf_i386 -pie --entry _start args_test.o -o args_test.elf
+
+# 3. Preparar directorio home en la ISO
+mkdir -p build/isodir/home
+cp hello.bin build/isodir/home/
+cp test_pie.elf build/isodir/home/
+cp args_test.elf build/isodir/home/
 
 #dd if=/dev/zero of=~/osdisk/disk.img bs=1M count=1000
 #parted ~/osdisk/disk.img --script mklabel msdos

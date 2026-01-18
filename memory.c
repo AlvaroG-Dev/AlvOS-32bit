@@ -208,46 +208,24 @@ void *kernel_realloc(void *ptr, size_t new_size) {
   if (new_size == block->size) {
     return ptr;
   } else if (new_size < block->size) {
-    // Shrink
+    // Shrink: Intentar reducir si el ahorro es significativo
     size_t shrink_amount = block->size - new_size;
     if (shrink_amount >= MIN_BLOCK_SIZE + sizeof(heap_block_t)) {
+      // Crear un nuevo bloque libre con el espacio sobrante
       heap_block_t *new_free_block =
-          (heap_block_t *)((uint8_t *)block + sizeof(heap_block_t) + new_size);
-      new_free_block->magic = HEAP_MAGIC_FREE;
+          (heap_block_t *)((uint8_t *)ptr + new_size);
+      new_free_block->magic = HEAP_MAGIC_OCCUPIED; // Temporalmente para free()
       new_free_block->size = shrink_amount - sizeof(heap_block_t);
-      new_free_block->free = 1;
+      new_free_block->free = 0;
 
       block->size = new_size;
       kernel_free((void *)((uint8_t *)new_free_block + sizeof(heap_block_t)));
     }
     return ptr;
   } else {
-    // Grow: intentar expandir
-    heap_block_t *next = block->next;
-    if (next && next->free && next->magic == HEAP_MAGIC_FREE &&
-        (block->size + sizeof(heap_block_t) + next->size >= new_size)) {
-
-      size_t needed = new_size - block->size;
-      if (next->size >= needed + sizeof(heap_block_t) + MIN_BLOCK_SIZE) {
-        // Dividir el next
-        heap_block_t *remainder =
-            (heap_block_t *)((uint8_t *)next + sizeof(heap_block_t) + needed);
-        remainder->magic = HEAP_MAGIC_FREE;
-        remainder->size = next->size - needed - sizeof(heap_block_t);
-        remainder->free = 1;
-        remainder->next = next->next;
-
-        block->size += needed + sizeof(heap_block_t);
-        block->next = remainder;
-      } else {
-        // Tomar todo el next
-        block->size += sizeof(heap_block_t) + next->size;
-        block->next = next->next;
-      }
-      return ptr;
-    }
-
-    // Si no se puede expandir, alloc nuevo y copiar
+    // Grow: Siempre asignar nuevo y copiar para evitar corrupción
+    // El código anterior usaba block->next de forma incorrecta (era free_list
+    // next)
     void *new_ptr = kernel_malloc(new_size);
     if (!new_ptr)
       return NULL;

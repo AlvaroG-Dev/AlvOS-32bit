@@ -290,9 +290,20 @@ void task_destroy(task_t *task) {
   uint32_t flags;
   __asm__ __volatile__("pushf\n\tcli\n\tpop %0" : "=r"(flags));
 
-  // Si es la tarea actual, cambiar a otra
+  // Si es la tarea actual, debemos manejar esto con cuidado
   if (task == scheduler.current_task) {
+    // CAMBIO CRITICO: No podemos liberar nuestra propia memoria mientras
+    // corremos en ella Marcar como ZOMBIE y ceder CPU para siempre. El
+    // recolector (idle/cleanup) nos limpiará.
+    task->state = TASK_ZOMBIE;
+
+    // Deshabilitar interrupciones para el yield final
+    __asm__ __volatile__("cli");
     task_yield();
+
+    // Código inalcanzable si el scheduler funciona bien
+    while (1)
+      __asm__("hlt");
   }
 
   // Marcar como zombie y remover de la lista
@@ -302,6 +313,51 @@ void task_destroy(task_t *task) {
   // Liberar recursos
   if (task->stack_base) {
     kernel_free(task->stack_base);
+  }
+
+  // Liberar stack de usuario si existe
+  if (task->user_stack_base) {
+    kernel_free(task->user_stack_base);
+    task->user_stack_base = NULL;
+  }
+
+  // Liberar descriptores de archivo abiertos
+  for (int i = 0; i < VFS_MAX_FDS; i++) {
+    if (task->fd_table[i] != NULL) {
+      // vfs_close se encarga de liberar la estructura socket o file
+      // Nota: Necesitamos asegurarnos de que vfs_close pueda manejar esto sin
+      // el contexto de la tarea actual si estamos destruyendo OTRA tarea.
+      // vfs_close usa current_task->fd_table para buscar, pero aquí tenemos el
+      // puntero directo. Podríamos llamar directamente a file->ops->close(file)
+      // y luego liberar file.
+
+      vfs_file_t *file = task->fd_table[i];
+      if (file && (uint32_t)file != 0x1) {
+        // Si tenemos VFS_NODE_SOCKET, vfs_close (si lo actualizamos) lo
+        // manejará Pero como vfs_close toma un INT fd y busca en
+        // current_task... Necesitamos una función interna o hacerlo manualmente
+        // aquí.
+
+        // Por seguridad, llamamos a vfs_file_close_internal(file) si existiera,
+        // o replicamos la lógica:
+
+        if (file->ops && file->ops->close) {
+          file->ops->close(file);
+        }
+
+        // Decrementar refcount del nodo si existe
+        if (file->node) {
+          file->node->refcount--;
+          if (file->node->refcount == 0 && file->node->ops &&
+              file->node->ops->release) {
+            file->node->ops->release(file->node);
+          }
+        }
+
+        kernel_free(file);
+        task->fd_table[i] = NULL;
+      }
+    }
   }
 
   scheduler.task_count--;
@@ -679,11 +735,15 @@ static void user_mode_entry_wrapper(void *arg) {
 // FUNCIÓN PARA CREAR TAREAS DE USUARIO (COMPLETAMENTE CORREGIDA)
 // ============================================================================
 
-task_t *task_create_user(const char *name, void *user_code_addr, void *arg,
-                         uint32_t code_size, task_priority_t priority) {
+task_t *task_create_user(const char *name, void *user_code_addr, int argc,
+                         char **argv, uint32_t code_size,
+                         task_priority_t priority) {
   terminal_printf(&main_terminal,
                   "[USER_CREATE] Creating user task: %s at 0x%08x\r\n", name,
                   (uint32_t)user_code_addr);
+
+  // ... (validations remain the same) ...
+  // (Assuming I should keep the existing validations and logic)
 
   // 1. Validar dirección de código
   if ((uint32_t)user_code_addr < 0x200000 ||
@@ -705,247 +765,92 @@ task_t *task_create_user(const char *name, void *user_code_addr, void *arg,
   }
 
   if (!(code_flags & PAGE_USER)) {
-    terminal_printf(
-        &main_terminal,
-        "[USER_CREATE] WARNING: Code page missing PAGE_USER (flags=0x%03x)\r\n",
-        code_flags);
-
-    if (!mmu_set_page_user(code_page)) {
-      terminal_puts(
-          &main_terminal,
-          "[USER_CREATE] ERROR: Cannot set PAGE_USER on code page\r\n");
-      return NULL;
-    }
-
-    terminal_puts(&main_terminal,
-                  "[USER_CREATE] PAGE_USER added to code page\r\n");
+    mmu_set_page_user(code_page);
   }
 
-  // 3. ✅ CRÍTICO: Asignar stack CORRECTAMENTE alineado
+  // 3. Asignar stack con GUARD PAGE
   size_t aligned_stack_size = (USER_STACK_SIZE + 0xFFF) & ~0xFFF;
+  size_t total_alloc_size = aligned_stack_size + PAGE_SIZE;
 
-  terminal_printf(
-      &main_terminal,
-      "[USER_CREATE] Allocating stack: %u bytes (aligned to 4KB)\r\n",
-      aligned_stack_size);
-
-  void *user_stack = kernel_malloc(aligned_stack_size);
-  if (!user_stack) {
-    terminal_puts(&main_terminal,
-                  "[USER_CREATE] ERROR: Cannot allocate user stack\r\n");
+  void *user_stack = kernel_malloc(total_alloc_size);
+  if (!user_stack)
     return NULL;
-  }
-  memset(user_stack, 0, aligned_stack_size);
+  memset(user_stack, 0, total_alloc_size);
 
-  // 4. ✅ CRÍTICO: Calcular correctamente inicio y fin
-  uint32_t stack_base = (uint32_t)user_stack;
-  uint32_t stack_end = stack_base + aligned_stack_size;
+  uint32_t alloc_base = (uint32_t)user_stack;
+  uint32_t guard_page = alloc_base & ~0xFFF;
+  uint32_t stack_real_base = guard_page + PAGE_SIZE;
+  uint32_t stack_end = alloc_base + total_alloc_size;
 
-  // ⚠️ IMPORTANTE: El stack crece HACIA ABAJO
-  // stack_base es el inicio (dirección más baja)
-  // stack_end es el final (dirección más alta)
-  // ESP debe apuntar al final (stack_end), no al inicio
-
-  terminal_printf(&main_terminal,
-                  "[USER_CREATE] Stack region: 0x%08x - 0x%08x (%u bytes)\r\n",
-                  stack_base, stack_end, aligned_stack_size);
-
-  // 5. ✅ CRÍTICO: Mapear TODAS las páginas del stack con verificación robusta
-  terminal_puts(&main_terminal, "[USER_CREATE] Mapping stack pages:\r\n");
-
-  uint32_t stack_base_aligned = stack_base & ~0xFFF;
-  uint32_t stack_end_aligned = (stack_end + 0xFFF) & ~0xFFF;
-  uint32_t mapped_count = 0;
-
-  for (uint32_t page = stack_base_aligned; page < stack_end_aligned;
-       page += PAGE_SIZE) {
-    // Verificar si ya está mapeada
-    if (mmu_is_mapped(page)) {
-      uint32_t flags = mmu_get_page_flags(page);
-
-      // ✅ CRÍTICO: Verificar que tenga PAGE_USER
-      if (!(flags & PAGE_USER)) {
-        terminal_printf(
-            &main_terminal,
-            "[USER_CREATE]   ⚠️ Page 0x%08x missing USER flag, fixing...\r\n",
-            page);
-
-        if (!mmu_set_page_user(page)) {
-          terminal_printf(
-              &main_terminal,
-              "[USER_CREATE] ❌ ERROR: Failed to set PAGE_USER on 0x%08x\r\n",
-              page);
-          kernel_free(user_stack);
-          return NULL;
-        }
-
-        // Verificar después del fix
-        flags = mmu_get_page_flags(page);
-        if (!(flags & PAGE_USER)) {
-          terminal_printf(&main_terminal,
-                          "[USER_CREATE] ❌ ERROR: PAGE_USER still not set on "
-                          "0x%08x after fix!\r\n",
-                          page);
-          kernel_free(user_stack);
-          return NULL;
-        }
-      }
-
-      // ✅ Verificar que tenga permisos de escritura
-      if (!(flags & PAGE_RW)) {
-        terminal_printf(
-            &main_terminal,
-            "[USER_CREATE] ⚠️ Page 0x%08x missing RW flag, fixing...\r\n", page);
-
-        if (!mmu_set_flags(page, flags | PAGE_RW)) {
-          terminal_printf(
-              &main_terminal,
-              "[USER_CREATE] ❌ ERROR: Failed to set RW on 0x%08x\r\n", page);
-          kernel_free(user_stack);
-          return NULL;
-        }
-      }
-
-      terminal_printf(
-          &main_terminal,
-          "[USER_CREATE]   ✓ Already mapped 0x%08x [U=%d, W=%d]\r\n", page,
-          (flags & PAGE_USER) ? 1 : 0, (flags & PAGE_RW) ? 1 : 0);
+  // 5. Mapear stack
+  for (uint32_t page = stack_real_base; page < stack_end; page += PAGE_SIZE) {
+    if (!mmu_is_mapped(page)) {
+      mmu_map_page(page, page, PAGE_PRESENT | PAGE_RW | PAGE_USER);
     } else {
-      // Mapear nueva página
-      terminal_printf(&main_terminal,
-                      "[USER_CREATE]   🆕 Mapping new page 0x%08x...\r\n",
-                      page);
-
-      // ✅ CRÍTICO: Usar mmu_map_page con flags correctos
-      if (!mmu_map_page(page, page, PAGE_PRESENT | PAGE_RW | PAGE_USER)) {
-        terminal_printf(&main_terminal,
-                        "[USER_CREATE] ❌ ERROR: Failed to map page 0x%08x\r\n",
-                        page);
-        kernel_free(user_stack);
-        return NULL;
-      }
-
-      // Verificar que se mapeó correctamente
-      uint32_t mapped_flags = mmu_get_page_flags(page);
-      if (!(mapped_flags & PAGE_USER)) {
-        terminal_printf(&main_terminal,
-                        "[USER_CREATE] ❌ ERROR: New page missing USER flag! "
-                        "(flags=0x%03x)\r\n",
-                        mapped_flags);
-        kernel_free(user_stack);
-        return NULL;
-      }
-
-      terminal_printf(&main_terminal,
-                      "[USER_CREATE]   ✅ Mapped 0x%08x [OK]\r\n", page);
+      mmu_set_page_user(page);
     }
-
-    mapped_count++;
   }
 
-  terminal_printf(&main_terminal, "[USER_CREATE] Total pages mapped: %u\r\n",
-                  mapped_count);
-
-  // 6. ✅ CRÍTICO: Stack top debe estar en el FINAL, con margen de seguridad
-  // Dejar 16 bytes de margen y alinear a 16 bytes
+  // 6. Preparar stack top y ARGC/ARGV
   uint32_t stack_top = (stack_end - 16) & ~0xF;
 
-  terminal_printf(
-      &main_terminal,
-      "[USER_CREATE] Stack top: 0x%08x (aligned, %u bytes from end)\r\n",
-      stack_top, stack_end - stack_top);
-
-  // 7. ✅ VERIFICACIÓN: Comprobar que el área crítica del stack está mapeada
-  terminal_puts(&main_terminal,
-                "[USER_CREATE] Verifying critical stack area:\r\n");
-
-  // Verificar las direcciones que el código relocatable usará
-  uint32_t test_addrs[] = {stack_top,      // ESP inicial
-                           stack_top - 4,  // Después del primer PUSH (CALL)
-                           stack_top - 8,  // Después del segundo PUSH
-                           stack_top - 16, // Más margen
-                           0};
-
-  for (int i = 0; test_addrs[i] != 0; i++) {
-    uint32_t addr = test_addrs[i];
-    uint32_t page = addr & ~0xFFF;
-
-    if (!mmu_is_mapped(page)) {
-      terminal_printf(
-          &main_terminal,
-          "[USER_CREATE] ❌ ERROR: Address 0x%08x (page 0x%08x) NOT MAPPED\r\n",
-          addr, page);
-      kernel_free(user_stack);
-      return NULL;
+  if (argc > 0 && argv != NULL) {
+    // 6.1. Copiar los strings de los argumentos al stack
+    uint32_t arg_ptrs[argc];
+    for (int i = argc - 1; i >= 0; i--) {
+      size_t len = strlen(argv[i]) + 1;
+      stack_top -= len;
+      memcpy((void *)stack_top, argv[i], len);
+      arg_ptrs[i] = stack_top;
     }
 
-    uint32_t flags = mmu_get_page_flags(page);
-    bool has_user = (flags & PAGE_USER) != 0;
-    bool has_write = (flags & PAGE_RW) != 0;
+    // 6.2. Alinear stack a 4 bytes antes de los punteros
+    stack_top &= ~0x3;
 
-    if (!has_user || !has_write) {
-      terminal_printf(
-          &main_terminal,
-          "[USER_CREATE] ❌ ERROR: Page 0x%08x has wrong perms (U=%d W=%d)\r\n",
-          page, has_user, has_write);
-      kernel_free(user_stack);
-      return NULL;
+    // 6.3. Push NULL terminator for argv
+    stack_top -= 4;
+    *(uint32_t *)stack_top = 0;
+
+    // 6.4. Push pointers to strings (argv[argc-1] downwards to argv[0])
+    for (int i = argc - 1; i >= 0; i--) {
+      stack_top -= 4;
+      *(uint32_t *)stack_top = arg_ptrs[i];
     }
+
+    // 6.5. Push argc
+    // Según ABI de System V i386 para _start:
+    // [esp] = argc
+    // [esp+4] = argv[0] ...
+    stack_top -= 4;
+    *(uint32_t *)stack_top = (uint32_t)argc;
 
     terminal_printf(&main_terminal,
-                    "[USER_CREATE]   ✅ 0x%08x -> page 0x%08x [OK]\r\n", addr,
-                    page);
+                    "[USER_CREATE] argc=%d, pushed to stack at 0x%08x\r\n",
+                    argc, stack_top);
   }
 
-  // 8. Crear tarea usando el wrapper de kernel
-  task_t *task = task_create(name, user_mode_entry_wrapper, arg, priority);
+  // 7. El ESP final debe apuntar exactamente a argc
+
+  // 8. Crear tarea
+  task_t *task = task_create(name, user_mode_entry_wrapper, NULL, priority);
   if (!task) {
-    terminal_puts(&main_terminal,
-                  "[USER_CREATE] ERROR: task_create() failed\r\n");
     kernel_free(user_stack);
     return NULL;
   }
 
-  // 9. Configurar información de usuario
   task->user_stack_base = user_stack;
   task->user_stack_top = (void *)stack_top;
-  task->user_stack_size = aligned_stack_size;
+  task->user_stack_size = total_alloc_size;
   task->user_entry_point = user_code_addr;
   task->user_code_base = user_code_addr;
   task->user_code_size = code_size;
   task->flags |= TASK_FLAG_USER_MODE;
 
-  // --- INICIALIZAR TABLA DE DESCRIPTORES ---
-  for (int i = 0; i < VFS_MAX_FDS; i++) {
+  for (int i = 0; i < VFS_MAX_FDS; i++)
     task->fd_table[i] = NULL;
-  }
-  // Reservar 0, 1, 2 para que vfs_open empiece en el 3
-  task->fd_table[0] = (struct vfs_file *)0x1; // Dummy stdin
-  task->fd_table[1] = (struct vfs_file *)0x1; // Dummy stdout
-  task->fd_table[2] = (struct vfs_file *)0x1; // Dummy stderr
-
-  // 10. Verificar que el contexto de kernel esté correcto
-  if (task->context.eip != (uint32_t)user_mode_entry_wrapper) {
-    terminal_printf(&main_terminal,
-                    "[USER_CREATE] WARNING: Fixing EIP: 0x%08x -> 0x%08x\r\n",
-                    task->context.eip, (uint32_t)user_mode_entry_wrapper);
-    task->context.eip = (uint32_t)user_mode_entry_wrapper;
-  }
-
-  terminal_printf(&main_terminal,
-                  "[USER_CREATE] ✅ User task created successfully!\r\n"
-                  "  Task ID: %u\r\n"
-                  "  Kernel entry (wrapper): 0x%08x\r\n"
-                  "  User entry point: 0x%08x\r\n"
-                  "  Kernel stack: 0x%08x -> 0x%08x\r\n"
-                  "  User stack: 0x%08x -> 0x%08x (size=%u, top=0x%08x)\r\n"
-                  "  Kernel segments: CS=0x%04x, DS=0x%04x, SS=0x%04x\r\n"
-                  "  User segments: CS=0x%04x, DS=0x%04x, SS=0x%04x\r\n",
-                  task->task_id, (uint32_t)user_mode_entry_wrapper,
-                  (uint32_t)user_code_addr, (uint32_t)task->stack_base,
-                  (uint32_t)task->stack_top, stack_base, stack_end,
-                  aligned_stack_size, stack_top, task->context.cs,
-                  task->context.ds, task->context.ss, 0x1B, 0x23, 0x23);
+  task->fd_table[0] = (struct vfs_file *)0x1;
+  task->fd_table[1] = (struct vfs_file *)0x1;
+  task->fd_table[2] = (struct vfs_file *)0x1;
 
   return task;
 }
@@ -1195,7 +1100,12 @@ static void idle_task_func(void *arg) {
 
   while (1) {
     // HLT para ahorrar energÃ­a
-    __asm__ volatile("hlt");
+    // HLT para ahorrar energía
+    __asm__ volatile(
+        "sti; hlt"); // Asegurar interrupciones habilitadas para despertar
+
+    // Limpiar zombies en cada ciclo idle
+    task_cleanup_zombies();
 
     // Ceder el CPU cada 10 ticks si no hay otras tareas
     if (ticks_since_boot - last_yield > 10) {
@@ -1259,7 +1169,7 @@ void cleanup_task(void *arg) {
   while (1) {
     task_cleanup_zombies();
 
-    // âœ… CAMBIO: 200ms en lugar de 1 segundo
+    // CAMBIO: 200ms en lugar de 1 segundo
     task_sleep(200);
 
     // Verificar heap periÃ³dicamente

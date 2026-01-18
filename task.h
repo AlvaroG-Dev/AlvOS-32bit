@@ -148,8 +148,9 @@ static bool validate_task_context(task_t *task);
 void cleanup_task(void *arg);
 
 // USER MODE
-task_t *task_create_user(const char *name, void *user_code_addr, void *arg,
-                         uint32_t code_size, task_priority_t priority);
+task_t *task_create_user(const char *name, void *user_code_addr, int argc,
+                         char **argv, uint32_t code_size,
+                         task_priority_t priority);
 void task_setup_user_mode(task_t *task, void (*entry_point)(void *), void *arg,
                           void *user_stack);
 // Macros útiles

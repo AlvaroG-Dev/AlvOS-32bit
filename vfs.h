@@ -24,6 +24,7 @@
 #define VFS_NODE_SYMLINK 3 // Nuevo: enlace simbólico
 #define VFS_NODE_CHRDEV 4  // Nuevo: dispositivo carácter
 #define VFS_NODE_BLKDEV 5  // Nuevo: dispositivo bloque
+#define VFS_NODE_SOCKET 6  // Nuevo: socket de red
 
 /* File flags - EXTENDIDOS */
 #define VFS_O_RDONLY 0x1

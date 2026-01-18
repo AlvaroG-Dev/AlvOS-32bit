@@ -40,22 +40,31 @@ static inline void e1000_write_reg(uint32_t reg, uint32_t value) {
 // ===================================================
 
 static bool e1000_detect_device(void) {
-  terminal_puts(&main_terminal, "[E1000] Searching for Intel E1000 NIC...\r\n");
+  terminal_puts(&main_terminal,
+                "[E1000] Searching for Intel E1000/E1000e NIC...\r\n");
 
-  // Buscar dispositivo E1000 por PCI
-  pci_device_t *device = pci_find_device(0x8086, 0x100E); // Intel 82540EM
-  if (!device) {
-    device = pci_find_device(0x8086, 0x100F); // Intel 82545EM
-  }
-  if (!device) {
-    device = pci_find_device(0x8086, 0x1004); // Intel 82540EP
-  }
-  if (!device) {
-    device = pci_find_device(0x8086, 0x1000); // Intel 82542
+  // Lista de IDs de dispositivos soportados
+  const uint16_t supported_devices[] = {
+      0x100E, 0x100F, 0x1004, 0x1000, 0x1001, 0x1008, 0x100C,
+      0x1015, 0x1017, 0x1016, 0x101E, 0x153B, 0x153A, 0x1559,
+      0x155A, 0x15B8, 0x15B7, 0x10D3, 0x10F6, 0x1502, 0x1503,
+      0x10EA, 0x10EB, 0x10EF, 0x10F0, 0x294C, 0x10BD, 0};
+
+  pci_device_t *device = NULL;
+
+  for (int i = 0; supported_devices[i] != 0; i++) {
+    device = pci_find_device(0x8086, supported_devices[i]);
+    if (device) {
+      terminal_printf(&main_terminal,
+                      "[E1000] Found supported device ID: 0x%04x\r\n",
+                      supported_devices[i]);
+      break;
+    }
   }
 
   if (!device) {
-    terminal_puts(&main_terminal, "[E1000] No Intel E1000 device found\r\n");
+    terminal_puts(&main_terminal,
+                  "[E1000] No supported Intel E1000/E1000e device found\r\n");
     return false;
   }
 
@@ -67,9 +76,16 @@ static bool e1000_detect_device(void) {
     if (device->bars[i].is_valid &&
         device->bars[i].type == PCI_BAR_TYPE_MEMORY) {
       e1000_device.mem_base = device->bars[i].address;
-      terminal_printf(&main_terminal,
-                      "[E1000] MMIO BAR%d: 0x%08x (size: %u)\r\n", i,
-                      e1000_device.mem_base, device->bars[i].size);
+      terminal_printf(
+          &main_terminal, "[E1000] MMIO BAR%d: 0x%08x%08x (size: %u)\r\n", i,
+          (uint32_t)(e1000_device.mem_base >> 32),
+          (uint32_t)(e1000_device.mem_base & 0xFFFFFFFF), device->bars[i].size);
+
+      if (e1000_device.mem_base > 0xFFFFFFFF) {
+        terminal_puts(&main_terminal,
+                      "[E1000] ERROR: BAR is above 4GB, not addressable!\r\n");
+        return false;
+      }
       break;
     }
   }
@@ -86,11 +102,18 @@ static bool e1000_detect_device(void) {
     }
   }
 
+  if (!e1000_device.mem_base && !e1000_device.io_base) {
+    terminal_puts(&main_terminal, "[E1000] ERROR: No valid BARs found!\r\n");
+    return false;
+  }
+
   e1000_device.irq_line = device->interrupt_line;
 
-  // Habilitar Bus Mastering explícitamente (CRÍTICO para DMA)
+  // Habilitar Bus Mastering y Memory Space explícitamente (CRÍTICO)
   pci_enable_bus_mastering(device);
-  terminal_puts(&main_terminal, "[E1000] PCI Bus Mastering ENABLED\r\n");
+  pci_enable_memory_space(device);
+  terminal_puts(&main_terminal,
+                "[E1000] PCI Bus Mastering and Memory Space ENABLED\r\n");
 
   return true;
 }
@@ -249,17 +272,77 @@ static void e1000_read_mac(void) {
 static void e1000_reset(void) {
   terminal_puts(&main_terminal, "[E1000] Resetting device...\r\n");
 
-  // Iniciar reset
-  uint32_t ctrl = e1000_read_reg(E1000_REG_CTRL);
-  ctrl |= E1000_CTRL_RST;
-  e1000_write_reg(E1000_REG_CTRL, ctrl);
-
-  // Esperar a que termine el reset
-  while (e1000_read_reg(E1000_REG_CTRL) & E1000_CTRL_RST) {
-    // busy wait
+  // 0. Verificar si podemos leer del dispositivo
+  uint32_t status = e1000_read_reg(E1000_REG_STATUS);
+  if (status == 0xFFFFFFFF) {
+    terminal_puts(&main_terminal, "[E1000] ERROR: Device reads 0xFFFFFFFF. "
+                                  "MMIO mapping might be broken!\r\n");
+    return;
   }
 
-  terminal_puts(&main_terminal, "[E1000] Reset complete\r\n");
+  // 1. MASTER DISABLE (Recomendado por Intel para evitar corrupción de DMA
+  // durante reset)
+  terminal_puts(&main_terminal, "[E1000] Disabling master...\r\n");
+  uint32_t ctrl = e1000_read_reg(E1000_REG_CTRL);
+
+  // Algunos dispositivos modernos necesitan preservar bits o realizar esta
+  // secuencia
+  e1000_write_reg(E1000_REG_CTRL,
+                  ctrl | (1 << 31)); // GIO Master Disable (bit 31)
+
+  // Esperar a que el Master Disable se complete (Status bit 19 se limpia)
+  int master_timeout = 1000;
+  while (master_timeout-- > 0) {
+    if (!(e1000_read_reg(E1000_REG_STATUS) & (1 << 19)))
+      break;
+    for (int i = 0; i < 100; i++)
+      io_wait();
+  }
+
+  if (master_timeout <= 0) {
+    terminal_puts(&main_terminal,
+                  "[E1000] WARNING: Master Disable timeout\r\n");
+  }
+
+  // 2. Iniciar software reset
+  terminal_puts(&main_terminal, "[E1000] Issuing software reset...\r\n");
+  ctrl = e1000_read_reg(E1000_REG_CTRL);
+  e1000_write_reg(E1000_REG_CTRL, ctrl | E1000_CTRL_RST);
+
+  // 3. Esperar a que el hardware limpie el bit RST
+  // Importante: Un delay mínimo de 1-2us es recomendado antes de empezar a leer
+  for (int i = 0; i < 1000; i++)
+    io_wait();
+
+  int timeout = 10000; // 10k iteraciones con delay son más que suficientes
+  while (timeout > 0) {
+    uint32_t current_ctrl = e1000_read_reg(E1000_REG_CTRL);
+
+    // Si la lectura devuelve 0xFFFFFFFF, algo fue muy mal
+    if (current_ctrl == 0xFFFFFFFF) {
+      terminal_puts(&main_terminal,
+                    "[E1000] ERROR: Bus hang detected during reset!\r\n");
+      break;
+    }
+
+    if (!(current_ctrl & E1000_CTRL_RST))
+      break;
+
+    for (int i = 0; i < 50; i++)
+      io_wait(); // Pequeño delay entre lecturas
+    timeout--;
+  }
+
+  if (timeout <= 0) {
+    terminal_puts(&main_terminal,
+                  "[E1000] ERROR: Reset timed out (RST bit stuck)!\r\n");
+  } else {
+    terminal_puts(&main_terminal, "[E1000] Reset complete\r\n");
+  }
+
+  // 4. Esperar un poco más para que la EEPROM se recargue
+  for (int i = 0; i < 5000; i++)
+    io_wait();
 }
 
 static void e1000_init_rx(void) {

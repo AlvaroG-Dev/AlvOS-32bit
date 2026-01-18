@@ -4,7 +4,6 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-
 // Puertos PCI Configuration Space
 #define PCI_CONFIG_ADDRESS 0xCF8
 #define PCI_CONFIG_DATA 0xCFC
@@ -71,7 +70,7 @@
 
 // Estructura para información de BAR
 typedef struct {
-  uint32_t address;
+  uint64_t address;
   uint32_t size;
   uint8_t type; // 0 = memory, 1 = I/O
   bool is_64bit;

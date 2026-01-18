@@ -2426,7 +2426,7 @@ void test_user_mode_simple(void) {
                   user_code_addr);
 
   task_t *user_task =
-      task_create_user("simple_user", (void *)user_code_addr, NULL,
+      task_create_user("simple_user", (void *)user_code_addr, 0, NULL,
                        sizeof(simple_user_code), TASK_PRIORITY_NORMAL);
 
   if (user_task) {
@@ -2737,17 +2737,20 @@ void terminal_execute(Terminal *term, const char *cmd) {
 
   // --- DISPATCHER DE COMANDOS CORREGIDO ---
   if (strcmp(command, "exec") == 0) {
-    const char *program_path = (argc > 1) ? argv[1] : "/home/hello.bin";
-    terminal_printf(term, "exec: Loading program: %s\r\n", program_path);
-
-    // Cargar y ejecutar
-    task_t *task = exec_load_and_run(program_path);
-
-    if (task) {
-      terminal_printf(term, "exec: Program started (PID %u)\r\n",
-                      task->task_id);
+    if (argc < 2) {
+      terminal_puts(term, "Usage: exec <program_path> [args...]\r\n");
     } else {
-      terminal_printf(term, "exec: Failed to load or execute program\r\n");
+      terminal_printf(term, "exec: Loading program: %s\r\n", argv[1]);
+
+      // Cargar y ejecutar con argumentos (saltando 'exec')
+      task_t *task = exec_load_and_run(argc - 1, &argv[1]);
+
+      if (task) {
+        terminal_printf(term, "exec: Program started (PID %u)\r\n",
+                        task->task_id);
+      } else {
+        terminal_printf(term, "exec: Failed to load or execute program\r\n");
+      }
     }
   }
   // Comandos de memoria visuales
@@ -2885,8 +2888,7 @@ void terminal_execute(Terminal *term, const char *cmd) {
     terminal_clear(term);
   } else if (strcmp(command, "modules") == 0) {
     cmd_list_modules(args);
-  }
-  if (strcmp(command, "apic") == 0) {
+  } else if (strcmp(command, "apic") == 0) {
     apic_print_info();
   } else if (strcmp(command, "net-init") == 0) {
     network_stack_init();
@@ -3154,15 +3156,15 @@ void terminal_execute(Terminal *term, const char *cmd) {
     term->bg_color = color;
     set_colors(term->fg_color, term->bg_color);
     terminal_clear(term);
-  } else if (strcmp(cmd, "lspci") == 0) {
+  } else if (strcmp(command, "lspci") == 0) {
     cmd_lspci();
-  } else if (strcmp(cmd, "usert") == 0) {
+  } else if (strcmp(command, "usert") == 0) {
     cmd_test_usermode();
-  } else if (strcmp(cmd, "acpi") == 0) {
+  } else if (strcmp(command, "acpi") == 0) {
     cmd_acpi_info();
-  } else if (strcmp(cmd, "reboot") == 0) {
+  } else if (strcmp(command, "reboot") == 0) {
     cmd_reboot();
-  } else if (strcmp(cmd, "suspend") == 0) {
+  } else if (strcmp(command, "suspend") == 0) {
     cmd_suspend();
   } else if (strcmp(command, "heap") == 0) {
     size_t libre = heap_available();
@@ -3187,7 +3189,7 @@ void terminal_execute(Terminal *term, const char *cmd) {
     } else {
       cmd_disk_info(term, args);
     }
-  } else if (strcmp(cmd, "lsblk") == 0) {
+  } else if (strcmp(command, "lsblk") == 0) {
     cmd_lsblk();
   } else if (strcmp(command, "format") == 0) {
     int result = fat32_format(&main_disk, "MYOS_DISK");
@@ -3232,8 +3234,7 @@ void terminal_execute(Terminal *term, const char *cmd) {
     uint32_t freq_mhz = (uint32_t)(cycles_per_second / 1000000ULL);
 
     terminal_printf(&main_terminal, "Estimated CPU freq: %u MHz\r\n", freq_mhz);
-  }
-  if (strcmp(command, "tasks") == 0) {
+  } else if (strcmp(command, "tasks") == 0) {
     task_list_all();
   } else if (strcmp(command, "task_state") == 0) {
     show_system_stats();
@@ -3712,28 +3713,6 @@ void terminal_execute(Terminal *term, const char *cmd) {
 
     terminal_printf(term, "mkdir: Created directory %s\r\n", full_path);
     log_message(LOG_INFO, "mkdir created %s\n", full_path);
-  } else if (strcmp(command, "umount") == 0) {
-    if (args[0] == '\0') {
-      terminal_puts(term, "Error: Usage: umount <mountpoint>\r\n");
-      return;
-    }
-
-    // Normalizar el mountpoint
-    char normalized[VFS_PATH_MAX];
-    if (vfs_normalize_path(args, normalized, VFS_PATH_MAX) != VFS_OK) {
-      terminal_printf(term, "umount: Invalid mountpoint path %s\r\n", args);
-      return;
-    }
-
-    // Llamar directamente a vfs_unmount (ya maneja la búsqueda)
-    int ret = vfs_unmount(normalized);
-    if (ret != VFS_OK) {
-      terminal_printf(term, "umount: Failed to unmount %s (error %d)\r\n",
-                      normalized, ret);
-      return;
-    }
-
-    terminal_printf(term, "umount: Successfully unmounted %s\r\n", normalized);
   } else if (strcmp(command, "umount") == 0) {
     if (args[0] == '\0') {
       terminal_puts(term, "Error: Usage: umount <mountpoint>\r\n");

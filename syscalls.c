@@ -131,6 +131,96 @@ int copy_string_to_user(uint32_t user_dst, const char *kernel_src,
   return copy_to_user(user_dst, (void *)kernel_src, len + 1);
 }
 
+// ============================================================================
+// SOCKET ADAPTER (VFS WRAPPER)
+// ============================================================================
+
+// Forward declarations
+static int socket_read(struct vfs_file *f, uint8_t *buf, uint32_t size);
+static int socket_write(struct vfs_file *f, const uint8_t *buf, uint32_t size);
+static int socket_close(struct vfs_file *f);
+static void socket_release(struct vfs_node *node);
+
+static file_ops_t socket_file_ops = {
+    .read = socket_read,
+    .write = socket_write,
+    .close = socket_close,
+};
+
+static vnode_ops_t socket_node_ops = {
+    .release = socket_release,
+    // Otras operaciones pueden ser nulas o default
+};
+
+static int socket_read(struct vfs_file *f, uint8_t *buf, uint32_t size) {
+  int socket_id = (int)f->node->fs_private;
+  return tcp_receive(socket_id, buf, size);
+}
+
+static int socket_write(struct vfs_file *f, const uint8_t *buf, uint32_t size) {
+  int socket_id = (int)f->node->fs_private;
+  int sent = tcp_send(socket_id, buf, size);
+  return (sent >= 0) ? sent : -1;
+}
+
+static int socket_close(struct vfs_file *f) {
+  int socket_id = (int)f->node->fs_private;
+  tcp_close(socket_id);
+  return VFS_OK;
+}
+
+static void socket_release(struct vfs_node *node) {
+  // El socket ya se cerró en file->close, aquí liberamos el nodo dummy
+  if (node) {
+    kernel_free(node);
+  }
+}
+
+// Crea un FD que envuelve un socket TCP
+static int create_socket_fd(int socket_id) {
+  task_t *curr = scheduler.current_task;
+
+  // Buscar FD libre
+  int fd = -1;
+  for (int i = 3; i < VFS_MAX_FDS; i++) {
+    if (curr->fd_table[i] == NULL) {
+      fd = i;
+      break;
+    }
+  }
+
+  if (fd == -1)
+    return -EMFILE;
+
+  // Crear nodo dummy
+  vfs_node_t *node = (vfs_node_t *)kernel_malloc(sizeof(vfs_node_t));
+  if (!node)
+    return -ENOMEM;
+
+  memset(node, 0, sizeof(vfs_node_t));
+  strcpy(node->name, "socket");
+  node->type = VFS_NODE_SOCKET;
+  node->fs_private = (void *)socket_id;
+  node->ops = &socket_node_ops;
+  node->refcount = 1;
+
+  // Crear archivo
+  vfs_file_t *file = (vfs_file_t *)kernel_malloc(sizeof(vfs_file_t));
+  if (!file) {
+    kernel_free(node);
+    return -ENOMEM;
+  }
+
+  memset(file, 0, sizeof(vfs_file_t));
+  file->node = node;
+  file->flags = VFS_O_RDWR;
+  file->ops = &socket_file_ops; // Usar ops de socket
+  file->refcount = 1;
+
+  curr->fd_table[fd] = file;
+  return fd;
+}
+
 // Handler de syscall principal
 void syscall_handler(struct regs *r) {
   uint32_t syscall_num = r->eax;
@@ -657,18 +747,45 @@ void syscall_handler(struct regs *r) {
       break;
     }
     int socket_id = tcp_connect(server_ip, port);
-    result = (socket_id >= 0) ? (uint32_t)socket_id : (uint32_t)-ECONNREFUSED;
+
+    if (socket_id >= 0) {
+      // Envolver en FD
+      int fd = create_socket_fd(socket_id);
+      if (fd >= 0) {
+        result = (uint32_t)fd;
+      } else {
+        tcp_close(socket_id); // Falló crear FD
+        result = (uint32_t)-ENOMEM;
+      }
+    } else {
+      result = (uint32_t)-ECONNREFUSED;
+    }
     break;
   }
 
   case SYSCALL_SEND: {
-    int socket_id = (int)r->ebx;
+    int fd = (int)r->ebx;
     uint32_t buf_ptr = r->ecx;
     uint32_t len = r->edx;
+
     if (!validate_user_pointer(buf_ptr, len)) {
       result = (uint32_t)-EFAULT;
       break;
     }
+
+    // Verificar que sea un socket válido
+    if (!is_valid_fd(fd)) {
+      result = (uint32_t)-EBADF;
+      break;
+    }
+    vfs_file_t *f = scheduler.current_task->fd_table[fd];
+    if (f->node->type != VFS_NODE_SOCKET) {
+      result = (uint32_t)-ENOTSOCK;
+      break;
+    }
+
+    // Usar la lógica de socket_write o llamar directo
+    // Podemos usar f->ops->write directamente!
     uint8_t *kernel_buf = kernel_malloc(len);
     if (!kernel_buf) {
       result = (uint32_t)-ENOMEM;
@@ -679,26 +796,41 @@ void syscall_handler(struct regs *r) {
       result = (uint32_t)-EFAULT;
       break;
     }
-    int sent = tcp_send(socket_id, kernel_buf, len);
+
+    // Llamada directa o via ops
+    int sent = f->ops->write(f, kernel_buf, len);
     kernel_free(kernel_buf);
     result = (sent >= 0) ? (uint32_t)sent : (uint32_t)-EIO;
     break;
   }
 
   case SYSCALL_RECV: {
-    int socket_id = (int)r->ebx;
+    int fd = (int)r->ebx;
     uint32_t buf_ptr = r->ecx;
     uint32_t len = r->edx;
     if (!validate_user_pointer(buf_ptr, len)) {
       result = (uint32_t)-EFAULT;
       break;
     }
+
+    if (!is_valid_fd(fd)) {
+      result = (uint32_t)-EBADF;
+      break;
+    }
+    vfs_file_t *f = scheduler.current_task->fd_table[fd];
+    if (f->node->type != VFS_NODE_SOCKET) {
+      result = (uint32_t)-ENOTSOCK;
+      break;
+    }
+
     uint8_t *kernel_buf = kernel_malloc(len);
     if (!kernel_buf) {
       result = (uint32_t)-ENOMEM;
       break;
     }
-    int received = tcp_receive(socket_id, kernel_buf, len);
+
+    int received = f->ops->read(f, kernel_buf, len);
+
     if (received > 0) {
       if (copy_to_user(buf_ptr, kernel_buf, received) < 0)
         result = (uint32_t)-EFAULT;

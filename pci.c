@@ -88,7 +88,8 @@ void pci_config_write_byte(uint8_t bus, uint8_t device, uint8_t function,
 // FUNCIONES DE ENUMERACIÓN
 // ========================================================================
 void pci_init(void) {
-  if (pci_initialized) return;
+  if (pci_initialized)
+    return;
 
   terminal_puts(&main_terminal, "Initializing PCI subsystem...\r\n");
 

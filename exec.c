@@ -1,13 +1,18 @@
 #include "exec.h"
+#include "elf.h"
 #include "kernel.h"
-#include "log.h"
 #include "memory.h"
-#include "memutils.h"
 #include "mmu.h"
 #include "string.h"
 #include "task.h"
 #include "terminal.h"
 #include "vfs.h"
+
+// Forward declarations
+static bool map_user_pages(uint32_t virt_start, uint32_t size,
+                           const char *region_name);
+static bool copy_code_to_user(const void *kernel_buffer, uint32_t size,
+                              uint32_t user_dest);
 
 // ============================================================================
 // CARGA DE ARCHIVO DESDE DISCO
@@ -131,24 +136,193 @@ static void *load_file_from_disk(const char *path, uint32_t *out_size) {
 // ============================================================================
 
 /**
+ * Verifica si el encabezado ELF es válido para AlvOS (32-bit, Intel 386)
+ */
+static bool elf_check_header(Elf32_Ehdr *header) {
+  if (!header)
+    return false;
+
+  // Verificar número mágico
+  if (header->e_ident[EI_MAG0] != ELFMAG0 ||
+      header->e_ident[EI_MAG1] != ELFMAG1 ||
+      header->e_ident[EI_MAG2] != ELFMAG2 ||
+      header->e_ident[EI_MAG3] != ELFMAG3) {
+    return false;
+  }
+
+  // Verificar que sea 32-bit
+  if (header->e_ident[EI_CLASS] != ELFCLASS32) {
+    terminal_printf(
+        &main_terminal, ANSI_COLOR_RED
+        "[ELF] ERROR: Not a 32-bit executable\r\n" ANSI_COLOR_RESET);
+    return false;
+  }
+
+  // Verificar endianness (Little Endian para x86)
+  if (header->e_ident[EI_DATA] != ELFDATA2LSB) {
+    terminal_printf(&main_terminal, ANSI_COLOR_RED
+                    "[ELF] ERROR: Not little-endian\r\n" ANSI_COLOR_RESET);
+    return false;
+  }
+
+  // Verificar tipo de archivo (Ejecutable o Dinámico/PIE)
+  if (header->e_type != ET_EXEC && header->e_type != ET_DYN) {
+    terminal_printf(&main_terminal,
+                    ANSI_COLOR_RED "[ELF] ERROR: Not a supported executable "
+                                   "type (%d)\r\n" ANSI_COLOR_RESET,
+                    header->e_type);
+    return false;
+  }
+
+  // Verificar arquitectura (Intel 386)
+  if (header->e_machine != EM_386) {
+    terminal_printf(
+        &main_terminal,
+        ANSI_COLOR_RED
+        "[ELF] ERROR: Wrong architecture (machine %d)\r\n" ANSI_COLOR_RESET,
+        header->e_machine);
+    return false;
+  }
+
+  return true;
+}
+
+/**
+ * Aplica relocaciones a un binario ELF cargado en memoria (soporte para PIE)
+ */
+static bool elf_apply_relocations(const void *file_data, uint32_t delta) {
+  if (delta == 0)
+    return true; // No hay nada que relocalizar
+
+  Elf32_Ehdr *header = (Elf32_Ehdr *)file_data;
+  Elf32_Phdr *ph_table = (Elf32_Phdr *)((uint8_t *)file_data + header->e_phoff);
+
+  Elf32_Dyn *dynamic_table = NULL;
+
+  // 1. Buscar el segmento DYNAMIC
+  for (int i = 0; i < header->e_phnum; i++) {
+    if (ph_table[i].p_type == PT_DYNAMIC) {
+      dynamic_table = (Elf32_Dyn *)(uintptr_t)(ph_table[i].p_vaddr + delta);
+      break;
+    }
+  }
+
+  if (!dynamic_table)
+    return true; // No hay tabla dinámica, no hay relocaciones
+
+  terminal_printf(&main_terminal,
+                  ANSI_COLOR_CYAN
+                  "[ELF]" ANSI_COLOR_RESET
+                  " Applying relocations (delta: 0x%08x)...\r\n",
+                  delta);
+
+  Elf32_Rel *rel_table = NULL;
+  uint32_t rel_size = 0;
+  uint32_t rel_ent = 0;
+
+  // 2. Buscar tablas de relocación en la sección dinámica
+  for (Elf32_Dyn *dyn = dynamic_table; dyn->d_tag != DT_NULL; dyn++) {
+    switch (dyn->d_tag) {
+    case DT_REL:
+      rel_table = (Elf32_Rel *)(uintptr_t)(dyn->d_un.d_ptr + delta);
+      break;
+    case DT_RELSZ:
+      rel_size = dyn->d_un.d_val;
+      break;
+    case DT_RELENT:
+      rel_ent = dyn->d_un.d_val;
+      break;
+    }
+  }
+
+  // 3. Aplicar relocaciones de tipo RELATIVE (comunes en PIE)
+  if (rel_table && rel_ent > 0) {
+    uint32_t count = rel_size / rel_ent;
+    for (uint32_t i = 0; i < count; i++) {
+      Elf32_Rel *rel = (Elf32_Rel *)((uint8_t *)rel_table + (i * rel_ent));
+      if (ELF32_R_TYPE(rel->r_info) == R_386_RELATIVE) {
+        uint32_t *addr = (uint32_t *)(uintptr_t)(rel->r_offset + delta);
+        *addr += delta;
+      }
+    }
+  }
+
+  return true;
+}
+
+/**
+ * Carga los segmentos de un archivo ELF en memoria
+ */
+static bool elf_load_segments(const void *data, uint32_t size, uint32_t delta) {
+  Elf32_Ehdr *header = (Elf32_Ehdr *)data;
+  Elf32_Phdr *ph_table = (Elf32_Phdr *)((uint8_t *)data + header->e_phoff);
+
+  terminal_printf(&main_terminal,
+                  ANSI_COLOR_CYAN
+                  "[ELF]" ANSI_COLOR_RESET
+                  " Loading segments (%d total, delta=0x%x)...\r\n",
+                  header->e_phnum, delta);
+
+  for (int i = 0; i < header->e_phnum; i++) {
+    Elf32_Phdr *phdr = &ph_table[i];
+
+    // Solo nos interesan los segmentos cargables (PT_LOAD)
+    if (phdr->p_type != PT_LOAD)
+      continue;
+
+    if (phdr->p_memsz == 0)
+      continue;
+
+    uint32_t vaddr = phdr->p_vaddr + delta;
+
+    terminal_printf(
+        &main_terminal,
+        "  Segment %d: offset=0x%x, vaddr=0x%x, filesz=0x%x, memsz=0x%x\r\n", i,
+        phdr->p_offset, vaddr, phdr->p_filesz, phdr->p_memsz);
+
+    // 1. Mapear la memoria necesaria
+    if (!map_user_pages(vaddr, phdr->p_memsz, "ELF_SEGMENT")) {
+      return false;
+    }
+
+    // 2. Copiar datos del archivo
+    if (phdr->p_filesz > 0) {
+      uint8_t *dest = (uint8_t *)(uintptr_t)vaddr;
+      uint8_t *src = (uint8_t *)data + phdr->p_offset;
+
+      // Verificar que no nos salgamos del buffer de datos
+      if (phdr->p_offset + phdr->p_filesz > size) {
+        terminal_printf(
+            &main_terminal, ANSI_COLOR_RED
+            "[ELF] ERROR: Segment goes beyond file size\r\n" ANSI_COLOR_RESET);
+        return false;
+      }
+
+      memcpy(dest, src, phdr->p_filesz);
+    }
+
+    // 3. Rellenar con ceros si memsz > filesz (BSS)
+    if (phdr->p_memsz > phdr->p_filesz) {
+      uint8_t *bss_start = (uint8_t *)(uintptr_t)vaddr + phdr->p_filesz;
+      uint32_t bss_size = phdr->p_memsz - phdr->p_filesz;
+      memset(bss_start, 0, bss_size);
+    }
+  }
+
+  return true;
+}
+
+/**
  * Intenta detectar la dirección de carga esperada del binario
- * Para binarios planos, devuelve EXEC_CODE_BASE por defecto
  */
 static uint32_t detect_load_address(const void *data, uint32_t size) {
-  if (!data || size < 4) {
+  if (!data || size < sizeof(Elf32_Ehdr)) {
     return EXEC_CODE_BASE;
   }
 
-  const uint8_t *bytes = (const uint8_t *)data;
-
-  // Detectar ELF (futuro)
-  if (size >= 4 && bytes[0] == 0x7F && bytes[1] == 'E' && bytes[2] == 'L' &&
-      bytes[3] == 'F') {
-    terminal_printf(
-        &main_terminal, ANSI_COLOR_YELLOW
-        "[EXEC] ELF format detected (not fully supported yet)" ANSI_COLOR_RESET
-        "\r\n");
-    return EXEC_CODE_BASE; // Por ahora
+  Elf32_Ehdr *header = (Elf32_Ehdr *)data;
+  if (elf_check_header(header)) {
+    return header->e_entry;
   }
 
   // Para binarios planos, usar dirección por defecto
@@ -292,7 +466,7 @@ static bool copy_code_to_user(const void *kernel_buffer, uint32_t size,
 
   // Copiar página por página con verificación
   const uint8_t *src = (const uint8_t *)kernel_buffer;
-  uint8_t *dst = (uint8_t *)user_dest;
+  uint8_t *dst = (uint8_t *)(uintptr_t)user_dest;
 
   for (uint32_t offset = 0; offset < size; offset += PAGE_SIZE) {
     uint32_t page_addr = user_dest + offset;
@@ -320,7 +494,7 @@ static bool copy_code_to_user(const void *kernel_buffer, uint32_t size,
   terminal_printf(&main_terminal, ANSI_COLOR_CYAN
                   "[EXEC]" ANSI_COLOR_RESET " Verifying copied data...\r\n");
 
-  const uint8_t *verify = (const uint8_t *)user_dest;
+  const uint8_t *verify = (const uint8_t *)(uintptr_t)user_dest;
   terminal_printf(&main_terminal,
                   "[EXEC] First 16 bytes at 0x%08x: ", user_dest);
   for (int i = 0; i < 16 && i < size; i++) {
@@ -352,12 +526,14 @@ static bool copy_code_to_user(const void *kernel_buffer, uint32_t size,
 /**
  * Carga un ejecutable desde disco y crea una tarea en modo usuario
  */
-task_t *exec_load_and_run(const char *path) {
-  if (!path) {
+task_t *exec_load_and_run(int argc, char **argv) {
+  if (argc < 1 || !argv || !argv[0]) {
     terminal_printf(&main_terminal, ANSI_COLOR_RED
-                    "[EXEC] ERROR: NULL path" ANSI_COLOR_RESET "\r\n");
+                    "[EXEC] ERROR: Invalid arguments" ANSI_COLOR_RESET "\r\n");
     return NULL;
   }
+
+  const char *path = argv[0];
 
   // ====== ENCABEZADO DEL CARGADOR ======
   terminal_printf(&main_terminal,
@@ -465,43 +641,86 @@ task_t *exec_load_and_run(const char *path) {
     return NULL;
   }
 
-  // ====== PASO 2: Detectar dirección de carga ======
+  // ====== PASO 2: Procesar formato (ELF o Plano) ======
   terminal_printf(&main_terminal,
                   "\r\n" ANSI_COLOR_BLUE "[STEP 2]" ANSI_COLOR_RESET
-                  " Detecting load address...\r\n");
+                  " Processing file format...\r\n");
 
-  uint32_t load_addr = detect_load_address(file_buffer, file_size);
-  uint32_t aligned_size = ALIGN_4KB_UP(file_size);
+  uint32_t entry_point = 0;
+  uint32_t code_size = file_size;
+  uint32_t base_delta = 0;
+  uint32_t load_addr = 0;
+  bool is_elf = false;
 
-  terminal_printf(&main_terminal,
-                  ANSI_COLOR_GREEN
-                  "  Load address:" ANSI_COLOR_RESET
-                  " 0x%08x\r\n" ANSI_COLOR_GREEN "  File size:" ANSI_COLOR_RESET
-                  " %u bytes (aligned: %u bytes, %u pages)\r\n",
-                  load_addr, file_size, aligned_size, aligned_size / PAGE_SIZE);
+  Elf32_Ehdr *header = (Elf32_Ehdr *)file_buffer;
+  if (file_size >= sizeof(Elf32_Ehdr) && elf_check_header(header)) {
+    is_elf = true;
+    terminal_printf(&main_terminal,
+                    ANSI_COLOR_GREEN "  Format: ELF32" ANSI_COLOR_RESET "\r\n");
 
-  // ====== PASO 3: Mapear memoria de código ======
-  terminal_printf(&main_terminal,
-                  "\r\n" ANSI_COLOR_BLUE "[STEP 3]" ANSI_COLOR_RESET
-                  " Mapping code memory...\r\n");
+    // Si es ET_DYN (PIE), podemos elegir cualquier base.
+    if (header->e_type == ET_DYN) {
+      static uint32_t next_auto_base = 0x04000000;
+      base_delta = next_auto_base;
+      next_auto_base += 0x01000000; // Siguiente programa 16MB después
+      terminal_printf(
+          &main_terminal,
+          ANSI_COLOR_YELLOW
+          "  Type: PIE (Relocatable) -> Delta: 0x%08x" ANSI_COLOR_RESET "\r\n",
+          base_delta);
+    }
 
-  if (!map_user_pages(load_addr, aligned_size, "CODE")) {
-    terminal_printf(&main_terminal, ANSI_COLOR_RED
-                    "[EXEC] Failed to map code pages" ANSI_COLOR_RESET "\r\n");
-    kernel_free(file_buffer);
-    return NULL;
-  }
+    entry_point = header->e_entry + base_delta;
 
-  // ====== PASO 4: Copiar código a memoria de usuario ======
-  terminal_printf(&main_terminal,
-                  "\r\n" ANSI_COLOR_BLUE "[STEP 4]" ANSI_COLOR_RESET
-                  " Copying code to user space...\r\n");
+    // 1. Cargar segmentos con el delta aplicado
+    if (!elf_load_segments(file_buffer, file_size, base_delta)) {
+      terminal_printf(&main_terminal, ANSI_COLOR_RED
+                      "[EXEC] Failed to load ELF segments" ANSI_COLOR_RESET
+                      "\r\n");
+      kernel_free(file_buffer);
+      return NULL;
+    }
 
-  if (!copy_code_to_user(file_buffer, file_size, load_addr)) {
-    terminal_printf(&main_terminal, ANSI_COLOR_RED
-                    "[EXEC] Failed to copy code" ANSI_COLOR_RESET "\r\n");
-    kernel_free(file_buffer);
-    return NULL;
+    // 2. Aplicar relocaciones para PIE
+    if (!elf_apply_relocations(file_buffer, base_delta)) {
+      terminal_printf(&main_terminal, ANSI_COLOR_RED
+                      "[EXEC] Failed to apply ELF relocations" ANSI_COLOR_RESET
+                      "\r\n");
+      kernel_free(file_buffer);
+      return NULL;
+    }
+  } else {
+    terminal_printf(&main_terminal, ANSI_COLOR_YELLOW
+                    "  Format: Flat Binary" ANSI_COLOR_RESET "\r\n");
+    load_addr = EXEC_CODE_BASE;
+    entry_point = load_addr;
+
+    // ====== PASO 3: Mapear memoria de código (solo para binarios planos)
+    // ======
+    terminal_printf(&main_terminal,
+                    "\r\n" ANSI_COLOR_BLUE "[STEP 3]" ANSI_COLOR_RESET
+                    " Mapping code memory...\r\n");
+
+    if (!map_user_pages(load_addr, ALIGN_4KB_UP(file_size), "CODE")) {
+      terminal_printf(&main_terminal, ANSI_COLOR_RED
+                      "[EXEC] Failed to map code pages" ANSI_COLOR_RESET
+                      "\r\n");
+      kernel_free(file_buffer);
+      return NULL;
+    }
+
+    // ====== PASO 4: Copiar código a memoria de usuario (solo para binarios
+    // planos) ======
+    terminal_printf(&main_terminal,
+                    "\r\n" ANSI_COLOR_BLUE "[STEP 4]" ANSI_COLOR_RESET
+                    " Copying code to user space...\r\n");
+
+    if (!copy_code_to_user(file_buffer, file_size, load_addr)) {
+      terminal_printf(&main_terminal, ANSI_COLOR_RED
+                      "[EXEC] Failed to copy code" ANSI_COLOR_RESET "\r\n");
+      kernel_free(file_buffer);
+      return NULL;
+    }
   }
 
   // Ya no necesitamos el buffer del kernel
@@ -522,11 +741,11 @@ task_t *exec_load_and_run(const char *path) {
   terminal_printf(&main_terminal,
                   ANSI_COLOR_GREEN "  Entry point:" ANSI_COLOR_RESET
                                    " 0x%08x\r\n",
-                  load_addr);
+                  entry_point);
 
   // Crear tarea usando task_create_user
-  task_t *task = task_create_user(name, (void *)load_addr, NULL, file_size,
-                                  TASK_PRIORITY_NORMAL);
+  task_t *task = task_create_user(name, (void *)(uintptr_t)entry_point, argc,
+                                  argv, code_size, TASK_PRIORITY_NORMAL);
 
   if (!task) {
     terminal_printf(&main_terminal, ANSI_COLOR_RED
@@ -555,11 +774,11 @@ task_t *exec_load_and_run(const char *path) {
                        "    - Code size: %u bytes\r\n"
                        "    - User stack: 0x%08x - 0x%08x (%u bytes)\r\n"
                        "    - Flags: 0x%08x (USER_MODE=%s)\r\n",
-      task->task_id, task->name, (uint32_t)task->user_entry_point,
-      (uint32_t)task->user_code_base, task->user_code_size,
-      (uint32_t)task->user_stack_base, (uint32_t)task->user_stack_top,
-      task->user_stack_size, task->flags,
-      (task->flags & TASK_FLAG_USER_MODE) ? "YES" : "NO");
+      task->task_id, task->name, (uint32_t)(uintptr_t)task->user_entry_point,
+      (uint32_t)(uintptr_t)task->user_code_base, task->user_code_size,
+      (uint32_t)(uintptr_t)task->user_stack_base,
+      (uint32_t)(uintptr_t)task->user_stack_top, task->user_stack_size,
+      task->flags, (task->flags & TASK_FLAG_USER_MODE) ? "YES" : "NO");
 
   // ====== ÉXITO ======
   terminal_printf(&main_terminal,
@@ -586,7 +805,8 @@ void exec_test_program(const char *path) {
                   " %s\r\n\r\n",
                   path);
 
-  task_t *task = exec_load_and_run(path);
+  char *tmp_argv[] = {(char *)path};
+  task_t *task = exec_load_and_run(1, tmp_argv);
 
   if (task) {
     terminal_printf(

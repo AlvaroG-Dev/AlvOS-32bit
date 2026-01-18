@@ -132,7 +132,7 @@ typedef struct {
 // Estructura principal del driver
 typedef struct {
   uint32_t io_base;  // Base I/O
-  uint32_t mem_base; // Base de memoria (si es memory-mapped)
+  uint64_t mem_base; // Base de memoria (si es memory-mapped)
   uint8_t *mem_virt; // Dirección virtual mapeada
   uint8_t irq_line;  // Línea de interrupción
 
