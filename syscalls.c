@@ -1,4 +1,3 @@
-// syscalls.c - VERSIÓN COMPLETA Y CORREGIDA
 #include "syscalls.h"
 #include "dns.h"
 #include "driver_system.h"
@@ -8,6 +7,7 @@
 #include "keyboard.h"
 #include "mmu.h"
 #include "network.h"
+#include "rtc.h"
 #include "string.h"
 #include "task.h"
 #include "tcp.h"
@@ -841,6 +841,21 @@ void syscall_handler(struct regs *r) {
     else
       result = (uint32_t)-EAGAIN;
     kernel_free(kernel_buf);
+    break;
+  }
+
+  case SYSCALL_RTC_GET_DATETIME: {
+    uint32_t buf_ptr = r->ebx;
+    if (!validate_user_pointer(buf_ptr, sizeof(rtc_time_t))) {
+      result = (uint32_t)-EFAULT;
+      break;
+    }
+
+    rtc_time_t time;
+    rtc_get_time(&time);
+    result = (uint32_t)copy_to_user(buf_ptr, &time, sizeof(rtc_time_t));
+    if ((int32_t)result >= 0)
+      result = 0;
     break;
   }
 

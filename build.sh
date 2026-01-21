@@ -103,6 +103,7 @@ compile "dns.c" "$GCC $GCC_OPTS -c dns.c -o build/dns.o"
 compile "tcp.c" "$GCC $GCC_OPTS -c tcp.c -o build/tcp.o"
 compile "http.c" "$GCC $GCC_OPTS -c http.c -o build/http.o"
 compile "network_daemon.c" "$GCC $GCC_OPTS -c network_daemon.c -o build/network_daemon.o"
+compile "rtc.c" "$GCC $GCC_OPTS -c rtc.c -o build/rtc.o"
 
 # Enlazado con linker.ld
 echo -e "${GREEN}Enlazando kernel.bin...${RESET}"
@@ -123,7 +124,7 @@ ld -m elf_i386 -T linker.ld -o build/kernel.bin \
     build/sysfs.o build/devfs.o build/chardev.o build/chardev_vfs.o \
     build/e1000.o build/network.o build/ipv4.o build/arp.o build/network_stack.o \
     build/icmp.o build/udp.o build/dns.o build/tcp.o build/http.o build/network_daemon.o \
-    
+    build/rtc.o
 
 if [ $? -ne 0 ]; then
     echo -e "${RED}Error en el enlazado con linker.ld${RESET}"
@@ -191,16 +192,11 @@ echo "Tamaño del binario: $(stat -c%s hello.bin) bytes"
 # 1. Compilar con -fPIE (Genera código que no depende de direcciones fijas)
 gcc -m32 -march=i386 -fPIE -ffreestanding -c test_pie.c -o test_pie.o
 gcc -m32 -march=i386 -fPIE -ffreestanding -c args_test.c -o args_test.o
-
+gcc -m32 -march=i386 -fPIE -ffreestanding -c rtc_test.c -o rtc_test.o
 # 2. Vincular con -pie (Crea un ejecutable relocalizable)
 ld -m elf_i386 -pie --entry _start test_pie.o -o test_pie.elf
 ld -m elf_i386 -pie --entry _start args_test.o -o args_test.elf
-
-# 3. Preparar directorio home en la ISO
-mkdir -p build/isodir/home
-cp hello.bin build/isodir/home/
-cp test_pie.elf build/isodir/home/
-cp args_test.elf build/isodir/home/
+ld -m elf_i386 -pie --entry _start rtc_test.o -o rtc_test.elf
 
 #dd if=/dev/zero of=~/osdisk/disk.img bs=1M count=1000
 #parted ~/osdisk/disk.img --script mklabel msdos

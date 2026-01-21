@@ -338,7 +338,10 @@ static uint32_t detect_load_address(const void *data, uint32_t size) {
  */
 static bool map_user_pages(uint32_t virt_start, uint32_t size,
                            const char *region_name) {
-  uint32_t aligned_size = ALIGN_4KB_UP(size);
+  uint32_t aligned_virt_start = ALIGN_4KB_DOWN(virt_start);
+  uint32_t end_addr = virt_start + size;
+  uint32_t aligned_end_addr = ALIGN_4KB_UP(end_addr);
+  uint32_t aligned_size = aligned_end_addr - aligned_virt_start;
   uint32_t num_pages = aligned_size / PAGE_SIZE;
 
   terminal_printf(&main_terminal,
@@ -346,11 +349,11 @@ static bool map_user_pages(uint32_t virt_start, uint32_t size,
                   "[EXEC]" ANSI_COLOR_RESET " Mapping %s: " ANSI_COLOR_YELLOW
                   "0x%08x" ANSI_COLOR_RESET " - " ANSI_COLOR_YELLOW
                   "0x%08x" ANSI_COLOR_RESET " (%u pages)\r\n",
-                  region_name, virt_start, virt_start + aligned_size,
-                  num_pages);
+                  region_name, aligned_virt_start,
+                  aligned_virt_start + aligned_size, num_pages);
 
   for (uint32_t i = 0; i < num_pages; i++) {
-    uint32_t virt_addr = virt_start + (i * PAGE_SIZE);
+    uint32_t virt_addr = aligned_virt_start + (i * PAGE_SIZE);
 
     // Si ya está mapeada, verificar permisos
     if (mmu_is_mapped(virt_addr)) {
@@ -408,7 +411,7 @@ static bool map_user_pages(uint32_t virt_start, uint32_t size,
                   region_name);
 
   for (uint32_t i = 0; i < num_pages; i++) {
-    uint32_t virt_addr = virt_start + (i * PAGE_SIZE);
+    uint32_t virt_addr = aligned_virt_start + (i * PAGE_SIZE);
 
     if (!mmu_is_mapped(virt_addr)) {
       terminal_printf(

@@ -21,6 +21,7 @@
 #include "log.h"
 #include "mmu.h"
 #include "module_loader.h"
+#include "mouse.h"
 #include "network.h"
 #include "network_stack.h"
 #include "partition.h"
@@ -389,7 +390,6 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
 
   // 15. Inicializar mouse
   // mouse_init(g_screen_width, g_screen_height);
-  //
 
   // 12. Inicializar multitarea
   serial_write_string(COM1_BASE, "MicroKernel OS\r\n");

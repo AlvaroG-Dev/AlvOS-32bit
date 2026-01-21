@@ -11,7 +11,7 @@
 #define VFS_MAX_FS_TYPES 8
 #define VFS_MAX_MOUNTS 8
 #define VFS_PATH_MAX 256
-#define VFS_NAME_MAX 32
+#define VFS_NAME_MAX 256
 #define SECTOR_SIZE 512
 
 /* Errores */

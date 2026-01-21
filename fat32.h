@@ -188,7 +188,8 @@ int fat32_format_short_name(const uint8_t *fat_name, char *name);
 uint8_t fat32_calculate_checksum(const uint8_t *short_name);
 bool check_fat32_signature(uint8_t *boot_sector);
 int fat32_find_free_dir_entry(fat32_fs_t *fs, uint32_t dir_cluster,
-                              uint32_t *sector, uint32_t *offset);
+                              uint32_t *sector, uint32_t *offset,
+                              int num_entries);
 int fat32_create_dir_entry(fat32_fs_t *fs, uint32_t dir_cluster,
                            const char *name, uint32_t first_cluster,
                            uint32_t size, uint8_t attributes);
