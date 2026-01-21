@@ -2914,8 +2914,12 @@ void terminal_execute(Terminal *term, const char *cmd) {
                       "Example: 192.168.1.100 255.255.255.0 192.168.1.1\r\n");
       }
     } else if (argc == 2 && strcmp(argv[1], "dhcp") == 0) {
-      terminal_puts(term, "DHCP not implemented yet\r\n");
-      terminal_puts(term, "Use: ip set <ip> <mask> <gateway>\r\n");
+      terminal_puts(term, "Starting DHCP...\r\n");
+      if (network_dhcp_request()) {
+        terminal_puts(term, "DHCP request sent. Waiting for response...\r\n");
+      } else {
+        terminal_puts(term, "Failed to start DHCP request.\r\n");
+      }
     } else {
       terminal_puts(term, "Usage:\r\n");
       terminal_puts(term, "  ip                    - Show configuration\r\n");

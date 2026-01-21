@@ -4,8 +4,10 @@
 #include "kernel.h"
 
 #include "network.h"
+#include "serial.h"
 #include "string.h"
 #include "terminal.h"
+
 
 // Configuración IP estática por defecto (VirtualBox NAT friendly)
 // Use 10.0.2.15 for VirtualBox/QEMU NAT default
@@ -60,33 +62,36 @@ bool ip_send_packet(ip_addr_t dest_ip, uint8_t protocol, uint8_t *payload,
   // Copiar payload
   memcpy(packet + sizeof(ip_header_t), payload, payload_len);
 
-  // Determinar dirección MAC destino
-  uint8_t dest_mac[6];
-
-  // Primero verificar si es local o necesita gateway
-  bool is_local = true;
-
-  for (int i = 0; i < 4; i++) {
-    if ((our_ip[i] & netmask[i]) != (dest_ip[i] & netmask[i])) {
-      is_local = false;
-      break;
-    }
-  }
-
-  // CORRECCIÓN: No se puede inicializar array con operador ternario
-  ip_addr_t target_ip;
-  if (is_local) {
-    memcpy(target_ip, dest_ip, 4);
-  } else {
-    memcpy(target_ip, gateway, 4);
-  }
-
   // Resolver ARP para obtener MAC
-  if (!arp_resolve(target_ip, dest_mac, true)) {
-    terminal_printf(&main_terminal,
-                    "[IP] Failed to resolve MAC for %d.%d.%d.%d\r\n",
+  uint8_t dest_mac[6];
+  bool is_broadcast = (dest_ip[0] == 255 && dest_ip[1] == 255 &&
+                       dest_ip[2] == 255 && dest_ip[3] == 255);
+
+  if (is_broadcast) {
+    memset(dest_mac, 0xFF, 6);
+  } else {
+    // Primero verificar si es local o necesita gateway
+    bool is_local = true;
+
+    for (int i = 0; i < 4; i++) {
+      if ((our_ip[i] & netmask[i]) != (dest_ip[i] & netmask[i])) {
+        is_local = false;
+        break;
+      }
+    }
+
+    ip_addr_t target_ip;
+    if (is_local) {
+      memcpy(target_ip, dest_ip, 4);
+    } else {
+      memcpy(target_ip, gateway, 4);
+    }
+
+    if (!arp_resolve(target_ip, dest_mac, true)) {
+      serial_printf(COM1_BASE, "[IP] Failed to resolve MAC for %d.%d.%d.%d\r\n",
                     target_ip[0], target_ip[1], target_ip[2], target_ip[3]);
-    return false;
+      return false;
+    }
   }
 
   // Añadir cabecera Ethernet
@@ -140,12 +145,18 @@ bool ip_process_packet(uint8_t *packet, uint32_t length, ip_addr_t *src_ip,
   ip->header_checksum = 0;
 
   if (ip_checksum(ip, sizeof(ip_header_t)) != received_checksum) {
-    terminal_puts(&main_terminal, "[IP] Bad checksum\r\n");
+    serial_printf(COM1_BASE, "[IP] Bad checksum\r\n");
     return false;
   }
 
-  // Verificar que es para nosotros
-  if (memcmp(ip->dest_ip, our_ip, 4) != 0) {
+  // Verificar que es para nosotros o broadcast
+  bool is_broadcast = (ip->dest_ip[0] == 255 && ip->dest_ip[1] == 255 &&
+                       ip->dest_ip[2] == 255 && ip->dest_ip[3] == 255);
+  bool is_our_ip = (memcmp(ip->dest_ip, our_ip, 4) == 0);
+  bool is_any_ip =
+      (our_ip[0] == 0 && our_ip[1] == 0 && our_ip[2] == 0 && our_ip[3] == 0);
+
+  if (!is_our_ip && !is_broadcast && !is_any_ip) {
     // No es para nosotros
     return false;
   }

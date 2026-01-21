@@ -44,6 +44,7 @@ uint32_t network_receive_ip_packet(uint8_t *buffer, uint32_t max_len,
 
 // Funciones de configuración
 void network_set_static_ip(ip_addr_t ip, ip_addr_t netmask, ip_addr_t gateway);
+void network_apply_config(const network_config_t *config);
 bool network_dhcp_request(void);
 void network_get_config(network_config_t *config);
 void network_print_config(void);

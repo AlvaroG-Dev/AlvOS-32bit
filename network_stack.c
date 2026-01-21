@@ -1,6 +1,7 @@
 
 #include "network_stack.h"
 #include "arp.h"
+#include "dhcp.h"
 #include "dns.h"
 #include "e1000.h"
 #include "icmp.h"
@@ -9,16 +10,18 @@
 #include "kernel.h"
 #include "network.h"
 #include "network_daemon.h"
+#include "serial.h"
 #include "string.h"
 #include "task.h"
 #include "tcp.h"
 #include "terminal.h"
 #include "udp.h"
 
+
 static network_config_t net_config;
 
 void network_stack_init(void) {
-  terminal_puts(&main_terminal, "\r\n=== Network Stack Initialization ===\r\n");
+  serial_printf(COM1_BASE, "\r\n=== Network Stack Initialization ===\r\n");
 
   // Inicializar configuración por defecto
   memcpy(net_config.ip_address, DEFAULT_IP_ADDR, 4);
@@ -33,22 +36,26 @@ void network_stack_init(void) {
   // Inicializar subsistemas
   arp_init();
   udp_init();
-  tcp_init(); // Added TCP init
+  dhcp_init(); // Initialize DHCP subsystem
+  tcp_init();  // Added TCP init
   dns_init();
 
-  // Configurar IP
+  // Configurar IP inicial
   ip_set_address(net_config.ip_address, net_config.netmask, net_config.gateway);
 
   net_config.state = NET_STATE_IP_CONFIGURED;
 
-  terminal_puts(&main_terminal, "[NET] Network stack initialized\r\n");
-  network_print_config();
+  serial_printf(COM1_BASE, "[NET] Network stack initialized\r\n");
+  // network_print_config();
+
+  // Iniciar solicitud DHCP automáticamente
+  terminal_puts(&main_terminal, "[NET] Starting automatic DHCP...\r\n");
+  network_dhcp_request();
 
   // Iniciar daemon de red para procesamiento asíncrono de paquetes
   if (scheduler.scheduler_enabled) {
     if (network_daemon_start()) {
-      terminal_puts(&main_terminal,
-                    "[NET] Network daemon started successfully\r\n");
+      serial_printf(COM1_BASE, "[NET] Network daemon started successfully\r\n");
     } else {
       terminal_puts(&main_terminal,
                     "[NET] Warning: Failed to start network daemon\r\n");
@@ -83,7 +90,9 @@ void network_stack_tick(void) {
         ip_addr_t src_ip;
         uint8_t protocol;
 
-        // CORRECCIÓN: Convertir endianness
+        // terminal_printf(&main_terminal, "[NET] IP Packet received, len
+        // %u\r\n", length);
+
         if (ip_process_packet(buffer, length, &src_ip, &protocol)) {
           // Determinar protocolo de capa 4
           uint8_t *ip_payload = buffer + sizeof(ethernet_header_t) + 20;
@@ -118,6 +127,7 @@ void network_stack_tick(void) {
     }
   }
   tcp_maintenance();
+  dhcp_tick(); // Allow DHCP to handle timeouts
   // Limpiar cache ARP periódicamente (cada 60 segundos)
   if (ticks_since_boot - last_arp_cleanup >
       6000) { // 6000 ticks = 60 segundos a 100Hz
@@ -142,6 +152,27 @@ void network_set_static_ip(ip_addr_t ip, ip_addr_t netmask, ip_addr_t gateway) {
   ip_set_address(ip, netmask, gateway);
   net_config.state = NET_STATE_IP_CONFIGURED;
   net_config.dhcp_enabled = false;
+}
+
+// Iniciar solicitud DHCP
+bool network_dhcp_request(void) {
+  net_config.dhcp_enabled = true;
+  net_config.state = NET_STATE_DHCP_REQUESTING;
+
+  // Set IP to 0.0.0.0 to allow DHCP to work correctly
+  ip_addr_t null_ip = {0, 0, 0, 0};
+  ip_set_address(null_ip, null_ip, null_ip);
+
+  return dhcp_start();
+}
+
+// Aplicar configuración
+void network_apply_config(const network_config_t *config) {
+  if (config) {
+    memcpy(&net_config, config, sizeof(network_config_t));
+    ip_set_address(net_config.ip_address, net_config.netmask,
+                   net_config.gateway);
+  }
 }
 
 // Obtener configuración

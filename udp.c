@@ -107,6 +107,11 @@ void udp_input(uint8_t *packet, uint32_t length, ip_addr_t src_ip) {
   uint16_t src_port = ntohs(udp->src_port);
   uint16_t udp_len = ntohs(udp->length);
 
+  if (dest_port == 68) {
+    // terminal_printf(&main_terminal, "[UDP] Packet for 68 arrived! Len:
+    // %u\r\n", length);
+  }
+
   // Validar longitud real
   if (length < udp_len) {
     // Paquete truncado

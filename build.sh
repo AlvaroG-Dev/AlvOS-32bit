@@ -99,6 +99,7 @@ compile "arp.c" "$GCC $GCC_OPTS -c arp.c -o build/arp.o"
 compile "network_stack.c" "$GCC $GCC_OPTS -c network_stack.c -o build/network_stack.o"
 compile "icmp.c" "$GCC $GCC_OPTS -c icmp.c -o build/icmp.o"
 compile "udp.c" "$GCC $GCC_OPTS -c udp.c -o build/udp.o"
+compile "dhcp.c" "$GCC $GCC_OPTS -c dhcp.c -o build/dhcp.o"
 compile "dns.c" "$GCC $GCC_OPTS -c dns.c -o build/dns.o"
 compile "tcp.c" "$GCC $GCC_OPTS -c tcp.c -o build/tcp.o"
 compile "http.c" "$GCC $GCC_OPTS -c http.c -o build/http.o"
@@ -123,7 +124,7 @@ ld -m elf_i386 -T linker.ld -o build/kernel.bin \
     build/text_editor.o build/syscalls.o build/syscall_asm.o build/exec.o \
     build/sysfs.o build/devfs.o build/chardev.o build/chardev_vfs.o \
     build/e1000.o build/network.o build/ipv4.o build/arp.o build/network_stack.o \
-    build/icmp.o build/udp.o build/dns.o build/tcp.o build/http.o build/network_daemon.o \
+    build/icmp.o build/udp.o build/dhcp.o build/dns.o build/tcp.o build/http.o build/network_daemon.o \
     build/rtc.o
 
 if [ $? -ne 0 ]; then
@@ -174,29 +175,6 @@ if [ $? -ne 0 ]; then
 fi
 
 echo -e "${BLUE}Creacion de ISO completadas con exito!${RESET}"
-
-echo "Compilando programa de prueba..."
-rm hello.bin hello.o
-
-# 1. Primero, compila el objeto
-i386-elf-gcc -m32 -ffreestanding -nostdlib -fno-pie -fno-stack-protector \
-    -O0 -Wall -Wextra -c hello.c -o hello.o
-
-# 2. Luego enlázalo como binario plano
-ld -m elf_i386 -Ttext 0x0 --oformat binary -e _start \
-    hello.o -o hello.bin
-
-# 3. (OPCIONAL) Verificar el binario resultante
-echo "Tamaño del binario: $(stat -c%s hello.bin) bytes"
-
-# 1. Compilar con -fPIE (Genera código que no depende de direcciones fijas)
-gcc -m32 -march=i386 -fPIE -ffreestanding -c test_pie.c -o test_pie.o
-gcc -m32 -march=i386 -fPIE -ffreestanding -c args_test.c -o args_test.o
-gcc -m32 -march=i386 -fPIE -ffreestanding -c rtc_test.c -o rtc_test.o
-# 2. Vincular con -pie (Crea un ejecutable relocalizable)
-ld -m elf_i386 -pie --entry _start test_pie.o -o test_pie.elf
-ld -m elf_i386 -pie --entry _start args_test.o -o args_test.elf
-ld -m elf_i386 -pie --entry _start rtc_test.o -o rtc_test.elf
 
 #dd if=/dev/zero of=~/osdisk/disk.img bs=1M count=1000
 #parted ~/osdisk/disk.img --script mklabel msdos

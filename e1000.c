@@ -40,7 +40,7 @@ static inline void e1000_write_reg(uint32_t reg, uint32_t value) {
 // ===================================================
 
 static bool e1000_detect_device(void) {
-  terminal_puts(&main_terminal,
+  serial_printf(COM1_BASE,
                 "[E1000] Searching for Intel E1000/E1000e NIC...\r\n");
 
   // Lista de IDs de dispositivos soportados
@@ -55,31 +55,30 @@ static bool e1000_detect_device(void) {
   for (int i = 0; supported_devices[i] != 0; i++) {
     device = pci_find_device(0x8086, supported_devices[i]);
     if (device) {
-      terminal_printf(&main_terminal,
-                      "[E1000] Found supported device ID: 0x%04x\r\n",
-                      supported_devices[i]);
+      serial_printf(COM1_BASE, "[E1000] Found supported device ID: 0x%04x\r\n",
+                    supported_devices[i]);
       break;
     }
   }
 
   if (!device) {
-    terminal_puts(&main_terminal,
+    serial_printf(COM1_BASE,
                   "[E1000] No supported Intel E1000/E1000e device found\r\n");
     return false;
   }
 
-  terminal_printf(&main_terminal, "[E1000] Found device at %02x:%02x.%x\r\n",
-                  device->bus, device->device, device->function);
+  serial_printf(COM1_BASE, "[E1000] Found device at %02x:%02x.%x\r\n",
+                device->bus, device->device, device->function);
 
   // Obtener BAR0 (normalmente memoria MMIO)
   for (int i = 0; i < 6; i++) {
     if (device->bars[i].is_valid &&
         device->bars[i].type == PCI_BAR_TYPE_MEMORY) {
       e1000_device.mem_base = device->bars[i].address;
-      terminal_printf(
-          &main_terminal, "[E1000] MMIO BAR%d: 0x%08x%08x (size: %u)\r\n", i,
-          (uint32_t)(e1000_device.mem_base >> 32),
-          (uint32_t)(e1000_device.mem_base & 0xFFFFFFFF), device->bars[i].size);
+      serial_printf(COM1_BASE, "[E1000] MMIO BAR%d: 0x%08x%08x (size: %u)\r\n",
+                    i, (uint32_t)(e1000_device.mem_base >> 32),
+                    (uint32_t)(e1000_device.mem_base & 0xFFFFFFFF),
+                    device->bars[i].size);
 
       if (e1000_device.mem_base > 0xFFFFFFFF) {
         terminal_puts(&main_terminal,
@@ -95,8 +94,8 @@ static bool e1000_detect_device(void) {
     for (int i = 0; i < 6; i++) {
       if (device->bars[i].is_valid && device->bars[i].type == PCI_BAR_TYPE_IO) {
         e1000_device.io_base = device->bars[i].address;
-        terminal_printf(&main_terminal, "[E1000] I/O BAR%d: 0x%08x\r\n", i,
-                        e1000_device.io_base);
+        serial_printf(COM1_BASE, "[E1000] I/O BAR%d: 0x%08x\r\n", i,
+                      e1000_device.io_base);
         break;
       }
     }
@@ -112,7 +111,7 @@ static bool e1000_detect_device(void) {
   // Habilitar Bus Mastering y Memory Space explícitamente (CRÍTICO)
   pci_enable_bus_mastering(device);
   pci_enable_memory_space(device);
-  terminal_puts(&main_terminal,
+  serial_printf(COM1_BASE,
                 "[E1000] PCI Bus Mastering and Memory Space ENABLED\r\n");
 
   return true;
@@ -123,8 +122,8 @@ static bool e1000_map_memory(void) {
     return false;
   }
 
-  terminal_printf(&main_terminal, "[E1000] Mapping MMIO at phys=0x%08x\r\n",
-                  e1000_device.mem_base);
+  serial_printf(COM1_BASE, "[E1000] Mapping MMIO at phys=0x%08x\r\n",
+                e1000_device.mem_base);
 
   // IMPORTANTE: Los dispositivos PCI pueden necesitar espacio no cacheable
   // Usar 0xF0000000 como base virtual para dispositivos PCI
@@ -134,8 +133,8 @@ static bool e1000_map_memory(void) {
   if (mmu_is_mapped(virt_addr)) {
     // Ya está mapeado, usar esa dirección
     e1000_device.mem_virt = (uint8_t *)virt_addr;
-    terminal_printf(&main_terminal, "[E1000] Already mapped at virt=0x%08x\r\n",
-                    virt_addr);
+    serial_printf(COM1_BASE, "[E1000] Already mapped at virt=0x%08x\r\n",
+                  virt_addr);
     return true;
   }
 
@@ -143,7 +142,7 @@ static bool e1000_map_memory(void) {
   // Mapear solo 4KB primero para probar
   if (!mmu_map_page(virt_addr, e1000_device.mem_base,
                     PAGE_PRESENT | PAGE_RW | PAGE_CACHE_DISABLE)) {
-    terminal_puts(&main_terminal, "[E1000] Failed to map first page\r\n");
+    serial_printf(COM1_BASE, "[E1000] Failed to map first page\r\n");
 
     // Intentar con una dirección virtual diferente
     virt_addr = 0xF0100000;
@@ -163,8 +162,7 @@ static bool e1000_map_memory(void) {
 
     if (!mmu_map_page(page_virt, page_phys,
                       PAGE_PRESENT | PAGE_RW | PAGE_CACHE_DISABLE)) {
-      terminal_printf(&main_terminal,
-                      "[E1000] Warning: Failed to map page %u\r\n", i);
+      serial_printf(COM1_BASE, "[E1000] Warning: Failed to map page %u\r\n", i);
       // Continuar con menos páginas
       break;
     }
@@ -175,9 +173,9 @@ static bool e1000_map_memory(void) {
   // Flushear TLB
   __asm__ volatile("movl %%cr3, %%eax; movl %%eax, %%cr3" ::: "eax");
 
-  terminal_printf(&main_terminal,
-                  "[E1000] MMIO mapped: phys=0x%08x -> virt=0x%08x\r\n",
-                  e1000_device.mem_base, virt_addr);
+  serial_printf(COM1_BASE,
+                "[E1000] MMIO mapped: phys=0x%08x -> virt=0x%08x\r\n",
+                e1000_device.mem_base, virt_addr);
 
   return true;
 }
@@ -243,9 +241,8 @@ static bool e1000_alloc_buffers(void) {
     }
   }
 
-  terminal_printf(&main_terminal,
-                  "[E1000] Allocated %d TX and %d RX descriptors\r\n",
-                  E1000_NUM_TX_DESC, E1000_NUM_RX_DESC);
+  serial_printf(COM1_BASE, "[E1000] Allocated %d TX and %d RX descriptors\r\n",
+                E1000_NUM_TX_DESC, E1000_NUM_RX_DESC);
 
   return true;
 }
@@ -262,15 +259,15 @@ static void e1000_read_mac(void) {
   e1000_device.mac_addr[4] = (mac_high >> 0) & 0xFF;
   e1000_device.mac_addr[5] = (mac_high >> 8) & 0xFF;
 
-  terminal_printf(&main_terminal,
-                  "[E1000] MAC address: %02x:%02x:%02x:%02x:%02x:%02x\r\n",
-                  e1000_device.mac_addr[0], e1000_device.mac_addr[1],
-                  e1000_device.mac_addr[2], e1000_device.mac_addr[3],
-                  e1000_device.mac_addr[4], e1000_device.mac_addr[5]);
+  serial_printf(COM1_BASE,
+                "[E1000] MAC address: %02x:%02x:%02x:%02x:%02x:%02x\r\n",
+                e1000_device.mac_addr[0], e1000_device.mac_addr[1],
+                e1000_device.mac_addr[2], e1000_device.mac_addr[3],
+                e1000_device.mac_addr[4], e1000_device.mac_addr[5]);
 }
 
 static void e1000_reset(void) {
-  terminal_puts(&main_terminal, "[E1000] Resetting device...\r\n");
+  serial_printf(COM1_BASE, "[E1000] Resetting device...\r\n");
 
   // 0. Verificar si podemos leer del dispositivo
   uint32_t status = e1000_read_reg(E1000_REG_STATUS);
@@ -282,7 +279,7 @@ static void e1000_reset(void) {
 
   // 1. MASTER DISABLE (Recomendado por Intel para evitar corrupción de DMA
   // durante reset)
-  terminal_puts(&main_terminal, "[E1000] Disabling master...\r\n");
+  serial_printf(COM1_BASE, "[E1000] Disabling master...\r\n");
   uint32_t ctrl = e1000_read_reg(E1000_REG_CTRL);
 
   // Algunos dispositivos modernos necesitan preservar bits o realizar esta
@@ -305,7 +302,7 @@ static void e1000_reset(void) {
   }
 
   // 2. Iniciar software reset
-  terminal_puts(&main_terminal, "[E1000] Issuing software reset...\r\n");
+  serial_printf(COM1_BASE, "[E1000] Issuing software reset...\r\n");
   ctrl = e1000_read_reg(E1000_REG_CTRL);
   e1000_write_reg(E1000_REG_CTRL, ctrl | E1000_CTRL_RST);
 
@@ -337,7 +334,7 @@ static void e1000_reset(void) {
     terminal_puts(&main_terminal,
                   "[E1000] ERROR: Reset timed out (RST bit stuck)!\r\n");
   } else {
-    terminal_puts(&main_terminal, "[E1000] Reset complete\r\n");
+    serial_printf(COM1_BASE, "[E1000] Reset complete\r\n");
   }
 
   // 4. Esperar un poco más para que la EEPROM se recargue
@@ -346,7 +343,7 @@ static void e1000_reset(void) {
 }
 
 static void e1000_init_rx(void) {
-  terminal_puts(&main_terminal, "[E1000] Initializing receive...\r\n");
+  serial_printf(COM1_BASE, "[E1000] Initializing receive...\r\n");
 
   // Configurar receive descriptor ring
   uint32_t rx_desc_phys = (uint32_t)e1000_device.rx_descs;
@@ -380,11 +377,11 @@ static void e1000_init_rx(void) {
 
   e1000_write_reg(E1000_REG_RCTL, rctl);
 
-  terminal_puts(&main_terminal, "[E1000] Receive initialized\r\n");
+  serial_printf(COM1_BASE, "[E1000] Receive initialized\r\n");
 }
 
 static void e1000_init_tx(void) {
-  terminal_puts(&main_terminal, "[E1000] Initializing transmit...\r\n");
+  serial_printf(COM1_BASE, "[E1000] Initializing transmit...\r\n");
 
   // 1. Resetear transmisión primero
   uint32_t tctl = e1000_read_reg(E1000_REG_TCTL);
@@ -452,10 +449,10 @@ static void e1000_init_tx(void) {
   uint32_t tdh = e1000_read_reg(E1000_REG_TDH);
   uint32_t tdt = e1000_read_reg(E1000_REG_TDT);
 
-  terminal_printf(&main_terminal, "[E1000] TX initialized: TDH=%u, TDT=%u\r\n",
-                  tdh, tdt);
-  terminal_printf(&main_terminal, "[E1000] TX descriptors at phys=0x%08x\r\n",
-                  tx_desc_phys);
+  serial_printf(COM1_BASE, "[E1000] TX initialized: TDH=%u, TDT=%u\r\n", tdh,
+                tdt);
+  serial_printf(COM1_BASE, "[E1000] TX descriptors at phys=0x%08x\r\n",
+                tx_desc_phys);
 }
 
 static void e1000_enable_interrupts(void) {
@@ -475,12 +472,11 @@ static void e1000_enable_interrupts(void) {
   // Disable interrupts for polling mode stability
   e1000_write_reg(E1000_REG_IMC, 0xFFFFFFFF);
 
-  terminal_printf(&main_terminal,
-                  "[E1000] Interrupts DISABLED (Polling mode)\r\n");
+  serial_printf(COM1_BASE, "[E1000] Interrupts DISABLED (Polling mode)\r\n");
 }
 
 bool e1000_init(void) {
-  terminal_puts(&main_terminal, "\r\n=== Intel E1000 Network Driver ===\r\n");
+  serial_printf(COM1_BASE, "\r\n=== Intel E1000 Network Driver ===\r\n");
 
   // 1. Detectar dispositivo
   if (!e1000_detect_device()) {
@@ -523,14 +519,14 @@ bool e1000_init(void) {
   uint32_t status = e1000_read_reg(E1000_REG_STATUS);
   e1000_device.link_up = (status & 0x02) ? true : false;
 
-  terminal_printf(&main_terminal, "[E1000] Link status: %s\r\n",
-                  e1000_device.link_up ? "UP" : "DOWN");
+  serial_printf(COM1_BASE, "[E1000] Link status: %s\r\n",
+                e1000_device.link_up ? "UP" : "DOWN");
 
   e1000_device.initialized = true;
   e1000_device.tx_packets = 0;
   e1000_device.rx_packets = 0;
 
-  terminal_puts(&main_terminal, "[E1000] Driver initialized successfully!\r\n");
+  serial_printf(COM1_BASE, "[E1000] Driver initialized successfully!\r\n");
 
   return true;
 }

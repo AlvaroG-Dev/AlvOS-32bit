@@ -6,8 +6,10 @@
 #include "network_stack.h"
 
 #include "network.h"
+#include "serial.h"
 #include "string.h"
 #include "terminal.h"
+
 
 // Increased cache size to prevent thrashing in bridged networks
 #define ARP_CACHE_SIZE 64
@@ -78,11 +80,11 @@ void arp_init(void) {
       }
     }
 
-    terminal_puts(&main_terminal, "[ARP] QEMU environment detected: Gateway "
-                                  "10.0.2.2 -> broadcast MAC\r\n");
+    serial_printf(COM1_BASE, "[ARP] QEMU environment detected: Gateway "
+                             "10.0.2.2 -> broadcast MAC\r\n");
   }
 
-  terminal_puts(&main_terminal, "[ARP] Cache initialized\r\n");
+  serial_printf(COM1_BASE, "[ARP] Cache initialized\r\n");
 }
 
 // Buscar MAC por IP
@@ -107,8 +109,8 @@ void arp_add_entry(ip_addr_t ip, uint8_t *mac) {
       if (memcmp(arp_cache[i].mac, mac, 6) != 0) {
         memcpy(arp_cache[i].mac, mac, 6);
         if (!arp_cache[i].permanent) {
-          terminal_printf(&main_terminal, "[ARP] Updated: %d.%d.%d.%d\r\n",
-                          ip[0], ip[1], ip[2], ip[3]);
+          serial_printf(COM1_BASE, "[ARP] Updated: %d.%d.%d.%d\r\n", ip[0],
+                        ip[1], ip[2], ip[3]);
         }
       }
 
@@ -130,8 +132,8 @@ void arp_add_entry(ip_addr_t ip, uint8_t *mac) {
       arp_cache[i].valid = true;
       arp_cache[i].permanent = false;
 
-      terminal_printf(
-          &main_terminal,
+      serial_printf(
+          COM1_BASE,
           "[ARP] Added: %d.%d.%d.%d -> %02x:%02x:%02x:%02x:%02x:%02x\r\n",
           ip[0], ip[1], ip[2], ip[3], mac[0], mac[1], mac[2], mac[3], mac[4],
           mac[5]);
@@ -152,8 +154,8 @@ void arp_add_entry(ip_addr_t ip, uint8_t *mac) {
     arp_cache[oldest].timestamp = ticks_since_boot;
     arp_cache[oldest].permanent = false;
 
-    terminal_printf(&main_terminal, "[ARP] Replaced old entry: %d.%d.%d.%d\r\n",
-                    ip[0], ip[1], ip[2], ip[3]);
+    serial_printf(COM1_BASE, "[ARP] Replaced old entry: %d.%d.%d.%d\r\n", ip[0],
+                  ip[1], ip[2], ip[3]);
   }
 }
 
@@ -369,8 +371,8 @@ bool arp_resolve(ip_addr_t ip, uint8_t *mac, bool send_request) {
     }
   }
 
-  terminal_printf(&main_terminal, "[ARP] Failed to resolve %d.%d.%d.%d\r\n",
-                  ip[0], ip[1], ip[2], ip[3]);
+  serial_printf(COM1_BASE, "[ARP] Failed to resolve %d.%d.%d.%d\r\n", ip[0],
+                ip[1], ip[2], ip[3]);
   return false;
 }
 
@@ -383,10 +385,9 @@ void arp_cleanup_old_entries(void) {
       uint32_t age = diff / 100; // en segundos
 
       if (age > 300) {
-        terminal_printf(&main_terminal,
-                        "[ARP] Removing stale entry: %d.%d.%d.%d\r\n",
-                        arp_cache[i].ip[0], arp_cache[i].ip[1],
-                        arp_cache[i].ip[2], arp_cache[i].ip[3]);
+        serial_printf(COM1_BASE, "[ARP] Removing stale entry: %d.%d.%d.%d\r\n",
+                      arp_cache[i].ip[0], arp_cache[i].ip[1],
+                      arp_cache[i].ip[2], arp_cache[i].ip[3]);
         arp_cache[i].valid = false;
       }
     }
