@@ -5,6 +5,7 @@
 #include "irq.h"
 #include "kernel.h"
 #include "mmu.h"
+#include "serial.h"
 #include "string.h"
 #include "terminal.h"
 
@@ -111,13 +112,13 @@ bool apic_init(void) {
     uint32_t version = ioapic_read(i, IOAPIC_REG_VERSION);
     apic_info.io_apics[i].max_redirect_entries = ((version >> 16) & 0xFF) + 1;
 
-    terminal_printf(&main_terminal,
-                    "APIC: I/O APIC %u at phys=0x%08x, virt=0x%08x, "
-                    "GSI base=%u, max entries=%u\r\n",
-                    i, apic_info.io_apics[i].base_address,
-                    apic_info.io_apics[i].virtual_address,
-                    apic_info.io_apics[i].gsi_base,
-                    apic_info.io_apics[i].max_redirect_entries);
+    serial_printf(COM1_BASE,
+                  "APIC: I/O APIC %u at phys=0x%08x, virt=0x%08x, "
+                  "GSI base=%u, max entries=%u\r\n",
+                  i, apic_info.io_apics[i].base_address,
+                  apic_info.io_apics[i].virtual_address,
+                  apic_info.io_apics[i].gsi_base,
+                  apic_info.io_apics[i].max_redirect_entries);
   }
 
   // 6. Habilitar Local APIC
@@ -127,16 +128,16 @@ bool apic_init(void) {
   apic_info.lapic_id = lapic_get_id();
   apic_info.lapic_version = lapic_read(LAPIC_VERSION);
 
-  terminal_printf(&main_terminal, "APIC: Local APIC ID=%u, version=0x%08x\r\n",
-                  apic_info.lapic_id, apic_info.lapic_version);
+  serial_printf(COM1_BASE, "APIC: Local APIC ID=%u, version=0x%08x\r\n",
+                apic_info.lapic_id, apic_info.lapic_version);
 
   // 8. Calibrar timer del APIC
   if (apic_info.lapic_enabled) {
     uint32_t ticks_per_ms = lapic_timer_calibrate();
     if (ticks_per_ms > 0) {
       apic_info.timer_ticks_per_ms = ticks_per_ms;
-      terminal_printf(&main_terminal, "APIC: Timer calibrated: %u ticks/ms\r\n",
-                      ticks_per_ms);
+      serial_printf(COM1_BASE, "APIC: Timer calibrated: %u ticks/ms\r\n",
+                    ticks_per_ms);
     }
   }
 
@@ -177,9 +178,9 @@ static bool apic_parse_madt(void) {
 
   apic_info.lapic_base_phys = madt->local_apic_address;
 
-  terminal_printf(&main_terminal,
-                  "APIC: MADT found, Local APIC at 0x%08x, flags=0x%08x\r\n",
-                  madt->local_apic_address, madt->flags);
+  serial_printf(COM1_BASE,
+                "APIC: MADT found, Local APIC at 0x%08x, flags=0x%08x\r\n",
+                madt->local_apic_address, madt->flags);
 
   // Parsear entradas
   uint8_t *entry_ptr = madt->entries;
@@ -202,8 +203,8 @@ static bool apic_parse_madt(void) {
             (lapic->flags & 2) != 0;
         apic_info.local_apic_count++;
 
-        terminal_printf(
-            &main_terminal,
+        serial_printf(
+            COM1_BASE,
             "APIC: Local APIC - Processor=%u, APIC ID=%u, Enabled=%u\r\n",
             lapic->acpi_processor_id, lapic->apic_id, (lapic->flags & 1));
       }
@@ -221,11 +222,10 @@ static bool apic_parse_madt(void) {
             ioapic->global_system_interrupt_base;
         apic_info.io_apic_count++;
 
-        terminal_printf(
-            &main_terminal,
-            "APIC: I/O APIC - ID=%u, Address=0x%08x, GSI Base=%u\r\n",
-            ioapic->io_apic_id, ioapic->io_apic_address,
-            ioapic->global_system_interrupt_base);
+        serial_printf(COM1_BASE,
+                      "APIC: I/O APIC - ID=%u, Address=0x%08x, GSI Base=%u\r\n",
+                      ioapic->io_apic_id, ioapic->io_apic_address,
+                      ioapic->global_system_interrupt_base);
       }
       break;
     }
@@ -244,8 +244,8 @@ static bool apic_parse_madt(void) {
             ((override->flags >> 2) & 0x3) == 0x3;
         apic_info.override_count++;
 
-        terminal_printf(
-            &main_terminal,
+        serial_printf(
+            COM1_BASE,
             "APIC: IRQ Override - Source IRQ=%u -> GSI=%u, flags=0x%04x\r\n",
             override->irq_source, override->global_system_interrupt,
             override->flags);
@@ -568,8 +568,8 @@ void lapic_timer_init(uint32_t frequency_hz) {
     apic_info.timer_ticks_per_ms = calibrated_ticks;
   }
 
-  terminal_printf(&main_terminal, "APIC: Timer ticks per ms: %u\r\n",
-                  apic_info.timer_ticks_per_ms);
+  serial_printf(COM1_BASE, "APIC: Timer ticks per ms: %u\r\n",
+                apic_info.timer_ticks_per_ms);
 
   // ✅ Cálculo correcto para cualquier frecuencia
   uint32_t initial_count;
@@ -606,11 +606,11 @@ void lapic_timer_init(uint32_t frequency_hz) {
   lapic_write(LAPIC_LVT_TIMER, LAPIC_LVT_MASKED);
   lapic_write(LAPIC_TIMER_ICR, 0);
 
-  terminal_printf(&main_terminal,
-                  "APIC: Timer config: ticks/ms=%u, freq=%uHz, "
-                  "initial_count=%u, divisor=%u\r\n",
-                  apic_info.timer_ticks_per_ms, frequency_hz, initial_count,
-                  divisor_config);
+  serial_printf(COM1_BASE,
+                "APIC: Timer config: ticks/ms=%u, freq=%uHz, "
+                "initial_count=%u, divisor=%u\r\n",
+                apic_info.timer_ticks_per_ms, frequency_hz, initial_count,
+                divisor_config);
 
   // ✅ Configurar divisor
   lapic_write(LAPIC_TIMER_DCR, divisor_config);
@@ -632,12 +632,11 @@ void lapic_timer_init(uint32_t frequency_hz) {
   uint32_t icr_check = lapic_read(LAPIC_TIMER_ICR);
   uint32_t ccr_initial = lapic_read(LAPIC_TIMER_CCR);
 
-  terminal_printf(&main_terminal, "APIC: Timer verification:\r\n");
-  terminal_printf(&main_terminal, "  LVT=0x%08x (masked=%d, periodic=%d)\r\n",
-                  lvt_check, (lvt_check & LAPIC_LVT_MASKED) ? 1 : 0,
-                  (lvt_check & LAPIC_LVT_TIMER_PERIODIC) ? 1 : 0);
-  terminal_printf(&main_terminal, "  ICR=%u, CCR=%u\r\n", icr_check,
-                  ccr_initial);
+  serial_printf(COM1_BASE, "APIC: Timer verification:\r\n");
+  serial_printf(COM1_BASE, "  LVT=0x%08x (masked=%d, periodic=%d)\r\n",
+                lvt_check, (lvt_check & LAPIC_LVT_MASKED) ? 1 : 0,
+                (lvt_check & LAPIC_LVT_TIMER_PERIODIC) ? 1 : 0);
+  serial_printf(COM1_BASE, "  ICR=%u, CCR=%u\r\n", icr_check, ccr_initial);
 
   // ✅ Verificación crítica: asegurar que NO esté masked
   if (lvt_check & LAPIC_LVT_MASKED) {

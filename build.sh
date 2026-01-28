@@ -77,6 +77,8 @@ compile "usb_uhci.c" "$GCC $GCC_OPTS -c usb_uhci.c -o build/uhci.o"
 compile "usb_ehci.c" "$GCC $GCC_OPTS -c usb_ehci.c -o build/ehci.o"
 compile "usb_disk_wrapper.c" "$GCC $GCC_OPTS -c usb_disk_wrapper.c -o build/usb_disk_wrapper.o"
 compile "usb_mass_storage.c" "$GCC $GCC_OPTS -c usb_mass_storage.c -o build/usb_mass_storage.o"
+compile "usb_ohci.c" "$GCC $GCC_OPTS -c usb_ohci.c -o build/usb_ohci.o"
+compile "usb_hid.c" "$GCC $GCC_OPTS -c usb_hid.c -o build/usb_hid.o"
 compile "usb_commands.c" "$GCC $GCC_OPTS -c usb_commands.c -o build/usb_commands.o"
 compile "installer.c" "$GCC $GCC_OPTS -c installer.c -o build/installer.o"
 compile "mbr.c" "$GCC $GCC_OPTS -c mbr.c -o build/mbr.o"
@@ -105,6 +107,7 @@ compile "tcp.c" "$GCC $GCC_OPTS -c tcp.c -o build/tcp.o"
 compile "http.c" "$GCC $GCC_OPTS -c http.c -o build/http.o"
 compile "network_daemon.c" "$GCC $GCC_OPTS -c network_daemon.c -o build/network_daemon.o"
 compile "rtc.c" "$GCC $GCC_OPTS -c rtc.c -o build/rtc.o"
+compile "cmd_top.c" "$GCC $GCC_OPTS -c cmd_top.c -o build/cmd_top.o"
 
 # Enlazado con linker.ld
 echo -e "${GREEN}Enlazando kernel.bin...${RESET}"
@@ -118,14 +121,14 @@ ld -m elf_i386 -T linker.ld -o build/kernel.bin \
     build/module_loader.o build/driver_system.o build/ide.o \
     build/pci.o build/acpi.o build/dma.o build/ahci.o build/sata_disk.o \
     build/atapi.o build/usb_core.o build/usb_disk_wrapper.o \
-    build/uhci.o build/usb_mass_storage.o build/ehci.o build/usb_commands.o \
+    build/uhci.o build/usb_mass_storage.o build/usb_ohci.o build/usb_hid.o build/ehci.o build/usb_commands.o \
     build/partition.o build/mbr.o build/installer.o \
     build/mouse.o build/partition_manager.o build/apic.o build/mini_parser.o \
     build/text_editor.o build/syscalls.o build/syscall_asm.o build/exec.o \
     build/sysfs.o build/devfs.o build/chardev.o build/chardev_vfs.o \
     build/e1000.o build/network.o build/ipv4.o build/arp.o build/network_stack.o \
     build/icmp.o build/udp.o build/dhcp.o build/dns.o build/tcp.o build/http.o build/network_daemon.o \
-    build/rtc.o
+    build/rtc.o build/cmd_top.o
 
 if [ $? -ne 0 ]; then
     echo -e "${RED}Error en el enlazado con linker.ld${RESET}"

@@ -4,7 +4,6 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-
 // Comandos del mouse PS/2
 #define MOUSE_CMD_RESET 0xFF
 #define MOUSE_CMD_RESEND 0xFE
@@ -83,6 +82,7 @@ bool mouse_is_pressed(uint8_t button);
 bool mouse_is_released(uint8_t button);
 void mouse_set_cursor_visible(bool visible);
 bool mouse_get_cursor_visible(void);
+void mouse_inject_event(int dx, int dy, uint8_t buttons);
 void mouse_draw_cursor(void);
 void mouse_erase_cursor(void);
 void mouse_process_packet(void);

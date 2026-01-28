@@ -108,6 +108,7 @@ typedef void (*KeyboardCallback)(int key);
 void keyboard_set_handler(KeyboardCallback handler);
 int keyboard_get_char(void);
 int keyboard_wait_char(void);
+void keyboard_inject_scancode(uint8_t scancode);
 
 // Layout management functions
 keyboard_layout_t *keyboard_get_current_layout(void);

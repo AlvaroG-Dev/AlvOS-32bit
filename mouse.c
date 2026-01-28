@@ -118,7 +118,8 @@ static bool mouse_install(void) {
 
 // Inicializar el mouse
 void mouse_init(uint32_t screen_width, uint32_t screen_height) {
-  if (mouse_initialized) return;
+  if (mouse_initialized)
+    return;
 
   memset(&mouse_state, 0, sizeof(mouse_state_t));
 
@@ -248,6 +249,53 @@ void mouse_process_packet(void) {
   }
 
   mouse_state.packet_ready = false;
+}
+
+void mouse_inject_event(int dx, int dy, uint8_t buttons) {
+  if (!mouse_state.enabled)
+    return;
+
+  // Guardar estado anterior
+  mouse_state.last_buttons = mouse_state.buttons;
+  mouse_state.last_x = mouse_state.x;
+  mouse_state.last_y = mouse_state.y;
+
+  // Actualizar botones
+  mouse_state.buttons = buttons;
+
+  // Limitar delta máximo (similar a process_packet)
+  if (dx > 100)
+    dx = 100;
+  if (dx < -100)
+    dx = -100;
+  if (dy > 100)
+    dy = 100;
+  if (dy < -100)
+    dy = -100;
+
+  // Borrar cursor anterior
+  if (mouse_state.cursor_visible) {
+    mouse_erase_cursor();
+  }
+
+  // Actualizar posición
+  mouse_state.x += dx;
+  mouse_state.y += dy;
+
+  // Aplicar límites de pantalla
+  if (mouse_state.x < mouse_state.min_x)
+    mouse_state.x = mouse_state.min_x;
+  if (mouse_state.x > mouse_state.max_x)
+    mouse_state.x = mouse_state.max_x;
+  if (mouse_state.y < mouse_state.min_y)
+    mouse_state.y = mouse_state.min_y;
+  if (mouse_state.y > mouse_state.max_y)
+    mouse_state.y = mouse_state.max_y;
+
+  // Dibujar cursor en nueva posición
+  if (mouse_state.cursor_visible) {
+    mouse_draw_cursor();
+  }
 }
 
 // Dibujar cursor simple

@@ -3,6 +3,7 @@
 #include "dma.h"
 #include "kernel.h"
 #include "memory.h"
+#include "serial.h"
 #include "string.h"
 #include "terminal.h"
 // SATA disk instances
@@ -400,8 +401,8 @@ sata_err_t sata_disk_flush(uint32_t disk_id) {
     return SATA_ERR_NOT_INITIALIZED;
   }
 
-  terminal_printf(&main_terminal, "SATA: Flushing disk %u (port %u)\n", disk_id,
-                  disk->ahci_port);
+  serial_printf(COM1_BASE, "SATA: Flushing disk %u (port %u)\n", disk_id,
+                disk->ahci_port);
 
   // Implementar FLUSH CACHE command si es necesario
   // Por ahora, es un no-op que retorna éxito

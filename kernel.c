@@ -35,6 +35,7 @@
 #include "task_utils.h"
 #include "terminal.h"
 #include "tmpfs.h"
+#include "usb_hid.h"
 #include "vfs.h"
 
 // Global definition of BootInfo.
@@ -324,7 +325,6 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
   vfs_mount("/dev", "devfs", NULL);
   vfs_mount("/ramfs", "tmpfs", NULL);
   vfs_mount("/sys", "sysfs", NULL);
-  vfs_mount("/sys", "sysfs", NULL);
 
   // Intentar montar disco persistente
   bool disk_hardware_initialized = false;
@@ -389,7 +389,7 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
   syscall_init();
 
   // 15. Inicializar mouse
-  // mouse_init(g_screen_width, g_screen_height);
+  mouse_init(g_screen_width, g_screen_height);
 
   // 12. Inicializar multitarea
   serial_write_string(COM1_BASE, "MicroKernel OS\r\n");
@@ -578,7 +578,10 @@ static void main_loop_task(void *arg) {
       last_update = current_time;
     }
     // CRÍTICO: Procesar pila de red
-    network_stack_tick();
+    // network_stack_tick();
+
+    // Poll USB HID (since we don't have proper USB interrupts yet)
+    usb_hid_poll();
 
     // CRÍTICO: Dormir en lugar de yield inmediato
     // Esto permite que otras tareas se ejecuten

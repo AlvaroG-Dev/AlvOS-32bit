@@ -43,7 +43,6 @@ void pic_send_eoi(uint8_t irq) {
 
 void irq_common_handler(struct regs *r) {
   uint8_t irq = r->int_no - 32;
-  terminal_printf(&main_terminal, "IRQ %d received\n", irq);
   pic_send_eoi(irq);
 }
 

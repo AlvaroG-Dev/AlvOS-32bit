@@ -42,6 +42,10 @@ extern vfs_superblock_t *mount_table[VFS_MAX_MOUNTS];
 extern char mount_points[VFS_MAX_MOUNTS][VFS_PATH_MAX];
 extern ahci_controller_t ahci_controller;
 
+// Forward declaration for cmd_top
+void cmd_top(Terminal *term);
+void cmd_stack_debug(Terminal *term);
+
 // Decodifica un color ANSI a color RGB
 uint32_t ansi_to_color(uint8_t ansi_code, uint8_t is_bright) {
   static const uint32_t ansi_colors_basic[16] = {
@@ -2886,6 +2890,10 @@ void terminal_execute(Terminal *term, const char *cmd) {
     terminal_puts(term, "su      - Switch user\r\n");
   } else if (strcmp(command, "clear") == 0) {
     terminal_clear(term);
+  } else if (strcmp(command, "top") == 0) {
+    cmd_top(term);
+  } else if (strcmp(command, "stack-debug") == 0) {
+    cmd_stack_debug(term);
   } else if (strcmp(command, "modules") == 0) {
     cmd_list_modules(args);
   } else if (strcmp(command, "apic") == 0) {

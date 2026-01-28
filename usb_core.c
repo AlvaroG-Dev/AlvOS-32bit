@@ -5,7 +5,12 @@
 #include "string.h"
 #include "terminal.h"
 #include "usb_ehci.h"
+#include "usb_ohci.h"
 #include "usb_uhci.h"
+
+
+#include "usb_hid.h"
+#include "usb_mass_storage.h"
 
 // Global state
 usb_controller_t usb_controllers[USB_MAX_CONTROLLERS];
@@ -28,6 +33,10 @@ bool usb_init(void) {
   memset(usb_controllers, 0, sizeof(usb_controllers));
   usb_controller_count = 0;
   registered_driver_count = 0;
+
+  // Register built-in class drivers
+  usb_hid_register_driver();
+  usb_msc_register_driver();
 
   // Detect USB controllers
   if (!usb_detect_controllers()) {
@@ -110,10 +119,12 @@ usb_controller_t *usb_detect_controllers(void) {
 
     case 0x10:
       ctrl->type = USB_TYPE_OHCI;
-      terminal_printf(
-          &main_terminal,
-          "Found OHCI controller at %02x:%02x.%x (not implemented)\r\n",
-          pci_dev->bus, pci_dev->device, pci_dev->function);
+      terminal_printf(&main_terminal,
+                      "Found OHCI controller at %02x:%02x.%x\r\n", pci_dev->bus,
+                      pci_dev->device, pci_dev->function);
+      if (ohci_init(ctrl)) {
+        usb_controller_count++;
+      }
       break;
 
     case 0x20:

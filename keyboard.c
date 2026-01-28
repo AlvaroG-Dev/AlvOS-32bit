@@ -181,13 +181,11 @@ uint8_t keyboard_get_modifiers(KeyboardState *state) {
          (state->ctrl << 2) | (state->caps_lock << 3) | (state->altgr << 4);
 }
 
-void keyboard_irq_handler() {
+void keyboard_inject_scancode(uint8_t scancode) {
   static uint8_t extended = 0;
-  uint8_t scancode = inb(0x60);
 
   if (scancode == 0xE0) {
     extended = 1;
-    pic_send_eoi(1);
     return;
   }
 
@@ -204,7 +202,11 @@ void keyboard_irq_handler() {
   if (keyboard_callback && key != 0) {
     keyboard_callback(key);
   }
+}
 
+void keyboard_irq_handler() {
+  uint8_t scancode = inb(0x60);
+  keyboard_inject_scancode(scancode);
   pic_send_eoi(1);
 }
 

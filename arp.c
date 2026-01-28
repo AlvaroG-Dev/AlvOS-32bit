@@ -10,7 +10,6 @@
 #include "string.h"
 #include "terminal.h"
 
-
 // Increased cache size to prevent thrashing in bridged networks
 #define ARP_CACHE_SIZE 64
 #define ARP_REQUEST_TIMEOUT 5000 // 5 segundos
@@ -172,13 +171,11 @@ bool arp_send_request(ip_addr_t target_ip) {
   ip_addr_t our_ip;
   ip_get_address(our_ip);
 
-  /* Verbose log disabled to reduce spam
-  terminal_printf(
-      &main_terminal,
+  serial_printf(
+      COM1_BASE,
       "[ARP] Sending request: Who has %d.%d.%d.%d? Tell %d.%d.%d.%d\r\n",
       target_ip[0], target_ip[1], target_ip[2], target_ip[3], our_ip[0],
       our_ip[1], our_ip[2], our_ip[3]);
-  */
 
   // Configurar cabecera Ethernet
   memset(packet, 0xFF, 6);        // Destino: broadcast
@@ -266,9 +263,9 @@ void arp_process_packet(uint8_t *packet, uint32_t length) {
     // Enviar respuesta
     e1000_send_packet(reply, 60);
 
-    terminal_printf(&main_terminal, "[ARP] Sent reply to %d.%d.%d.%d\r\n",
-                    arp->sender_ip[0], arp->sender_ip[1], arp->sender_ip[2],
-                    arp->sender_ip[3]);
+    serial_printf(COM1_BASE, "[ARP] Sent reply to %d.%d.%d.%d\r\n",
+                  arp->sender_ip[0], arp->sender_ip[1], arp->sender_ip[2],
+                  arp->sender_ip[3]);
   }
   // Omit reply logging to avoid spam
 }
@@ -305,8 +302,8 @@ bool arp_resolve(ip_addr_t ip, uint8_t *mac, bool send_request) {
 
         // Verificar si ya se resolvió
         if (arp_lookup(ip, mac)) {
-          // terminal_printf(&main_terminal, "[ARP] Resolved %d.%d.%d.%d\r\n",
-          //                 ip[0], ip[1], ip[2], ip[3]);
+          serial_printf(COM1_BASE, "[ARP] Resolved %d.%d.%d.%d\r\n", ip[0],
+                        ip[1], ip[2], ip[3]);
           return true;
         }
 
