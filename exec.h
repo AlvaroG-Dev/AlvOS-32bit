@@ -4,6 +4,7 @@
 #include "elf.h"
 #include "task.h"
 #include "vfs.h"
+#include <stdbool.h>
 #include <stdint.h>
 
 // Configuración de memoria para ejecutables
@@ -11,6 +12,9 @@
   0x02000000 // 32MB - Evitamos conflicto con Heap del Kernel (1-17MB)
 #define EXEC_STACK_SIZE (16 * 1024)     // 16KB de stack por defecto
 #define EXEC_MAX_SIZE (2 * 1024 * 1024) // 2MB máximo por ejecutable
+
+// Global verbose flag - when false, suppresses debug output from exec functions
+extern bool exec_verbose;
 
 // Información de un ejecutable cargado
 typedef struct {
@@ -23,6 +27,7 @@ typedef struct {
 
 // Funciones públicas
 task_t *exec_load_and_run(int argc, char **argv);
+task_t *exec_run_quiet(int argc, char **argv);
 void exec_test_program(const char *path);
 
 #endif // EXEC_H

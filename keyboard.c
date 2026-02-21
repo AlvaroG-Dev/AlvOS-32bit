@@ -1,13 +1,11 @@
 #include "keyboard.h"
-#include "idt.h"
 #include "io.h"
 #include "irq.h"
-#include "isr.h"
 #include "kernel.h"
 #include "memory.h"
+#include "serial.h"
 #include "string.h"
 #include "terminal.h"
-#include "vfs.h"
 
 extern Terminal main_terminal;
 
@@ -74,6 +72,7 @@ void keyboard_init() {
 
   // Asegurar que el driver está cargado y activo
   get_keyboard_driver();
+  keyboard_clear_buffer();
 }
 
 uint8_t keyboard_read_scancode() {
@@ -196,6 +195,10 @@ void keyboard_inject_scancode(uint8_t scancode) {
     keyboard_buffer[keyboard_buffer_tail] = key;
     keyboard_buffer_tail = (keyboard_buffer_tail + 1) % KEYBOARD_BUFFER_SIZE;
     keyboard_buffer_count++;
+
+    // DEBUG: Ver qué entra al buffer del kernel
+    serial_printf(COM1_BASE, "[KBD_HARDWARE] Injected key: %d ('%c')\r\n", key,
+                  (key >= 32 && key < 127) ? key : '.');
   }
 
   // Call callback with key (including specials)
@@ -205,8 +208,12 @@ void keyboard_inject_scancode(uint8_t scancode) {
 }
 
 void keyboard_irq_handler() {
-  uint8_t scancode = inb(0x60);
-  keyboard_inject_scancode(scancode);
+  // Check status register to ensure data is available
+  uint8_t status = inb(KEYBOARD_STATUS_PORT);
+  if (status & 0x01) {
+    uint8_t scancode = inb(KEYBOARD_DATA_PORT);
+    keyboard_inject_scancode(scancode);
+  }
   pic_send_eoi(1);
 }
 

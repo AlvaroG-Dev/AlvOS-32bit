@@ -20,6 +20,8 @@ static int fs_count = 0;
 /* NUEVO: Tabla de montajes como lista enlazada */
 vfs_mount_info_t *mount_list = NULL;
 int mount_count = 0;
+char vfs_cwd[VFS_PATH_MAX] =
+    "/home"; // Inicializar en /home como pide la terminal
 
 /* Global FD table REMOVED (now in task_t) */
 
@@ -58,59 +60,72 @@ int vfs_normalize_path(const char *input, char *output, size_t output_size) {
   if (!input || !output || output_size < VFS_PATH_MAX)
     return VFS_ERR;
 
-  char temp[VFS_PATH_MAX];
+  char temp[VFS_PATH_MAX * 2]; // Buffer más grande para concatenación
   size_t temp_idx = 0;
 
-  // Start with root
-  temp[0] = '/';
-  temp_idx = 1;
-
-  // Process input path
-  size_t i = 0;
-  while (input[i] == '/')
-    i++; // Skip leading slashes
-  while (i < strlen(input) && temp_idx < VFS_PATH_MAX - 1) {
-    if (input[i] == '/') {
-      // Skip multiple slashes
-      while (input[i] == '/' && i < strlen(input))
-        i++;
-      if (i >= strlen(input))
-        break;
-      if (temp_idx > 1 && temp[temp_idx - 1] != '/')
-        temp[temp_idx++] = '/';
-    } else if (input[i] == '.' &&
-               (input[i + 1] == '/' || input[i + 1] == '\0')) {
-      // Handle .
-      i++;
-      if (input[i] == '/')
-        i++;
-    } else if (input[i] == '.' && input[i + 1] == '.' &&
-               (input[i + 2] == '/' || input[i + 2] == '\0')) {
-      // Handle ..
-      i += 2;
-      if (input[i] == '/')
-        i++;
-      if (temp_idx > 1) {
-        temp_idx--; // Remove trailing /
-        while (temp_idx > 1 && temp[temp_idx - 1] != '/')
-          temp_idx--; // Backtrack to previous /
-      }
-    } else {
-      temp[temp_idx++] = input[i++];
+  // Si es relativo, concatenar con CWD
+  if (input[0] != '/') {
+    strncpy(temp, vfs_cwd, VFS_PATH_MAX - 1);
+    size_t cwd_len = strlen(temp);
+    if (cwd_len > 0 && temp[cwd_len - 1] != '/') {
+      strcat(temp, "/");
     }
-  }
-
-  // Remove trailing slash unless root
-  if (temp_idx > 1 && temp[temp_idx - 1] == '/')
-    temp_idx--;
-
-  temp[temp_idx] = '\0';
-  if (temp_idx == 1 && temp[0] == '/') {
-    // Root case
-    strncpy(output, "/", output_size);
+    strncat(temp, input, VFS_PATH_MAX - 1);
   } else {
-    strncpy(output, temp, output_size);
+    strncpy(temp, input, sizeof(temp) - 1);
   }
+  temp[sizeof(temp) - 1] = '\0';
+
+  char result[VFS_PATH_MAX];
+  size_t res_idx = 0;
+
+  // Iniciar siempre con /
+  result[0] = '/';
+  res_idx = 1;
+
+  // Procesar componentes
+  char *saveptr;
+  char *copy = (char *)kernel_malloc(strlen(temp) + 1);
+  if (!copy)
+    return VFS_ERR;
+  strcpy(copy, temp);
+
+  char *token = strtok_r(copy, "/", &saveptr);
+  while (token != NULL) {
+    if (strcmp(token, ".") == 0) {
+      // Ignorar .
+    } else if (strcmp(token, "..") == 0) {
+      // Retroceder un nivel
+      if (res_idx > 1) {
+        res_idx--; // Eliminar último /
+        if (result[res_idx] == '/') {
+          // Ya está en /
+        }
+        while (res_idx > 1 && result[res_idx - 1] != '/')
+          res_idx--;
+      }
+    } else if (token[0] != '\0') {
+      // Agregar componente
+      if (res_idx > 1 && result[res_idx - 1] != '/') {
+        result[res_idx++] = '/';
+      }
+      size_t tok_len = strlen(token);
+      if (res_idx + tok_len < VFS_PATH_MAX - 1) {
+        strcpy(&result[res_idx], token);
+        res_idx += tok_len;
+      }
+    }
+    token = strtok_r(NULL, "/", &saveptr);
+  }
+
+  kernel_free(copy);
+
+  // Asegurar que no termine en / (excepto si es root)
+  if (res_idx > 1 && result[res_idx - 1] == '/')
+    res_idx--;
+
+  result[res_idx] = '\0';
+  strncpy(output, result, output_size);
   output[output_size - 1] = '\0';
 
   return VFS_OK;
@@ -135,19 +150,11 @@ void vfs_init(void) {
   unsigned int f = vfs_lock_disable_irq();
   fs_count = 0;
   mount_count = 0;
-
   mount_list = NULL;
 
-  // Ya no limpiamos fd_table global aquí
-
-  // Limpiar lista de montajes
-  vfs_mount_info_t *current = mount_list;
-  while (current) {
-    vfs_mount_info_t *next = current->next;
-    vfs_free(current);
-    current = next;
-  }
-  mount_list = NULL;
+  // Inicialización segura del CWD
+  strncpy(vfs_cwd, "/home", VFS_PATH_MAX - 1);
+  vfs_cwd[VFS_PATH_MAX - 1] = '\0';
 
   vfs_unlock_restore_irq(f);
 }
@@ -200,8 +207,7 @@ vfs_superblock_t *find_mount_for_path(const char *path,
 
   char normalized[VFS_PATH_MAX];
   if (vfs_normalize_path(path, normalized, VFS_PATH_MAX) != VFS_OK) {
-    terminal_printf(&main_terminal, "VFS: Failed to normalize path %s\r\n",
-                    path);
+    serial_printf(COM1_BASE, "VFS: Failed to normalize path %s\r\n", path);
     return NULL;
   }
 
@@ -257,8 +263,8 @@ vfs_superblock_t *find_mount_for_path(const char *path,
     return NULL;
   }
 
-  /* serial_printf(COM1_BASE, "VFS: Matched mount %s for path %s (fs: %s)\r\n",
-                best_mountpoint, normalized, best_sb->fs_name); */
+  /* serial_printf(COM1_BASE, "VFS: Matched mount %s for path %s (fs:
+     %s)\r\n", best_mountpoint, normalized, best_sb->fs_name); */
 
   *out_relpath = best_relpath;
   vfs_unlock_restore_irq(f);
@@ -270,8 +276,8 @@ int vfs_mount(const char *mountpoint, const char *fsname, void *device) {
   if (!mountpoint || !fsname)
     return VFS_ERR;
 
-  terminal_printf(&main_terminal, "VFS: Mount attempt %s on %s...\n", fsname,
-                  mountpoint);
+  serial_printf(COM1_BASE, "VFS: Mount attempt %s on %s...\r\n", fsname,
+                mountpoint);
 
   unsigned int f = vfs_lock_disable_irq();
 
@@ -293,10 +299,8 @@ int vfs_mount(const char *mountpoint, const char *fsname, void *device) {
   vfs_mount_info_t *existing_mount = NULL;
 
   if (device != NULL) {
-    // Solo buscar superblocks existentes para dispositivos reales
     current = mount_list;
     while (current) {
-      // Verificar si es el mismo dispositivo y filesystem
       if (current->sb && current->sb->backing_device == device &&
           strcmp(current->fs_type, fsname) == 0) {
         existing_sb = current->sb;
@@ -310,8 +314,6 @@ int vfs_mount(const char *mountpoint, const char *fsname, void *device) {
       current = current->next;
     }
   } else {
-    // Para tmpfs y otros filesystems sin dispositivo, siempre crear nuevo
-    // superblock
     terminal_printf(
         &main_terminal,
         "VFS: Creating new superblock for %s (no backing device)\r\n", fsname);
@@ -413,8 +415,8 @@ int vfs_mount(const char *mountpoint, const char *fsname, void *device) {
       return VFS_ERR;
     }
     sb->refcount = 1;
-    sb->backing_device =
-        device; // Guardar referencia al dispositivo (puede ser NULL para tmpfs)
+    sb->backing_device = device; // Guardar referencia al dispositivo (puede
+                                 // ser NULL para tmpfs)
   }
 
   // Create mount info
@@ -455,9 +457,9 @@ int vfs_mount(const char *mountpoint, const char *fsname, void *device) {
   mount_count++;
   vfs_unlock_restore_irq(f);
 
-  terminal_printf(
-      &main_terminal, "VFS: Mounted %s at %s (refcount: %u, device: %s)\r\n",
-      fsname, mountpoint, sb->refcount, device ? "present" : "none");
+  serial_printf(COM1_BASE,
+                "VFS: Mounted %s at %s (refcount: %u, device: %s)\r\n", fsname,
+                mountpoint, sb->refcount, device ? "present" : "none");
 
   return VFS_OK;
 }
@@ -534,7 +536,10 @@ static int allocate_fd(vfs_file_t *f) {
   if (!curr)
     return -1;
 
-  for (int i = 0; i < VFS_MAX_FDS; i++) {
+  // RESERVAR 0, 1, 2 para STDIN, STDOUT, STDERR
+  // Esto evita que vfs_open devuelva 0 para un archivo normal,
+  // lo cual rompe programas que asumen que 0 es el teclado.
+  for (int i = 3; i < VFS_MAX_FDS; i++) {
     if (!curr->fd_table[i]) {
       curr->fd_table[i] = f;
       return i;
@@ -572,43 +577,21 @@ int vfs_list_mounts(void (*callback)(const char *mountpoint,
 }
 
 int vfs_open(const char *path, uint32_t flags) {
-  if (!path || strnlen(path, VFS_PATH_MAX + 1) > VFS_PATH_MAX) {
-    serial_printf(COM1_BASE, "vfs_open: Invalid path=%p, len=%u\n", path,
-                  path ? strnlen(path, VFS_PATH_MAX + 1) : 0);
+  if (!path)
     return -1;
-  }
-  for (size_t i = 0; i < strnlen(path, VFS_PATH_MAX + 1); i++) {
-    if (path[i] < 0x20 || path[i] > 0x7E) {
-      serial_printf(
-          COM1_BASE,
-          "vfs_open: Invalid character 0x%02X in path at position %u\n",
-          (unsigned char)path[i], i);
-      return -1;
-    }
-  }
-  serial_printf(COM1_BASE, "vfs_open: Opening path: %s with flags 0x%x\n", path,
-                flags);
-  debug_hex_dump("Path input", path, strnlen(path, VFS_PATH_MAX + 1));
 
   char normalized[VFS_PATH_MAX];
   if (vfs_normalize_path(path, normalized, VFS_PATH_MAX) != VFS_OK) {
-    serial_printf(COM1_BASE, "vfs_open: Failed to normalize path %s\n", path);
     return -1;
   }
-  debug_hex_dump("Normalized path", normalized,
-                 strnlen(normalized, VFS_PATH_MAX));
 
   const char *rel;
   vfs_superblock_t *sb = find_mount_for_path(normalized, &rel);
-  if (!sb || !rel) {
-    serial_printf(COM1_BASE, "vfs_open: No mount found for %s\n", normalized);
+  if (!sb || !rel)
     return -1;
-  }
-  serial_printf(COM1_BASE, "vfs_open: Mountpoint found, relative path: %s\n",
-                rel);
-  debug_hex_dump("Relative path", rel, strnlen(rel, VFS_PATH_MAX));
 
   vfs_node_t *node = NULL;
+
   if (!(flags & VFS_O_CREAT)) {
     node = resolve_path_to_vnode(sb, rel);
     if (!node) {
@@ -743,21 +726,18 @@ int vfs_read(int fd, void *buf, uint32_t size) {
   if (!curr || fd < 0 || fd >= VFS_MAX_FDS)
     return -1;
   vfs_file_t *f = curr->fd_table[fd];
-  if (!f || (uint32_t)f <= 0x100 || !buf)
+  if (!f || !buf)
     return -1;
+
+  // Los FDs 0, 1, 2 son especiales y no deben pasar por aquí (se manejan en
+  // syscalls)
+  if (fd <= 2 || (uintptr_t)f <= 0x1000)
+    return -1;
+
   if (!f->node || !f->node->ops || !f->node->ops->read)
     return -1;
 
-  // ✅ DEBUG
-  serial_printf(COM1_BASE,
-                "vfs_read: fd=%d, size=%u, calling node->ops->read\r\n", fd,
-                size);
-
   int got = f->node->ops->read(f->node, (uint8_t *)buf, size, f->offset);
-
-  // ✅ DEBUG
-  serial_printf(COM1_BASE, "vfs_read: node->ops->read returned %d\r\n", got);
-
   if (got > 0)
     f->offset += got;
   return got;
@@ -768,8 +748,12 @@ int vfs_write(int fd, const void *buf, uint32_t size) {
   if (!curr || fd < 0 || fd >= VFS_MAX_FDS)
     return -1;
   vfs_file_t *f = curr->fd_table[fd];
-  if (!f || (uint32_t)f <= 0x100 || !buf)
+  if (!f || !buf)
     return -1;
+
+  if (fd <= 2 || (uintptr_t)f <= 0x1000)
+    return -1;
+
   if (!f->node || !f->node->ops || !f->node->ops->write)
     return -1;
   int wrote =
@@ -1576,4 +1560,67 @@ int vfs_stat(const char *path, vfs_dirent_t *statbuf) {
 int vfs_lstat(const char *path, vfs_dirent_t *statbuf) {
   // Por ahora, igual que vfs_stat (no seguimos symlinks en stat)
   return vfs_stat(path, statbuf);
+}
+int vfs_rmdir(const char *path) {
+  if (!path)
+    return VFS_ERR;
+  char pp[VFS_PATH_MAX], n[VFS_NAME_MAX];
+  if (vfs_split_path(path, pp, n) != VFS_OK)
+    return VFS_ERR;
+  const char *rel;
+  vfs_superblock_t *sb = find_mount_for_path(pp, &rel);
+  if (!sb)
+    return VFS_ERR;
+  vfs_node_t *p = resolve_path_to_vnode(sb, rel);
+  if (!p || !p->ops->rmdir) {
+    if (p) {
+      p->refcount--;
+      if (p->refcount == 0 && p->ops->release)
+        p->ops->release(p);
+    }
+    return VFS_ERR;
+  }
+  int r = p->ops->rmdir(p, n);
+  p->refcount--;
+  if (p->refcount == 0 && p->ops->release)
+    p->ops->release(p);
+  return r;
+}
+
+int vfs_rename(const char *oldpath, const char *newpath) {
+  if (!oldpath || !newpath)
+    return VFS_ERR;
+  char opp[VFS_PATH_MAX], on[VFS_NAME_MAX], npp[VFS_PATH_MAX], nn[VFS_NAME_MAX];
+  if (vfs_split_path(oldpath, opp, on) != VFS_OK)
+    return VFS_ERR;
+  if (vfs_split_path(newpath, npp, nn) != VFS_OK)
+    return VFS_ERR;
+  const char *orel, *nrel;
+  vfs_superblock_t *osb = find_mount_for_path(opp, &orel);
+  vfs_superblock_t *nsb = find_mount_for_path(npp, &nrel);
+  if (!osb || osb != nsb)
+    return VFS_ERR;
+  vfs_node_t *op = resolve_path_to_vnode(osb, orel);
+  vfs_node_t *np = resolve_path_to_vnode(nsb, nrel);
+  if (!op || !np || !op->ops->rename) {
+    if (op) {
+      op->refcount--;
+      if (op->refcount == 0 && op->ops->release)
+        op->ops->release(op);
+    }
+    if (np) {
+      np->refcount--;
+      if (np->refcount == 0 && np->ops->release)
+        np->ops->release(np);
+    }
+    return VFS_ERR;
+  }
+  int r = op->ops->rename(op, on, np, nn);
+  op->refcount--;
+  if (op->refcount == 0 && op->ops->release)
+    op->ops->release(op);
+  np->refcount--;
+  if (np->refcount == 0 && np->ops->release)
+    np->ops->release(np);
+  return r;
 }

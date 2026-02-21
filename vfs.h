@@ -95,6 +95,9 @@ typedef struct vnode_ops {
                  uint32_t offset);
   void (*release)(vfs_node_t *node);
   int (*unlink)(vfs_node_t *parent, const char *name);
+  int (*rmdir)(vfs_node_t *parent, const char *name); // Nuevo
+  int (*rename)(vfs_node_t *old_parent, const char *old_name,
+                vfs_node_t *new_parent, const char *new_name); // Nuevo
 
   // Nuevas operaciones
   int (*symlink)(vfs_node_t *parent, const char *name, const char *target);
@@ -153,6 +156,7 @@ typedef struct vfs_mount_info {
 } vfs_mount_info_t;
 
 extern vfs_mount_info_t *mount_list;
+extern char vfs_cwd[VFS_PATH_MAX];
 
 /* Public API (POSIX-like fd interface) */
 void vfs_init(void);
@@ -163,6 +167,8 @@ int vfs_read(int fd, void *buf, uint32_t size);
 int vfs_write(int fd, const void *buf, uint32_t size);
 int vfs_close(int fd);
 int vfs_unlink(const char *path); // Nueva función pública
+int vfs_rmdir(const char *path);  // Nueva
+int vfs_rename(const char *oldpath, const char *newpath); // Nueva
 int vfs_unlink_recursive(const char *path, int recursive);
 int vfs_mknod(const char *path, vfs_dev_type_t dev_type, uint32_t major,
               uint32_t minor);

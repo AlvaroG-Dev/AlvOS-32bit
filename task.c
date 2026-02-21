@@ -1,4 +1,5 @@
 #include "task.h"
+#include "exec.h"
 #include "gdt.h"
 #include "io.h"
 #include "irq.h"
@@ -6,6 +7,7 @@
 #include "memory.h"
 #include "memutils.h"
 #include "mmu.h"
+#include "serial.h"
 #include "string.h"
 #include "task_utils.h"
 #include "terminal.h"
@@ -34,9 +36,11 @@ extern void task_switch_to_user(cpu_context_t *user_context);
 
 static void task_exit_wrapper(void) {
   // Esta funciÃ³n se llama cuando una tarea termina normalmente
-  terminal_printf(&main_terminal, "[TASK_EXIT] Task %s finished normally\r\n",
-                  scheduler.current_task ? scheduler.current_task->name
-                                         : "unknown");
+  if (scheduler.current_task &&
+      !(scheduler.current_task->flags & TASK_FLAG_QUIET)) {
+    serial_printf(COM1_BASE, "[TASK_EXIT] Task %s finished normally\r\n",
+                  scheduler.current_task->name);
+  }
   task_exit(0);
 
   // Nunca deberÃ­a llegar aquÃ­
@@ -48,8 +52,7 @@ static void task_exit_wrapper(void) {
 static void task_entry_wrapper(void) {
   // ✅ FIX: Verificar contexto antes de ejecutar
   if (!scheduler.current_task) {
-    terminal_puts(&main_terminal,
-                  "ERROR: No current task in entry wrapper!\r\n");
+    serial_printf(COM1_BASE, "ERROR: No current task in entry wrapper!\r\n");
     while (1)
       __asm__("hlt");
   }
@@ -59,18 +62,19 @@ static void task_entry_wrapper(void) {
   void *arg = current->arg;
 
   // ✅ FIX: Verificar que entry sea válido
-  if (!entry) {
-    terminal_printf(&main_terminal,
-                    "[ENTRY] ERROR: NULL entry point for %s\r\n",
+  if (!(current->flags & TASK_FLAG_QUIET)) {
+    if (!entry) {
+      serial_printf(COM1_BASE, "[ENTRY] ERROR: NULL entry point for %s\r\n",
                     current->name);
-    task_exit(-1);
-    while (1)
-      __asm__("hlt"); // Nunca debería llegar aquí
-  }
+      task_exit(-1);
+      while (1)
+        __asm__("hlt"); // Nunca debería llegar aquí
+    }
 
-  terminal_printf(&main_terminal,
+    serial_printf(COM1_BASE,
                   "[ENTRY] Starting %s (entry=0x%08x, arg=0x%08x)\r\n",
                   current->name, (uint32_t)entry, (uint32_t)arg);
+  }
 
   // ✅ Habilitar interrupciones ANTES de ejecutar
   __asm__ __volatile__("sti");
@@ -80,8 +84,10 @@ static void task_entry_wrapper(void) {
   entry(arg);
 
   // ✅ FIX: Si la función retorna, imprimir mensaje Y salir
-  terminal_printf(&main_terminal, "[ENTRY] Task %s returned normally\r\n",
+  if (!(current->flags & TASK_FLAG_QUIET)) {
+    serial_printf(COM1_BASE, "[ENTRY] Task %s returned normally\r\n",
                   current->name);
+  }
   task_exit(0);
 
   // NUNCA debería llegar aquí
@@ -119,10 +125,14 @@ static void perform_context_switch(task_t *from, task_t *to) {
   scheduler.current_task = to;
 
   // Debug cada 50 switches
+  /*
   if (scheduler.total_switches % 50 == 0) {
-    terminal_printf(&main_terminal, "[CTX #%u] %s -> %s\r\n",
+    if (exec_verbose) {
+      serial_printf(COM1_BASE, "[CTX #%u] %s -> %s\r\n",
                     scheduler.total_switches, from->name, to->name);
+    }
   }
+  */
 
   // CRÃTICO: Realizar cambio de contexto
   // Esta funciÃ³n debe preservar el estado del stack correctamente
@@ -202,19 +212,14 @@ void task_yield(void) {
   __asm__ __volatile__("push %0\n\tpopf" : : "r"(flags));
 }
 
-// ========================================================================
-// GESTIÃ“N DE TAREAS
-// ========================================================================
-
 task_t *task_create(const char *name, void (*entry_point)(void *), void *arg,
                     task_priority_t priority) {
-  terminal_printf(&main_terminal, "[TASK_CREATE] Creating task: %s\r\n",
-                  name ? name : "null");
 
   if (!entry_point || scheduler.task_count >= MAX_TASKS) {
-    terminal_printf(&main_terminal,
-                    "[TASK_CREATE] FAILED: entry=%s, count=%u\r\n",
+    if (exec_verbose) {
+      serial_printf(COM1_BASE, "[TASK_CREATE] FAILED: entry=%s, count=%u\r\n",
                     entry_point ? "ok" : "NULL", scheduler.task_count);
+    }
     return NULL;
   }
 
@@ -231,6 +236,15 @@ task_t *task_create(const char *name, void (*entry_point)(void *), void *arg,
   // INICIALIZACIÃ“N COMPLETA DE TODOS LOS CAMPOS
   memset(task, 0,
          sizeof(task_t)); // Esto asegura que todos los campos estÃ©n en 0
+
+  if (!exec_verbose) {
+    task->flags |= TASK_FLAG_QUIET;
+  }
+
+  if (!(task->flags & TASK_FLAG_QUIET)) {
+    serial_printf(COM1_BASE, "[TASK_CREATE] Creating task: %s\r\n",
+                  name ? name : "null");
+  }
 
   task->task_id = scheduler.next_task_id++;
   strncpy(task->name, name ? name : "unnamed", TASK_NAME_MAX - 1);
@@ -270,6 +284,17 @@ task_t *task_create(const char *name, void (*entry_point)(void *), void *arg,
   add_task_to_list(task);
   scheduler.task_count++;
 
+  // Inicializar CWD (heredar del padre si existe)
+  if (scheduler.current_task) {
+    strncpy(task->cwd, scheduler.current_task->cwd, 255);
+    task->cwd[255] = '\0';
+  } else {
+    strcpy(task->cwd, "/home");
+  }
+  task->wait_for_pid = 0;
+  task->has_waited = 0;
+  task->parent = scheduler.current_task;
+
   // La tarea estÃ¡ lista para ejecutar
   task->state = TASK_READY;
 
@@ -277,8 +302,10 @@ task_t *task_create(const char *name, void (*entry_point)(void *), void *arg,
 
   message_queue_create(task->task_id);
 
-  terminal_printf(&main_terminal, "Task created: %s (ID: %u)\r\n", task->name,
+  if (exec_verbose) {
+    serial_printf(COM1_BASE, "Task created: %s (ID: %u)\r\n", task->name,
                   task->task_id);
+  }
   return task;
 }
 
@@ -385,34 +412,45 @@ void task_sleep(uint32_t ms) {
   task_yield();
 }
 
+void task_terminate(task_t *task, int exit_code) {
+  if (!task || task == scheduler.idle_task)
+    return;
+
+  unsigned int f = vfs_lock_disable_irq();
+
+  if (task->state == TASK_FINISHED || task->state == TASK_ZOMBIE) {
+    vfs_unlock_restore_irq(f);
+    return;
+  }
+
+  task->exit_code = exit_code;
+  task->state = TASK_FINISHED;
+
+  // Despertar al padre si estaba esperando
+  if (task->parent) {
+    task_t *p = task->parent;
+    if (p->state == TASK_WAITING && p->wait_for_pid == task->task_id) {
+      p->state = TASK_READY;
+      p->wait_for_pid = 0;
+    }
+  }
+
+  if (!(task->flags & TASK_FLAG_QUIET)) {
+    serial_printf(COM1_BASE, "Task %s terminated with code %d\r\n", task->name,
+                  exit_code);
+  }
+
+  vfs_unlock_restore_irq(f);
+}
+
 void task_exit(int exit_code) {
   if (!scheduler.current_task ||
       scheduler.current_task == scheduler.idle_task) {
-    // Idle task nunca debe salir
     terminal_puts(&main_terminal, "[TASK_EXIT] Cannot exit idle task\r\n");
     return;
   }
 
-  // ✅ FIX: Deshabilitar interrupciones para operación atómica
-  __asm__ __volatile__("cli");
-
-  // ✅ FIX: Verificar estado de manera atómica
-  if (scheduler.current_task->state == TASK_FINISHED ||
-      scheduler.current_task->state == TASK_ZOMBIE) {
-    terminal_printf(&main_terminal,
-                    "[TASK_EXIT] WARNING: %s already exited, halting\r\n",
-                    scheduler.current_task->name);
-    // NO retornar, en su lugar hacer halt infinito
-    while (1)
-      __asm__("hlt");
-  }
-
-  // Marcar como terminada
-  scheduler.current_task->exit_code = exit_code;
-  scheduler.current_task->state = TASK_FINISHED;
-
-  terminal_printf(&main_terminal, "Task %s exited with code %d\r\n",
-                  scheduler.current_task->name, exit_code);
+  task_terminate(scheduler.current_task, exit_code);
 
   // ✅ FIX: Forzar cambio de contexto inmediato
   // NO volver a habilitar interrupciones aquí
@@ -612,7 +650,8 @@ static void user_mode_entry_wrapper(void *arg) {
   }
 
   // Debug: mostrar estado antes del switch
-  terminal_printf(&main_terminal,
+  if (!(current->flags & TASK_FLAG_QUIET)) {
+    serial_printf(COM1_BASE,
                   "[USER_WRAPPER] Preparing transition to Ring 3:\r\n"
                   "  Task: %s (ID: %u)\r\n"
                   "  User code: 0x%08x\r\n"
@@ -620,14 +659,15 @@ static void user_mode_entry_wrapper(void *arg) {
                   current->name, current->task_id,
                   (uint32_t)current->user_entry_point,
                   (uint32_t)current->user_stack_top);
+  }
 
   // **CRÍTICO**: Verificar mapeo de la página de código
   uint32_t code_page = (uint32_t)current->user_entry_point & ~0xFFF;
 
   if (!mmu_is_mapped(code_page)) {
-    terminal_printf(&main_terminal,
-                    "[USER_WRAPPER] ERROR: Code page not mapped at 0x%08x!\r\n",
-                    code_page);
+    serial_printf(COM1_BASE,
+                  "[USER_WRAPPER] ERROR: Code page not mapped at 0x%08x!\r\n",
+                  code_page);
 
     // Intentar mapear automáticamente
     terminal_printf(&main_terminal, "  Attempting to map page 0x%08x...\r\n",
@@ -707,15 +747,17 @@ static void user_mode_entry_wrapper(void *arg) {
   }
 
   // Debug final con más información
-  terminal_printf(&main_terminal,
-                  "[USER_WRAPPER] Ready for switch:\r\n"
-                  "  CS:EIP = 0x%04x:0x%08x\r\n"
-                  "  SS:ESP = 0x%04x:0x%08x\r\n"
-                  "  DS:ES:FS:GS = 0x%04x:0x%04x:0x%04x:0x%04x\r\n"
-                  "  EFLAGS = 0x%08x\r\n",
-                  user_ctx.cs, user_ctx.eip, user_ctx.ss, user_ctx.esp,
-                  user_ctx.ds, user_ctx.es, user_ctx.fs, user_ctx.gs,
-                  user_ctx.eflags);
+  if (!(current->flags & TASK_FLAG_QUIET)) {
+    terminal_printf(&main_terminal,
+                    "[USER_WRAPPER] Ready for switch:\r\n"
+                    "  CS:EIP = 0x%04x:0x%08x\r\n"
+                    "  SS:ESP = 0x%04x:0x%08x\r\n"
+                    "  DS:ES:FS:GS = 0x%04x:0x%04x:0x%04x:0x%04x\r\n"
+                    "  EFLAGS = 0x%08x\r\n",
+                    user_ctx.cs, user_ctx.eip, user_ctx.ss, user_ctx.esp,
+                    user_ctx.ds, user_ctx.es, user_ctx.fs, user_ctx.gs,
+                    user_ctx.eflags);
+  }
 
   // Deshabilitar interrupciones antes del switch
   __asm__ volatile("cli");
@@ -738,9 +780,15 @@ static void user_mode_entry_wrapper(void *arg) {
 task_t *task_create_user(const char *name, void *user_code_addr, int argc,
                          char **argv, uint32_t code_size,
                          task_priority_t priority) {
-  terminal_printf(&main_terminal,
-                  "[USER_CREATE] Creating user task: %s at 0x%08x\r\n", name,
-                  (uint32_t)user_code_addr);
+  if (!exec_verbose) {
+    // Note: We don't have task yet, but we'll set it in task->flags later
+  }
+
+  if (exec_verbose) {
+    terminal_printf(&main_terminal,
+                    "[USER_CREATE] Creating user task: %s at 0x%08x\r\n", name,
+                    (uint32_t)user_code_addr);
+  }
 
   // ... (validations remain the same) ...
   // (Assuming I should keep the existing validations and logic)
@@ -782,20 +830,18 @@ task_t *task_create_user(const char *name, void *user_code_addr, int argc,
   uint32_t stack_real_base = guard_page + PAGE_SIZE;
   uint32_t stack_end = alloc_base + total_alloc_size;
 
-  // 5. Mapear stack
+  // 5. Mapear stack y asegurar permisos de usuario
   for (uint32_t page = stack_real_base; page < stack_end; page += PAGE_SIZE) {
-    if (!mmu_is_mapped(page)) {
-      mmu_map_page(page, page, PAGE_PRESENT | PAGE_RW | PAGE_USER);
-    } else {
-      mmu_set_page_user(page);
-    }
+    mmu_map_page(page, page, PAGE_PRESENT | PAGE_RW | PAGE_USER);
+    // Forzar actualización de flags si ya estaba mapeada
+    mmu_set_page_user(page);
   }
 
-  // 6. Preparar stack top y ARGC/ARGV
-  uint32_t stack_top = (stack_end - 16) & ~0xF;
+  // 6. Preparar stack top y ARGC/ARGV (System V ABI i386)
+  uint32_t stack_top = (stack_end - 32) & ~0xF;
 
   if (argc > 0 && argv != NULL) {
-    // 6.1. Copiar los strings de los argumentos al stack
+    // 6.1. Copiar los strings de los argumentos al stack (en la parte superior)
     uint32_t arg_ptrs[argc];
     for (int i = argc - 1; i >= 0; i--) {
       size_t len = strlen(argv[i]) + 1;
@@ -804,29 +850,38 @@ task_t *task_create_user(const char *name, void *user_code_addr, int argc,
       arg_ptrs[i] = stack_top;
     }
 
-    // 6.2. Alinear stack a 4 bytes antes de los punteros
-    stack_top &= ~0x3;
+    // 6.2. Calcular el espacio para punteros y argc (1 + argc + 1) * 4
+    uint32_t ptr_space = (argc + 2) * 4;
 
-    // 6.3. Push NULL terminator for argv
+    // 6.3. ALINEACIÓN CRÍTICA: Asegurar que el ESP final esté alineado a 16
+    // bytes. El ESP final será (stack_top - ptr_space). Queremos que eso sea
+    // múltiplo de 16.
+    uint32_t current_esp = stack_top - ptr_space;
+    uint32_t aligned_esp = current_esp & ~0xF;
+
+    // Ajustamos stack_top para que el resultado final sea el alineado
+    stack_top -= (current_esp - aligned_esp);
+
+    // 6.4. Push NULL terminator for argv[argc]
     stack_top -= 4;
     *(uint32_t *)stack_top = 0;
 
-    // 6.4. Push pointers to strings (argv[argc-1] downwards to argv[0])
+    // 6.5. Push pointers to strings (argv[argc-1] down to argv[0])
     for (int i = argc - 1; i >= 0; i--) {
       stack_top -= 4;
       *(uint32_t *)stack_top = arg_ptrs[i];
     }
 
-    // 6.5. Push argc
-    // Según ABI de System V i386 para _start:
-    // [esp] = argc
-    // [esp+4] = argv[0] ...
+    // 6.6. Push argc - EL ESP FINAL DEBERÁ APUNTAR EXACTAMENTE AQUÍ
     stack_top -= 4;
     *(uint32_t *)stack_top = (uint32_t)argc;
 
-    terminal_printf(&main_terminal,
-                    "[USER_CREATE] argc=%d, pushed to stack at 0x%08x\r\n",
-                    argc, stack_top);
+    if (exec_verbose) {
+      terminal_printf(
+          &main_terminal,
+          "[USER_CREATE] Stack setup complete: argc=%d, esp=0x%08x\r\n", argc,
+          stack_top);
+    }
   }
 
   // 7. El ESP final debe apuntar exactamente a argc
@@ -838,6 +893,31 @@ task_t *task_create_user(const char *name, void *user_code_addr, int argc,
     return NULL;
   }
 
+  // 9. Inicializar espacio de direcciones y HEAP para la tarea
+  // Usamos el PD actual (que ya tiene el código y stack mapeados identity)
+  // Pero lo encapsulamos en una estructura address_space
+  task->address_space =
+      (address_space_t *)kernel_malloc(sizeof(address_space_t));
+  if (task->address_space) {
+    memset(task->address_space, 0, sizeof(address_space_t));
+    // Obtener el CR3 actual (dirección física del directorio de páginas)
+    task->address_space->page_directory = mmu_get_current_cr3();
+
+    // El heap comienza en una zona segura (256MB) alejada del código (128MB)
+    uint32_t heap_base = 0x10000000;
+    task->address_space->heap_start = heap_base;
+    task->address_space->heap_current = heap_base;
+
+    // NO mapeamos el heap inicial aquí para evitar colisiones durante la
+    // creación. La syscall SBRK (vmm_brk) lo hará bajo demanda cuando se llame
+    // a malloc.
+    if (exec_verbose) {
+      terminal_printf(&main_terminal,
+                      "[USER_CREATE] Heap boundaries set at 0x%08x\r\n",
+                      heap_base);
+    }
+  }
+
   task->user_stack_base = user_stack;
   task->user_stack_top = (void *)stack_top;
   task->user_stack_size = total_alloc_size;
@@ -846,11 +926,22 @@ task_t *task_create_user(const char *name, void *user_code_addr, int argc,
   task->user_code_size = code_size;
   task->flags |= TASK_FLAG_USER_MODE;
 
+  if (!exec_verbose) {
+    task->flags |= TASK_FLAG_QUIET;
+  }
+
   for (int i = 0; i < VFS_MAX_FDS; i++)
     task->fd_table[i] = NULL;
-  task->fd_table[0] = (struct vfs_file *)0x1;
-  task->fd_table[1] = (struct vfs_file *)0x1;
-  task->fd_table[2] = (struct vfs_file *)0x1;
+
+  // Reserve 0, 1, 2 for stdin/stdout/stderr so that the first open() gets FD 3
+  // and doesn't conflict with hardcoded terminal logic in syscalls.c
+  task->fd_table[0] = (void *)1;
+  task->fd_table[1] = (void *)1;
+  task->fd_table[2] = (void *)1;
+
+  // ✅ CRITICAL BUGFIX: Limpieza obligatoria al 1er READ de stdin
+  // Esto asegura que el programa no lea el residual del Shell.
+  task->flags |= TASK_FLAG_KBD_CLEAN_REQUIRED;
 
   return task;
 }
@@ -971,10 +1062,12 @@ void task_setup_stack(task_t *task, void (*entry_point)(void *), void *arg) {
   // Esto evita race conditions durante la inicialización
   task->context.eflags = 0x200;
 
-  terminal_printf(
-      &main_terminal, "[STACK] %s: ESP=0x%08x (aligned=%s) EIP=0x%08x\r\n",
-      task->name, task->context.esp,
-      ((uint32_t)stack_ptr & 0xF) == 0 ? "YES" : "NO", task->context.eip);
+  if (!(task->flags & TASK_FLAG_QUIET)) {
+    serial_printf(
+        COM1_BASE, "[STACK] %s: ESP=0x%08x (aligned=%s) EIP=0x%08x\r\n",
+        task->name, task->context.esp,
+        ((uint32_t)stack_ptr & 0xF) == 0 ? "YES" : "NO", task->context.eip);
+  }
 }
 
 bool task_is_ready(task_t *task) {

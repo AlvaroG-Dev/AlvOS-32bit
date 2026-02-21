@@ -87,6 +87,40 @@ void unmount_callback(const char *mountpoint, const char *fs_name, void *arg) {
   data->count++;
 }
 
+/* Disco virtual para /bin desde módulo binfs.img (debe persistir) */
+static disk_t binfs_disk;
+
+// Función para montar /bin desde módulo o disco
+static void mount_bin_directory(void) {
+  terminal_printf(&main_terminal, "[BOOT] Intentando montar /bin...\r\n");
+
+  module_info_t *binfs_module = module_find_by_name("binfs.img");
+  if (binfs_module && binfs_module->data && binfs_module->size >= 512) {
+    uint32_t size_aligned = (binfs_module->size / 512) * 512;
+    if (disk_init_ramdisk(&binfs_disk, binfs_module->data, size_aligned) !=
+        DISK_ERR_NONE) {
+      serial_printf(COM1_BASE, "[BOOT] Error al init ramdisk para binfs\r\n");
+    } else if (vfs_mount("/bin", "fat32", &binfs_disk) == VFS_OK) {
+      serial_printf(COM1_BASE,
+                    "[BOOT] /bin montado desde binfs.img (%u bytes)\r\n",
+                    size_aligned);
+      return;
+    } else {
+      serial_printf(COM1_BASE,
+                    "[BOOT] FAT32 mount de binfs falló, usando tmpfs\r\n");
+    }
+  } else {
+    serial_printf(COM1_BASE,
+                  "[BOOT] Módulo binfs.img no encontrado o inválido\r\n");
+  }
+
+  if (vfs_mount("/bin", "tmpfs", NULL) == VFS_OK) {
+    serial_printf(COM1_BASE, "[BOOT] /bin montado como tmpfs (fallback)\r\n");
+  } else {
+    serial_printf(COM1_BASE, "[BOOT] No se pudo montar /bin\r\n");
+  }
+}
+
 // Función de apagado del sistema operativo
 void shutdown(void) {
   terminal_printf(&main_terminal, "\n\nSystem shutdown initiated\r\n");
@@ -244,6 +278,12 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
   outb(0x40, (uint8_t)(divisor & 0xFF));
   outb(0x40, (uint8_t)((divisor >> 8) & 0xFF));
   terminal_init(&main_terminal);
+
+  // Cargar módulos Multiboot2 (p. ej. binfs.img para /bin)
+  if (!module_loader_init(boot_info.multiboot_info_ptr)) {
+    terminal_puts(&main_terminal, "WARNING: module_loader_init failed\r\n");
+  }
+
   // 13. Inicializar drivers
   driver_system_init();
 
@@ -385,6 +425,9 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
   // Escanear disco principal al inicio
   partition_manager_scan_disk(&main_disk, 0);
   partition_manager_auto_mount_all();
+
+  // Intentar montar /bin desde módulo binfs.img o desde disco
+  mount_bin_directory();
 
   syscall_init();
 
@@ -557,7 +600,12 @@ static void main_loop_task(void *arg) {
   (void)arg;
   uint32_t last_update = 0;
   terminal_printf(&main_terminal, "[MAIN_LOOP] Task started\r\n");
+
+  // Cargar symlinks ahora que tenemos contexto de tarea
+  terminal_load_symlinks(&main_terminal);
+
   keyboard_set_handler(keyboard_terminal_handler);
+
   while (1) {
     uint32_t current_time = ticks_since_boot * 10; // 10ms per tick a 100Hz
     // Actualizar cada 50ms (5 ticks)

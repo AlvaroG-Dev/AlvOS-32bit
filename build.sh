@@ -109,6 +109,7 @@ compile "network_daemon.c" "$GCC $GCC_OPTS -c network_daemon.c -o build/network_
 compile "rtc.c" "$GCC $GCC_OPTS -c rtc.c -o build/rtc.o"
 compile "cmd_top.c" "$GCC $GCC_OPTS -c cmd_top.c -o build/cmd_top.o"
 
+
 # Enlazado con linker.ld
 echo -e "${GREEN}Enlazando kernel.bin...${RESET}"
 ld -m elf_i386 -T linker.ld -o build/kernel.bin \
@@ -161,12 +162,25 @@ if [ "$CORE_SECTORS" -gt 62 ]; then
     echo "WARNING: core.img is very large, may not fit in embedding area"
 fi
 
+# Crear imagen FAT32 con binarios de usuario
+if [ -f "create_binfs.sh" ]; then
+    echo -e "${CYAN}Creando imagen de binarios...${RESET}"
+    chmod +x create_binfs.sh
+    ./create_binfs.sh || echo -e "${YELLOW}Advertencia: No se pudo crear binfs.img${RESET}"
+fi
+
 # Copiar binario y archivo de GRUB
 echo -e "${CYAN}Copiando kernel.bin y grub.cfg...${RESET}"
 cp build/kernel.bin build/isodir/boot/
 cp core.img build/isodir/boot/
 cp boot.img build/isodir/boot/mbr_boot.bin
 cp grub.cfg build/isodir/boot/grub/
+
+# Copiar imagen de binarios si existe
+if [ -f "build/binfs.img" ]; then
+    echo -e "${CYAN}Copiando binfs.img al ISO...${RESET}"
+    cp build/binfs.img build/isodir/boot/binfs.img
+fi
 
 # Crear ISO con GRUB
 echo -e "${GREEN}Creando imagen ISO...${RESET}"

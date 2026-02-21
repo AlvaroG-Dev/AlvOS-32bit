@@ -58,6 +58,11 @@ typedef struct {
   uint8_t conceal;
 } TextAttributes;
 
+typedef struct {
+  char alias[64];
+  char target[256];
+} TerminalLink;
+
 // Estructura para información del prompt
 typedef struct {
   char username[32];
@@ -108,6 +113,10 @@ typedef struct {
   char cwd[VFS_PATH_MAX]; // Current working directory
   char path[512];         // PATH environment variable
 
+  // Links
+  TerminalLink links[32]; // Max 32 links
+  uint32_t link_count;
+
   // Atributos de texto y prompt mejorado
   TextAttributes current_attrs; // Atributos de texto actuales
   TextAttributes saved_attrs;   // Atributos guardados
@@ -122,6 +131,9 @@ typedef struct {
   // Estadísticas para debug
   uint32_t total_lines_written;
   uint32_t page_faults_avoided;
+
+  // Seguimiento de tareas
+  struct task *foreground_task; // Tarea que tiene el foco
 } Terminal;
 
 extern bool graphical_mode;
@@ -193,5 +205,8 @@ void terminal_reset_colors(Terminal *term);
 void terminal_show_cursor(Terminal *term, bool show);
 uint32_t terminal_get_cursor_x(Terminal *term);
 uint32_t terminal_get_cursor_y(Terminal *term);
+
+// Carga de Symlinks
+void terminal_load_symlinks(Terminal *term);
 
 #endif

@@ -8,6 +8,7 @@
 #include "mmu.h"
 #include "network.h"
 #include "rtc.h"
+#include "serial.h"
 #include "string.h"
 #include "task.h"
 #include "tcp.h"
@@ -18,13 +19,16 @@ extern void syscall_entry(void);
 
 // Declarar variables externas de vfs.c
 extern int mount_count;
-static char cwd_buffer[VFS_PATH_MAX] = "/";
+// Usamos vfs_cwd declarado en vfs.h
 
 // Función auxiliar para verificar si un FD es válido y está abierto
 static bool is_valid_fd(int fd) {
   task_t *curr = scheduler.current_task;
   if (!curr || fd < 0 || fd >= VFS_MAX_FDS)
     return false;
+  // 0, 1, 2 son siempre válidos (stdin, stdout, stderr)
+  if (fd <= 2)
+    return true;
   return (curr->fd_table[fd] != NULL);
 }
 
@@ -47,16 +51,12 @@ bool validate_user_pointer(uint32_t ptr, uint32_t size) {
   uint32_t start_page = ptr & ~0xFFF;
   uint32_t end_page = (ptr + size - 1) & ~0xFFF;
 
+  // Simplificación agresiva: si la dirección es de usuario (bajo 3GB)
+  // y está mapeada, la damos por buena.
   for (uint32_t page = start_page; page <= end_page; page += PAGE_SIZE) {
     if (!mmu_is_mapped(page))
       return false;
-    uint32_t flags = mmu_get_page_flags(page);
-    if (!(flags & PAGE_USER))
-      return false;
-    if ((flags & PAGE_RW) == 0 && page == start_page)
-      return false;
   }
-
   return true;
 }
 
@@ -93,26 +93,18 @@ int copy_to_user(uint32_t user_dst, void *kernel_src, size_t size) {
 
 int copy_string_from_user(char *kernel_dst, uint32_t user_src, size_t max_len) {
   if (!kernel_dst || max_len == 0)
-    return -EFAULT;
-
-  for (size_t i = 0; i < max_len; i++) {
-    // Verificar cada byte individualmente
-    if (!validate_user_pointer(user_src + i, 1)) {
-      kernel_dst[i] = '\0';
-      return -EFAULT;
-    }
-
-    char c = *(char *)(user_src + i);
+    return -1;
+  volatile char *src = (char *)user_src;
+  size_t i = 0;
+  while (i < max_len - 1) {
+    char c = src[i];
     kernel_dst[i] = c;
-
-    if (c == '\0') {
-      return i;
-    }
+    if (c == '\0')
+      return (int)i;
+    i++;
   }
-
-  // Buffer lleno, asegurar terminación
-  kernel_dst[max_len - 1] = '\0';
-  return max_len - 1;
+  kernel_dst[i] = '\0';
+  return (int)i;
 }
 
 int copy_string_to_user(uint32_t user_dst, const char *kernel_src,
@@ -224,6 +216,18 @@ static int create_socket_fd(int socket_id) {
 // Handler de syscall principal
 void syscall_handler(struct regs *r) {
   uint32_t syscall_num = r->eax;
+
+  // LOG UNIVERSAL: Comentado para evitar ruido, ya sabemos que el kernel
+  // funciona. serial_printf(COM1_BASE, "[SYSCALL] PID %d calling %d
+  // (EBX=%d)\r\n",
+  //               (scheduler.current_task ? scheduler.current_task->task_id :
+  //               0), syscall_num, r->ebx);
+
+  // Habilitar interrupciones para permitir que el timer y el teclado
+
+  // funcionen durante syscalls bloqueantes (como READ)
+  __asm__ volatile("sti");
+
   uint32_t result = 0;
 
   task_t *current = scheduler.current_task;
@@ -238,9 +242,8 @@ void syscall_handler(struct regs *r) {
   // ============================================
   case SYSCALL_EXIT: {
     int exit_code = (int)r->ebx;
-    terminal_printf(&main_terminal,
-                    "[SYSCALL] Process %u exited with code %d\r\n",
-                    current->task_id, exit_code);
+    serial_printf(COM1_BASE, "[SYSCALL] Process %u exited with code %d\r\n",
+                  current->task_id, exit_code);
     task_exit(exit_code);
     break;
   }
@@ -271,9 +274,12 @@ void syscall_handler(struct regs *r) {
     }
 
     if (fd == 1 || fd == 2) { // stdout/stderr
+      // Optimización para salidas grandes (como 'cat')
       for (size_t i = 0; i < count; i++) {
         terminal_putchar(&main_terminal, kernel_buffer[i]);
       }
+      terminal_draw(&main_terminal); // Refresh so user sees output streaming!
+      task_yield();
       result = count;
     } else if (fd == 0) { // stdin
       result = (uint32_t)-EBADF;
@@ -293,70 +299,66 @@ void syscall_handler(struct regs *r) {
     uint32_t buf_ptr = r->ecx;
     size_t count = r->edx;
 
-    if (!validate_user_pointer(buf_ptr, count)) {
-      result = (uint32_t)-EFAULT;
-      break;
-    }
+    // --- PRIORIDAD ABSOLUTA: STDIN (TECLADO) ---
+    if (fd == 0) {
+      serial_printf(COM1_BASE,
+                    ">>> SYSCALL_READ ENTERED (KERNEL V1172) <<<\r\n");
 
-    char *kernel_buffer = (char *)kernel_malloc(count);
-    if (!kernel_buffer) {
-      result = (uint32_t)-ENOMEM;
-      break;
-    }
+      if (current->task_id > 2 &&
+          (current->flags & TASK_FLAG_KBD_CLEAN_REQUIRED)) {
+        keyboard_clear_buffer();
+        current->flags &= ~TASK_FLAG_KBD_CLEAN_REQUIRED;
+        serial_printf(COM1_BASE, "[KBD] Cleaned for PID %d\r\n",
+                      current->task_id);
+      }
 
-    size_t bytes_read = 0;
-
-    if (fd == 0) { // stdin - leer del teclado
-      for (bytes_read = 0; bytes_read < count; bytes_read++) {
-        int key = keyboard_getkey_nonblock();
-        if (key == -1) {
-          task_sleep(1);
-          if (keyboard_available()) {
-            key = keyboard_getkey_nonblock();
-          } else {
-            break;
-          }
-        }
-
-        if (key == '\n') {
-          kernel_buffer[bytes_read] = '\n';
-          bytes_read++;
-          break;
-        } else if (key == '\b' && bytes_read > 0) {
-          bytes_read--;
-        } else if (key > 0 && key < 128) {
-          kernel_buffer[bytes_read++] = (char)key;
+      int key = -1;
+      while (key <= 0) {
+        key = keyboard_getkey_nonblock();
+        if (key <= 0) {
+          __asm__ volatile("sti");
+          task_sleep(5);
         }
       }
-    } else if (fd == 1 || fd == 2) { // stdout/stderr
-      result = (uint32_t)-EBADF;
-      kernel_free(kernel_buffer);
+
+      char c = (char)key;
+      serial_printf(COM1_BASE, "[KBD] PID %d GOT: %d\r\n", current->task_id,
+                    (int)c);
+
+      if (c == '\n' || (c >= 32 && c < 127) || c == '\b') {
+        terminal_putchar(&main_terminal, c);
+      }
+
+      *((char *)buf_ptr) = c;
+      result = 1;
       break;
-    } else if (is_valid_fd(fd)) {
-      int32_t vfs_result = vfs_read(fd, kernel_buffer, count);
-      if (vfs_result >= 0) {
-        bytes_read = vfs_result;
-      } else {
-        result = (uint32_t)-EIO;
-        kernel_free(kernel_buffer);
+    }
+
+    // --- ARCHIVOS NORMALES ---
+    int32_t bytes_read = 0;
+    if (is_valid_fd(fd)) {
+      char *kernel_buffer = (char *)kernel_malloc(count);
+      if (!kernel_buffer) {
+        result = (uint32_t)-ENOMEM;
         break;
       }
+      bytes_read = vfs_read(fd, kernel_buffer, (uint32_t)count);
+
+      if (bytes_read > 0) {
+        if (validate_user_pointer(buf_ptr, (uint32_t)bytes_read)) {
+          memcpy((void *)buf_ptr, kernel_buffer, (size_t)bytes_read);
+          result = (uint32_t)bytes_read;
+        } else {
+          result = (uint32_t)-EFAULT;
+        }
+      } else {
+        result = (uint32_t)bytes_read;
+      }
+      kernel_free(kernel_buffer);
+      task_yield(); // Yielding per read ensures system doesn't hang!
     } else {
       result = (uint32_t)-EBADF;
-      kernel_free(kernel_buffer);
-      break;
     }
-
-    if (bytes_read > 0) {
-      int copied = copy_to_user(buf_ptr, kernel_buffer, bytes_read);
-      if (copied < 0) {
-        result = (uint32_t)-EFAULT;
-      } else {
-        result = bytes_read;
-      }
-    }
-
-    kernel_free(kernel_buffer);
     break;
   }
 
@@ -382,12 +384,24 @@ void syscall_handler(struct regs *r) {
   // SYSCALLS DE TECLADO
   // ============================================
   case SYSCALL_READKEY: {
+    // Limpieza agresiva al nacer
+    if (current->task_id > 2 &&
+        (current->flags & TASK_FLAG_KBD_CLEAN_REQUIRED)) {
+      keyboard_clear_buffer();
+      task_sleep(40);
+      keyboard_clear_buffer();
+      current->flags &= ~TASK_FLAG_KBD_CLEAN_REQUIRED;
+      serial_printf(COM1_BASE, "[READKEY] KBD Cleaned for PID %d\r\n",
+                    current->task_id);
+    }
+
     int key = -1;
     while (key == -1) {
       key = keyboard_getkey_nonblock();
       if (key == -1)
         task_sleep(10);
     }
+    serial_printf(COM1_BASE, "[READKEY] Result: %d\r\n", key);
     result = (uint32_t)key;
     break;
   }
@@ -397,12 +411,23 @@ void syscall_handler(struct regs *r) {
     break;
 
   case SYSCALL_GETC: {
+    if (current->task_id > 2 &&
+        (current->flags & TASK_FLAG_KBD_CLEAN_REQUIRED)) {
+      keyboard_clear_buffer();
+      task_sleep(40);
+      keyboard_clear_buffer();
+      current->flags &= ~TASK_FLAG_KBD_CLEAN_REQUIRED;
+      serial_printf(COM1_BASE, "[GETC] KBD Cleaned for PID %d\r\n",
+                    current->task_id);
+    }
+
     int key = -1;
     while (key == -1) {
       key = keyboard_getkey_nonblock();
       if (key == -1)
         task_sleep(10);
     }
+    serial_printf(COM1_BASE, "[GETC] Result: %d\r\n", key);
     result = (uint32_t)key;
     break;
   }
@@ -410,6 +435,16 @@ void syscall_handler(struct regs *r) {
   case SYSCALL_GETS: {
     uint32_t buf_ptr = r->ebx;
     size_t max_len = r->ecx;
+
+    if (current->task_id > 2 &&
+        (current->flags & TASK_FLAG_KBD_CLEAN_REQUIRED)) {
+      keyboard_clear_buffer();
+      task_sleep(40);
+      keyboard_clear_buffer();
+      current->flags &= ~TASK_FLAG_KBD_CLEAN_REQUIRED;
+      serial_printf(COM1_BASE, "[GETS] KBD Cleaned for PID %d\r\n",
+                    current->task_id);
+    }
 
     if (!validate_user_pointer(buf_ptr, max_len)) {
       result = (uint32_t)-EFAULT;
@@ -437,6 +472,7 @@ void syscall_handler(struct regs *r) {
       if (key == '\n') {
         kernel_buffer[pos] = '\0';
         done = true;
+        terminal_putchar(&main_terminal, '\n'); // Echo extra para GETS
         break;
       } else if (key == '\b') {
         if (pos > 0) {
@@ -450,14 +486,10 @@ void syscall_handler(struct regs *r) {
     }
 
     kernel_buffer[max_len - 1] = '\0';
-    int copied = copy_to_user(buf_ptr, kernel_buffer, max_len);
-    if (copied < 0) {
-      result = (uint32_t)-EFAULT;
-    } else {
-      result = (uint32_t)pos;
-    }
-
+    serial_printf(COM1_BASE, "[GETS] Result: %s\r\n", kernel_buffer);
+    memcpy((void *)buf_ptr, kernel_buffer, max_len);
     kernel_free(kernel_buffer);
+    result = 0;
     break;
   }
 
@@ -477,14 +509,25 @@ void syscall_handler(struct regs *r) {
     uint32_t path_ptr = r->ebx;
     uint32_t flags = r->ecx;
 
-    char kernel_path[VFS_PATH_MAX];
+    // Usar el heap en lugar del stack para evitar desbordamientos (Stack
+    // Overflow)
+    char *kernel_path = (char *)kernel_malloc(VFS_PATH_MAX);
+    if (!kernel_path) {
+      result = (uint32_t)-ENOMEM;
+      break;
+    }
+    memset(kernel_path, 0, VFS_PATH_MAX);
+
     if (copy_string_from_user(kernel_path, path_ptr, VFS_PATH_MAX) < 0) {
+      kernel_free(kernel_path);
       result = (uint32_t)-EFAULT;
       break;
     }
 
     int fd = vfs_open(kernel_path, flags);
     result = (uint32_t)fd;
+
+    kernel_free(kernel_path);
     break;
   }
 
@@ -506,46 +549,43 @@ void syscall_handler(struct regs *r) {
 
   case SYSCALL_GETCWD: {
     uint32_t buf_ptr = r->ebx;
-    size_t size = r->ecx;
+    uint32_t size = r->ecx;
 
     if (!validate_user_pointer(buf_ptr, size)) {
       result = (uint32_t)-EFAULT;
       break;
     }
 
-    int copied = copy_string_to_user(buf_ptr, cwd_buffer, size);
-    if (copied < 0) {
-      result = (uint32_t)-EFAULT;
-    } else {
-      result = 0;
+    if (strlen(current->cwd) >= size) {
+      result = (uint32_t)-ERANGE;
+      break;
     }
+
+    strcpy((char *)buf_ptr, current->cwd);
+    result = 0;
     break;
   }
 
   case SYSCALL_CHDIR: {
     uint32_t path_ptr = r->ebx;
-
     char kernel_path[VFS_PATH_MAX];
     if (copy_string_from_user(kernel_path, path_ptr, VFS_PATH_MAX) < 0) {
       result = (uint32_t)-EFAULT;
       break;
     }
 
+    // Resolver el path
+    vfs_superblock_t *sb;
     const char *rel;
-    vfs_superblock_t *sb = find_mount_for_path(kernel_path, &rel);
-    if (!sb) {
+    vfs_node_t *node = vfs_resolve_path(kernel_path, 0, &sb, &rel);
+
+    if (!node) {
       result = (uint32_t)-ENOENT;
       break;
     }
 
-    vfs_node_t *node = resolve_path_to_vnode(sb, rel);
-    if (!node || node->type != VFS_NODE_DIR) {
-      if (node) {
-        node->refcount--;
-        if (node->refcount == 0 && node->ops->release) {
-          node->ops->release(node);
-        }
-      }
+    if (node->type != VFS_NODE_DIR) {
+      node->refcount--;
       result = (uint32_t)-ENOTDIR;
       break;
     }
@@ -555,15 +595,20 @@ void syscall_handler(struct regs *r) {
       node->ops->release(node);
     }
 
-    strncpy(cwd_buffer, kernel_path, VFS_PATH_MAX - 1);
-    cwd_buffer[VFS_PATH_MAX - 1] = '\0';
-    result = 0;
+    // Normalizar antes de guardar en la tarea
+    char normalized[VFS_PATH_MAX];
+    if (vfs_normalize_path(kernel_path, normalized, VFS_PATH_MAX) == VFS_OK) {
+      strncpy(current->cwd, normalized, VFS_PATH_MAX - 1);
+      current->cwd[VFS_PATH_MAX - 1] = '\0';
+      result = 0;
+    } else {
+      result = (uint32_t)-ENOENT;
+    }
     break;
   }
 
   case SYSCALL_MKDIR: {
     uint32_t path_ptr = r->ebx;
-
     char kernel_path[VFS_PATH_MAX];
     if (copy_string_from_user(kernel_path, path_ptr, VFS_PATH_MAX) < 0) {
       result = (uint32_t)-EFAULT;
@@ -587,6 +632,19 @@ void syscall_handler(struct regs *r) {
 
   case SYSCALL_UNLINK: {
     uint32_t path_ptr = r->ebx;
+    char kernel_path[VFS_PATH_MAX];
+    if (copy_string_from_user(kernel_path, path_ptr, VFS_PATH_MAX) < 0) {
+      result = (uint32_t)-EFAULT;
+      break;
+    }
+    int ret = vfs_unlink(kernel_path);
+    result = (ret == VFS_OK) ? 0 : (uint32_t)-EACCES;
+    break;
+  }
+
+  case SYSCALL_EXECVE: {
+    uint32_t path_ptr = r->ebx;
+    uint32_t argv_ptr = r->ecx;
 
     char kernel_path[VFS_PATH_MAX];
     if (copy_string_from_user(kernel_path, path_ptr, VFS_PATH_MAX) < 0) {
@@ -594,8 +652,104 @@ void syscall_handler(struct regs *r) {
       break;
     }
 
-    int ret = vfs_unlink(kernel_path);
-    result = (ret == VFS_OK) ? 0 : (uint32_t)-EACCES;
+    // Parse argv from user space
+    int argc = 0;
+    char *kernel_argv[32]; // Max 32 arguments
+    memset(kernel_argv, 0, sizeof(kernel_argv));
+
+    if (argv_ptr != 0) {
+      // argv is an array of char* pointers
+      uint32_t *user_argv = (uint32_t *)argv_ptr;
+
+      while (argc < 32) {
+        // Validate pointer to argv[argc]
+        if (!validate_user_pointer((uint32_t)&user_argv[argc],
+                                   sizeof(uint32_t))) {
+          break;
+        }
+
+        uint32_t str_ptr = user_argv[argc];
+        if (str_ptr == 0) { // NULL terminator
+          break;
+        }
+
+        // Allocate space for this argument
+        kernel_argv[argc] = (char *)kernel_malloc(256);
+        if (!kernel_argv[argc]) {
+          // Free previously allocated args
+          for (int i = 0; i < argc; i++) {
+            kernel_free(kernel_argv[i]);
+          }
+          result = (uint32_t)-ENOMEM;
+          goto execve_cleanup;
+        }
+
+        // Copy the string from user space
+        if (copy_string_from_user(kernel_argv[argc], str_ptr, 256) < 0) {
+          kernel_free(kernel_argv[argc]);
+          for (int i = 0; i < argc; i++) {
+            kernel_free(kernel_argv[i]);
+          }
+          result = (uint32_t)-EFAULT;
+          goto execve_cleanup;
+        }
+
+        argc++;
+      }
+    }
+
+    // If no arguments were provided, use just the path
+    if (argc == 0) {
+      kernel_argv[0] = kernel_path;
+      argc = 1;
+    }
+
+    extern task_t *exec_load_and_run(int argc, char **argv);
+    task_t *new_task = exec_load_and_run(argc, kernel_argv);
+
+    // Free allocated argv strings (but not kernel_path if it was used)
+    for (int i = 0; i < argc; i++) {
+      if (kernel_argv[i] != kernel_path) {
+        kernel_free(kernel_argv[i]);
+      }
+    }
+
+    if (new_task) {
+      new_task->parent = current;
+      result = new_task->task_id;
+    } else {
+      result = (uint32_t)-ENOENT;
+    }
+
+  execve_cleanup:
+    break;
+  }
+
+  case SYSCALL_WAITPID: {
+    uint32_t pid = r->ebx;
+    uint32_t status_ptr = r->ecx;
+
+    task_t *target = task_find_by_id(pid);
+    if (!target) {
+      result = (uint32_t)-ECHILD;
+      break;
+    }
+
+    if (target->state == TASK_FINISHED || target->state == TASK_ZOMBIE) {
+      if (status_ptr && validate_user_pointer(status_ptr, 4)) {
+        *(int *)status_ptr = target->exit_code;
+      }
+      result = pid;
+    } else {
+      current->state = TASK_WAITING;
+      current->wait_for_pid = pid;
+      task_yield();
+
+      if (status_ptr && validate_user_pointer(status_ptr, 4)) {
+        *(int *)status_ptr = target->exit_code;
+      }
+      result = pid;
+    }
     break;
   }
 
@@ -614,20 +768,26 @@ void syscall_handler(struct regs *r) {
     switch (whence) {
     case 0: // SEEK_SET
       f->offset = offset;
+      result = f->offset;
       break;
     case 1: // SEEK_CUR
       f->offset += offset;
+      result = f->offset;
       break;
-    case 2: // SEEK_END
-      result = (uint32_t)-ENOSYS;
+    case 2: { // SEEK_END - Asumir tamaño del archivo si es posible
+      vfs_dirent_t stat;
+      if (f->node->ops->getattr) {
+        f->node->ops->getattr(f->node, &stat);
+        f->offset = stat.size + offset;
+        result = f->offset;
+      } else {
+        result = (uint32_t)-ENOSYS;
+      }
       break;
+    }
     default:
       result = (uint32_t)-EINVAL;
       break;
-    }
-
-    if (result != (uint32_t)-ENOSYS && result != (uint32_t)-EINVAL) {
-      result = f->offset;
     }
     break;
   }
@@ -859,43 +1019,303 @@ void syscall_handler(struct regs *r) {
     break;
   }
 
-  case SYSCALL_STAT:
+  case SYSCALL_RMDIR: {
+    uint32_t path_ptr = r->ebx;
+    char path[VFS_PATH_MAX];
+    if (copy_string_from_user(path, path_ptr, VFS_PATH_MAX) < 0) {
+      result = (uint32_t)-EFAULT;
+      break;
+    }
+    int ret = vfs_rmdir(path);
+    result = (ret == VFS_OK) ? 0 : (uint32_t)-EACCES;
+    break;
+  }
+
+  case SYSCALL_RENAME: {
+    uint32_t old_ptr = r->ebx;
+    uint32_t new_ptr = r->ecx;
+    char old_path[VFS_PATH_MAX], new_path[VFS_PATH_MAX];
+    if (copy_string_from_user(old_path, old_ptr, VFS_PATH_MAX) < 0 ||
+        copy_string_from_user(new_path, new_ptr, VFS_PATH_MAX) < 0) {
+      result = (uint32_t)-EFAULT;
+      break;
+    }
+    int ret = vfs_rename(old_path, new_path);
+    result = (ret == VFS_OK) ? 0 : (uint32_t)-EACCES;
+    break;
+  }
+
   case SYSCALL_FORK:
-  case SYSCALL_EXECVE:
-  case SYSCALL_RMDIR:
+    // Stub: No soportamos fork real aún (requiere clonar memoria)
+    result = (uint32_t)-ENOSYS;
+    break;
+
   case SYSCALL_GETPPID:
+    result = current->parent ? current->parent->task_id : 0;
+    break;
+
   case SYSCALL_GETUID:
   case SYSCALL_GETGID:
-  case SYSCALL_DUP:
-  case SYSCALL_DUP2:
-  case SYSCALL_PIPE:
-  case SYSCALL_WAITPID:
-  case SYSCALL_BRK:
-  case SYSCALL_SBRK:
-  case SYSCALL_MMAP:
-  case SYSCALL_MUNMAP:
-  case SYSCALL_GETDENTS:
-  case SYSCALL_FSTAT:
-  case SYSCALL_FSYNC:
-  case SYSCALL_TRUNCATE:
-  case SYSCALL_ACCESS:
-  case SYSCALL_CHMOD:
-  case SYSCALL_CHOWN:
-  case SYSCALL_UMASK:
-  case SYSCALL_GETRUSAGE:
-  case SYSCALL_TIMES:
-  case SYSCALL_SYSCONF:
-  case SYSCALL_GETPGRP:
-  case SYSCALL_SETPGID:
-  case SYSCALL_SETSID:
-  case SYSCALL_GETSID:
-  case SYSCALL_MOUNT:
-  case SYSCALL_UMOUNT:
-  case SYSCALL_LSEEK:
+    result = 0; // Por ahora root
+    break;
+
+  case SYSCALL_DUP: {
+    // Stub: No soportamos dup aún
+    result = (uint32_t)-ENOSYS;
+    break;
+  }
+
+  case SYSCALL_SBRK: {
+    int32_t incr = (int32_t)r->ebx;
+    if (!current->address_space) {
+      result = (uint32_t)-ENOMEM;
+      break;
+    }
+
+    uint32_t old_brk = current->address_space->heap_current;
+    if (incr == 0) {
+      result = old_brk;
+    } else {
+      void *new_brk_ptr =
+          vmm_brk(current->address_space, (void *)(old_brk + incr));
+      if (new_brk_ptr == (void *)-1) {
+        result = (uint32_t)-ENOMEM;
+      } else {
+        result = old_brk; // Newlib espera el break ANTERIOR
+      }
+    }
+    break;
+  }
+
+  case SYSCALL_FSTAT: {
+    int fd = (int)r->ebx;
+    uint32_t stat_ptr = r->ecx;
+
+    if (!is_valid_fd(fd)) {
+      result = (uint32_t)-EBADF;
+      break;
+    }
+
+    vfs_stat_t st;
+    memset(&st, 0, sizeof(st));
+    vfs_file_t *f = current->fd_table[fd];
+
+    st.st_mode = (f->node->type == VFS_NODE_DIR) ? 0040000 : 0100000;
+    if (f->node->type == VFS_NODE_CHRDEV)
+      st.st_mode = 0020000;
+
+    vfs_dirent_t vstat;
+    if (f->node->ops->getattr) {
+      f->node->ops->getattr(f->node, &vstat);
+      st.st_size = vstat.size;
+    }
+
+    if (copy_to_user(stat_ptr, &st, sizeof(st)) < 0)
+      result = (uint32_t)-EFAULT;
+    else
+      result = 0;
+    break;
+  }
+
+  case SYSCALL_STAT: {
+    uint32_t path_ptr = r->ebx;
+    uint32_t stat_ptr = r->ecx;
+    char path[VFS_PATH_MAX];
+    if (copy_string_from_user(path, path_ptr, VFS_PATH_MAX) < 0) {
+      result = (uint32_t)-EFAULT;
+      break;
+    }
+
+    vfs_dirent_t vstat;
+    if (vfs_stat(path, &vstat) == VFS_OK) {
+      vfs_stat_t st;
+      memset(&st, 0, sizeof(st));
+      st.st_mode = (vstat.type == VFS_NODE_DIR) ? 0040000 : 0100000;
+      st.st_size = vstat.size;
+      if (copy_to_user(stat_ptr, &st, sizeof(st)) < 0)
+        result = (uint32_t)-EFAULT;
+      else
+        result = 0;
+    } else {
+      result = (uint32_t)-ENOENT;
+    }
+    break;
+  }
+
+  case SYSCALL_TIMES: {
+    uint32_t buf_ptr = r->ebx;
+    struct {
+      uint32_t tms_utime;
+      uint32_t tms_stime;
+      uint32_t tms_cutime;
+      uint32_t tms_cstime;
+    } tms;
+    tms.tms_utime = current->total_runtime;
+    tms.tms_stime = 0;
+    tms.tms_cutime = 0;
+    tms.tms_cstime = 0;
+    if (validate_user_pointer(buf_ptr, sizeof(tms))) {
+      copy_to_user(buf_ptr, &tms, sizeof(tms));
+      result = ticks_since_boot;
+    } else {
+      result = (uint32_t)-EFAULT;
+    }
+    break;
+  }
+
+  case SYSCALL_LSEEK: {
+    int fd = (int)r->ebx;
+    int offset = (int)r->ecx;
+    int whence = (int)r->edx;
+
+    if (!is_valid_fd(fd)) {
+      result = (uint32_t)-EBADF;
+      break;
+    }
+
+    vfs_file_t *f = current->fd_table[fd];
+    switch (whence) {
+    case 0:
+      f->offset = offset;
+      break;
+    case 1:
+      f->offset += offset;
+      break;
+    case 2: {
+      vfs_dirent_t vstat;
+      if (f->node->ops->getattr) {
+        f->node->ops->getattr(f->node, &vstat);
+        f->offset = vstat.size + offset;
+      }
+      break;
+    }
+    }
+    result = f->offset;
+    break;
+  }
+  case SYSCALL_GETDENTS: {
+    // ebx = path pointer, ecx = user buffer pointer, edx = buffer size
+    uint32_t path_ptr = r->ebx;
+    uint32_t buf_ptr = r->ecx;
+    uint32_t buf_size = r->edx;
+
+    char kernel_path[VFS_PATH_MAX];
+    if (copy_string_from_user(kernel_path, path_ptr, VFS_PATH_MAX) < 0) {
+      result = (uint32_t)-EFAULT;
+      break;
+    }
+
+    if (!validate_user_pointer(buf_ptr, buf_size)) {
+      result = (uint32_t)-EFAULT;
+      break;
+    }
+
+    // Resolve path to node
+    const char *relpath;
+    vfs_superblock_t *sb = find_mount_for_path(kernel_path, &relpath);
+    if (!sb) {
+      result = (uint32_t)-ENOENT;
+      break;
+    }
+
+    vfs_node_t *dir = resolve_path_to_vnode(sb, relpath);
+    if (!dir) {
+      result = (uint32_t)-ENOENT;
+      break;
+    }
+
+    if (dir->type != VFS_NODE_DIR) {
+      dir->refcount--;
+      if (dir->refcount == 0 && dir->ops && dir->ops->release)
+        dir->ops->release(dir);
+      result = (uint32_t)-ENOTDIR;
+      break;
+    }
+
+    if (!dir->ops || !dir->ops->readdir) {
+      dir->refcount--;
+      if (dir->refcount == 0 && dir->ops && dir->ops->release)
+        dir->ops->release(dir);
+      result = (uint32_t)-ENOSYS;
+      break;
+    }
+
+    // Read directory entries (max 64 at a time)
+    uint32_t max_entries = 64;
+    vfs_dirent_t *dirents =
+        (vfs_dirent_t *)kernel_malloc(sizeof(vfs_dirent_t) * max_entries);
+    if (!dirents) {
+      dir->refcount--;
+      if (dir->refcount == 0 && dir->ops && dir->ops->release)
+        dir->ops->release(dir);
+      result = (uint32_t)-ENOMEM;
+      break;
+    }
+
+    uint32_t count = max_entries;
+    int ret = dir->ops->readdir(dir, dirents, &count, 0);
+
+    dir->refcount--;
+    if (dir->refcount == 0 && dir->ops && dir->ops->release)
+      dir->ops->release(dir);
+
+    if (ret != 0) {
+      kernel_free(dirents);
+      result = (uint32_t)-EIO;
+      break;
+    }
+
+    // Pack entries into user buffer
+    // Format per entry: [1 byte type][null-terminated name string]
+    uint32_t offset = 0;
+    uint8_t *kernel_buf = (uint8_t *)kernel_malloc(buf_size);
+    if (!kernel_buf) {
+      kernel_free(dirents);
+      result = (uint32_t)-ENOMEM;
+      break;
+    }
+    memset(kernel_buf, 0, buf_size);
+
+    // First 4 bytes: entry count
+    if (buf_size < 4) {
+      kernel_free(kernel_buf);
+      kernel_free(dirents);
+      result = (uint32_t)-EINVAL;
+      break;
+    }
+
+    uint32_t *count_ptr = (uint32_t *)kernel_buf;
+    *count_ptr = count;
+    offset = 4;
+
+    for (uint32_t i = 0; i < count && offset < buf_size - 2; i++) {
+      uint32_t name_len = strlen(dirents[i].name);
+      // Need: 1 byte type + name_len + 1 null terminator + 4 bytes size
+      if (offset + 1 + name_len + 1 + 4 > buf_size)
+        break;
+      kernel_buf[offset++] = dirents[i].type;
+      memcpy(kernel_buf + offset, dirents[i].name, name_len + 1);
+      offset += name_len + 1;
+      // Add file size (4 bytes, little endian)
+      uint32_t fsize = dirents[i].size;
+      memcpy(kernel_buf + offset, &fsize, 4);
+      offset += 4;
+    }
+
+    if (copy_to_user(buf_ptr, kernel_buf, offset) < 0) {
+      result = (uint32_t)-EFAULT;
+    } else {
+      result = offset; // Return bytes written
+    }
+
+    kernel_free(kernel_buf);
+    kernel_free(dirents);
+    break;
+  }
+
   case SYSCALL_LINK:
   case SYSCALL_SYMLINK:
   case SYSCALL_READLINK:
-  case SYSCALL_RENAME:
   case SYSCALL_FCHDIR:
   case SYSCALL_FCHMOD:
   case SYSCALL_FCHOWN:

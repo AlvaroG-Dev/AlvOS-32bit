@@ -92,49 +92,38 @@ bool mmu_map_page(uint32_t virtual_addr, uint32_t physical_addr,
     asm volatile("invlpg (%0)" : : "r"(virtual_addr & 0xFFC00000));
   }
 
-  // Verificar si ya está mapeado con diferentes parámetros
-  if ((page_tables[pd_index][pt_index] & PAGE_PRESENT)) {
-    uint32_t current_phys = page_tables[pd_index][pt_index] & ~0xFFF;
-    uint32_t current_flags = page_tables[pd_index][pt_index] & 0xFFF;
-
-    if (current_phys != physical_addr) {
-      return false; // Colisión de mapeo
-    }
-
-    // Solo actualizar flags si son diferentes
-    if (current_flags != (flags & 0xFFF)) {
-      page_tables[pd_index][pt_index] = physical_addr | (flags & 0xFFF);
-      asm volatile("invlpg (%0)" : : "r"(virtual_addr));
-    }
-    return true;
-  }
-
-  // ✅ VERIFICAR CONFLICTOS DE PERMISOS
+  // Verificar si ya está mapeado
   if ((page_directory[pd_index] & PAGE_PRESENT)) {
-    if (page_directory[pd_index] & PAGE_4MB) {
-      // Página grande existente
-      uint32_t existing_flags = page_directory[pd_index] & 0xFFF;
-
-      // Si los flags son diferentes, puede ser un problema
-      if ((existing_flags & PAGE_USER) != (flags & PAGE_USER)) {
-        terminal_printf(&main_terminal,
-                        "WARNING: Page permission conflict at 0x%08x\n",
-                        virtual_addr);
-        return false;
-      }
-    } else {
-      // Tabla de páginas existente
+    if (!(page_directory[pd_index] & PAGE_4MB)) {
       if (page_tables[pd_index][pt_index] & PAGE_PRESENT) {
-        uint32_t existing_flags = page_tables[pd_index][pt_index] & 0xFFF;
+        uint32_t current_phys = page_tables[pd_index][pt_index] & ~0xFFF;
+        uint32_t current_flags = page_tables[pd_index][pt_index] & 0xFFF;
 
-        // Verificar conflictos de usuario/kernel
-        if ((existing_flags & PAGE_USER) != (flags & PAGE_USER)) {
+        if (current_phys == physical_addr) {
+          // Ya está mapeada a la misma dirección física, solo actualizar flags
+          // si es necesario
+          if (current_flags != (flags & 0xFFF)) {
+            page_tables[pd_index][pt_index] = physical_addr | (flags & 0xFFF);
+            asm volatile("invlpg (%0)" : : "r"(virtual_addr));
+          }
+          return true; // Éxito silencioso (o aviso)
+        } else {
           terminal_printf(&main_terminal,
-                          "ERROR: User/Kernel page conflict at 0x%08x\n",
-                          virtual_addr);
+                          ANSI_COLOR_YELLOW
+                          "[MMU] COLLISION at 0x%08x: Current Phys 0x%08x, New "
+                          "Phys 0x%08x" ANSI_COLOR_RESET "\r\n",
+                          virtual_addr, current_phys, physical_addr);
           return false;
         }
       }
+    } else {
+      terminal_printf(
+          &main_terminal,
+          ANSI_COLOR_RED
+          "[MMU] ERROR: 0x%08x is already mapped as 4MB page" ANSI_COLOR_RESET
+          "\r\n",
+          virtual_addr);
+      return false;
     }
   }
 

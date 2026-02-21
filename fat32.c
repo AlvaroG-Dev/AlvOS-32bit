@@ -969,6 +969,12 @@ int fat32_mount(void *device, vfs_superblock_t **out_sb) {
     return VFS_ERR;
   }
 
+  /* Usar total_sectors_16 si total_sectors_32 es 0 (algunas imágenes) */
+  if (fs->boot_sector.total_sectors_32 == 0 &&
+      fs->boot_sector.total_sectors_16 != 0) {
+    fs->boot_sector.total_sectors_32 = fs->boot_sector.total_sectors_16;
+  }
+
   // Validate boot sector
   if (fs->boot_sector.bytes_per_sector != FAT32_SECTOR_SIZE ||
       fs->boot_sector.sectors_per_cluster == 0 ||
@@ -1041,15 +1047,21 @@ int fat32_mount(void *device, vfs_superblock_t **out_sb) {
     return VFS_ERR;
   }
 
-  // Validate and repair FAT[1]
+  // Read and validate FAT[1]
   uint32_t fat1 = fat32_get_fat_entry(fs, 1);
   serial_printf(COM1_BASE, "fat32_mount: FAT[1]=0x%08X\n", fat1);
-  if (fat1 == FAT32_BAD_CLUSTER || (fat1 & 0xF0000000) != 0x0FFFFFFF) {
-    serial_printf(COM1_BASE,
-                  "fat32_mount: Invalid FAT[1]=0x%08X, setting to 0x0FFFFFFF\n",
-                  fat1);
-    fat1 = 0x0FFFFFFF;
+
+  // Verificar que los bits 31-28 sean 0x0 (requisito de FAT32)
+  if ((fat1 & 0xF0000000) != 0x00000000) {
+    // Los bits altos están corruptos, reparar
+    serial_printf(
+        COM1_BASE,
+        "FAT32: Invalid FAT[1] value 0x%08X (bits 31-28 should be 0x0), "
+        "repairing to 0x0FFFFFFF\n",
+        fat1);
+    fat1 = 0x0FFFFFFF; // Clean, no errors
     fs->has_errors = 1;
+
     if (fat32_set_fat_entry(fs, 1, fat1) != VFS_OK ||
         fat32_flush_fat_cache(fs) != VFS_OK) {
       serial_printf(COM1_BASE, "fat32_mount: Failed to repair FAT[1]\n");
@@ -1058,6 +1070,17 @@ int fat32_mount(void *device, vfs_superblock_t **out_sb) {
       kernel_free(fs);
       return VFS_ERR;
     }
+  } else {
+    // FAT[1] tiene formato válido, interpretar su estado
+    int clean_shutdown = (fat1 & FAT32_CLN_SHUT_BIT_MASK) != 0;
+    int no_errors = (fat1 & FAT32_HRD_ERR_BIT_MASK) != 0;
+
+    serial_printf(COM1_BASE, "FAT32: Volume state: %s shutdown, %s\n",
+                  clean_shutdown ? "clean" : "dirty",
+                  no_errors ? "no errors" : "errors detected");
+
+    // No marcar como error si simplemente estaba sucio
+    // (es normal en un desmontaje no limpio)
   }
 
   // Set dirty bit
@@ -1149,6 +1172,7 @@ int fat32_mount(void *device, vfs_superblock_t **out_sb) {
   root_data->current_cluster = fs->root_dir_cluster;
   root_data->is_directory = 1;
   root_data->parent_cluster = 0;
+  root_data->current_cluster_index = 0;
   root->fs_private = root_data;
 
   sb->root = root;
@@ -1257,7 +1281,7 @@ static int fat32_unmount(vfs_superblock_t *sb) {
 
   // Manejar FAT[1] - clean bit y error bit
   uint32_t fat1 = fat32_get_fat_entry(fs, 1);
-  if (fat1 == FAT32_BAD_CLUSTER || (fat1 & 0xF0000000) != 0x0FFFFFFF) {
+  if ((fat1 & 0xF0000000) != 0x00000000) {
     serial_printf(
         COM1_BASE,
         "FAT32: Invalid FAT[1] value 0x%08X, repairing to 0x0FFFFFFF\r\n",
@@ -1386,6 +1410,12 @@ int fat32_read_boot_sector(fat32_fs_t *fs) {
     terminal_puts(&main_terminal, "FAT32: Invalid sectors per FAT\r\n");
     fs->has_errors = 1;
     return VFS_ERR;
+  }
+
+  /* Algunas imágenes usan total_sectors_16 en lugar de total_sectors_32 */
+  if (fs->boot_sector.total_sectors_32 == 0 &&
+      fs->boot_sector.total_sectors_16 != 0) {
+    fs->boot_sector.total_sectors_32 = fs->boot_sector.total_sectors_16;
   }
 
   uint32_t data_sectors =
@@ -1690,8 +1720,9 @@ int fat32_set_fat_entry(fat32_fs_t *fs, uint32_t cluster, uint32_t value) {
       (value & 0x0FFFFFFF) |
       (((uint32_t *)fs->fat_cache)[offset / 4] & 0xF0000000);
   fs->fat_cache_dirty = 1;
-  serial_printf(COM1_BASE, "FAT32: Set FAT entry for cluster %u to 0x%08X\n",
-                cluster, value);
+  // serial_printf(COM1_BASE, "FAT32: Set FAT entry for cluster %u to 0x%08X\n",
+  //               cluster, value);
+
   return VFS_OK;
 }
 
@@ -1784,7 +1815,7 @@ int fat32_free_cluster_chain(fat32_fs_t *fs, uint32_t cluster) {
     return VFS_ERR;
   }
 
-  if (cluster < 2 || cluster >= fs->total_clusters + 2) {
+  if (cluster >= fs->total_clusters + 2) {
     terminal_printf(&main_terminal,
                     "fat32_free_cluster_chain: Invalid starting cluster %u\n",
                     cluster);
@@ -1913,8 +1944,10 @@ uint32_t fat32_cluster_to_sector(fat32_fs_t *fs, uint32_t cluster) {
   }
   uint32_t sector = fs->data_start_sector +
                     ((cluster - 2) * fs->boot_sector.sectors_per_cluster);
-  serial_printf(COM1_BASE, "fat32_cluster_to_sector: Cluster %u -> Sector %u\n",
-                cluster, sector);
+  // serial_printf(COM1_BASE, "fat32_cluster_to_sector: Cluster %u -> Sector
+  // %u\n",
+  //               cluster, sector);
+
   return sector;
 }
 
@@ -1954,8 +1987,10 @@ int fat32_read_cluster(fat32_fs_t *fs, uint32_t cluster, void *buffer) {
     fs->has_errors = 1;
     return VFS_ERR;
   }
-  serial_printf(COM1_BASE, "FAT32: Read cluster %u from sector %u\n", cluster,
-                sector);
+  // serial_printf(COM1_BASE, "FAT32: Read cluster %u from sector %u\n",
+  // cluster,
+  //               sector);
+
   return VFS_OK;
 }
 
@@ -2294,6 +2329,7 @@ int fat32_lookup(vfs_node_t *parent, const char *name, vfs_node_t **out) {
               ((uint32_t)le16_to_cpu(entries[i].first_cluster_high) << 16) |
               le16_to_cpu(entries[i].first_cluster_low);
           node_data->current_cluster = node_data->first_cluster;
+          node_data->current_cluster_index = 0;
           node_data->size = le32_to_cpu(entries[i].file_size);
           node_data->attributes = entries[i].attributes;
           node_data->is_directory =
@@ -2374,6 +2410,7 @@ int fat32_create(vfs_node_t *parent, const char *name, vfs_node_t **out) {
 
   node_data->first_cluster = new_cluster;
   node_data->current_cluster = new_cluster;
+  node_data->current_cluster_index = 0;
   node_data->size = 0;
   node_data->attributes = FAT32_ATTR_ARCHIVE;
   node_data->is_directory = 0;
@@ -2412,8 +2449,20 @@ int fat32_read(vfs_node_t *node, uint8_t *buf, uint32_t size, uint32_t offset) {
   uint32_t intra_offset = offset % fs->cluster_size;
 
   // Skip to starting cluster
+  // Skip to starting cluster
   uint32_t cluster = start_cluster;
-  for (uint32_t i = 0; i < cluster_offset; i++) {
+  uint32_t current_index = 0;
+
+  // FAT32 Optimization: Use cached cluster if possible
+  if (cluster_offset >= node_data->current_cluster_index &&
+      node_data->current_cluster_index > 0) {
+    // Basic check to ensure cached cluster is valid for this file
+    // Note: This assumes current_cluster corresponds to current_cluster_index
+    cluster = node_data->current_cluster;
+    current_index = node_data->current_cluster_index;
+  }
+
+  for (uint32_t i = current_index; i < cluster_offset; i++) {
     cluster = fat32_get_fat_entry(fs, cluster);
     if (cluster >= FAT32_EOC)
       return bytes_read;
@@ -2423,7 +2472,14 @@ int fat32_read(vfs_node_t *node, uint8_t *buf, uint32_t size, uint32_t offset) {
   if (!cluster_buffer)
     return VFS_ERR;
 
+  // Track index for updating cache
+  uint32_t tracking_index = cluster_offset;
+
   while (bytes_to_read > 0 && cluster >= 2 && cluster < FAT32_EOC) {
+    // Update cache before reading (so it points to valid cluster)
+    node_data->current_cluster = cluster;
+    node_data->current_cluster_index = tracking_index;
+
     if (fat32_read_cluster(fs, cluster, cluster_buffer) != VFS_OK) {
       kernel_free(cluster_buffer);
       return VFS_ERR;
@@ -2439,7 +2495,11 @@ int fat32_read(vfs_node_t *node, uint8_t *buf, uint32_t size, uint32_t offset) {
     bytes_to_read -= bytes_to_copy;
     intra_offset = 0;
 
+    if (bytes_to_read == 0)
+      break;
+
     cluster = fat32_get_fat_entry(fs, cluster);
+    tracking_index++;
   }
 
   kernel_free(cluster_buffer);
@@ -2815,6 +2875,7 @@ int fat32_readdir(vfs_node_t *node, vfs_dirent_t *buf, uint32_t *count,
                                  ? VFS_NODE_DIR
                                  : VFS_NODE_FILE;
           (*count)++;
+          entry_index++; // CORRECCIÓN: Incrementar índice
           if (*count >= max_count)
             return VFS_OK;
         } else if (entry_index >= offset) {
@@ -2825,8 +2886,13 @@ int fat32_readdir(vfs_node_t *node, vfs_dirent_t *buf, uint32_t *count,
                                  ? VFS_NODE_DIR
                                  : VFS_NODE_FILE;
           (*count)++;
+          entry_index++; // CORRECCIÓN: Incrementar índice
           if (*count >= max_count)
             return VFS_OK;
+        } else {
+          // No cumple offset, pero debemos incrementar el índice para la
+          // próxima
+          entry_index++;
         }
         lfn_active = false;
         memset(lfn_name, 0, 256);

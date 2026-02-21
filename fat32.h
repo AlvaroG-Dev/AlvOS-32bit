@@ -138,14 +138,15 @@ typedef struct {
 
 // FAT32 vnode private data
 typedef struct {
-  uint32_t first_cluster;   // First cluster of file/directory
-  uint32_t size;            // File size (0 for directories)
-  uint32_t current_cluster; // Current cluster for sequential access
-  uint32_t cluster_offset;  // Offset within current cluster
-  uint8_t attributes;       // File attributes
-  uint8_t is_directory;     // 1 if directory, 0 if file
-  uint32_t parent_cluster;  // Cluster of the parent directory (0 for root)
-  uint8_t short_name[11];   // Short 8.3 name for locating dir entry
+  uint32_t first_cluster;         // First cluster of file/directory
+  uint32_t size;                  // File size (0 for directories)
+  uint32_t current_cluster;       // Current cluster for sequential access
+  uint32_t current_cluster_index; // Index of current_cluster (0-based)
+  uint32_t cluster_offset;        // Offset within current cluster
+  uint8_t attributes;             // File attributes
+  uint8_t is_directory;           // 1 if directory, 0 if file
+  uint32_t parent_cluster; // Cluster of the parent directory (0 for root)
+  uint8_t short_name[11];  // Short 8.3 name for locating dir entry
 } fat32_node_t;
 
 // Function prototypes

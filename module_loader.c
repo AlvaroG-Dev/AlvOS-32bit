@@ -19,22 +19,35 @@ bool module_loader_init(struct multiboot_tag* mb_info) {
         return false;
     }
 
-    // Verificar magic number y tamaño total
-    uint32_t total_size = (uint32_t)mb_info;
-    // terminal_printf(&main_terminal, "Multiboot info total size: %u bytes\n", total_size);
+    /* mb_info es la dirección FÍSICA que pasa GRUB; hay que mapearla para usarla */
+    uint32_t mb_phys = (uint32_t)mb_info;
+    if (!mmu_ensure_physical_mapped(mb_phys & ~0xFFF, 4096)) {
+        terminal_printf(&main_terminal, "ERROR: Cannot map multiboot info page\n");
+        return false;
+    }
+    const uint8_t* mb_virt = (const uint8_t*)(KERNEL_VIRTUAL_BASE + mb_phys);
+
+    /* Multiboot2: los primeros 4 bytes del bloque son el tamaño total */
+    uint32_t total_size = *(const uint32_t *)mb_virt;
     if (total_size < 8) {
         terminal_printf(&main_terminal, "ERROR: Invalid multiboot info size\n");
         return false;
     }
+    /* Mapear el bloque completo por si total_size > 4K */
+    if (total_size > 4096) {
+        if (!mmu_ensure_physical_mapped(mb_phys & ~0xFFF, (total_size + 0xFFF) & ~0xFFF)) {
+            terminal_printf(&main_terminal, "WARNING: Could not map full multiboot block\n");
+        }
+    }
 
-    // Buscar módulos en las tags de Multiboot2
-    struct multiboot_tag* tag = (struct multiboot_tag*)((uint8_t*)mb_info + 8);
+    // Buscar módulos en las tags de Multiboot2 (usar dirección virtual)
+    struct multiboot_tag* tag = (struct multiboot_tag*)(mb_virt + 8);
     module_count = 0;
 
     // Primera pasada: contar módulos y mostrar todas las tags
     uint32_t offset = 8;
     while (offset < total_size) {
-        tag = (struct multiboot_tag*)((uint8_t*)mb_info + offset);
+        tag = (struct multiboot_tag*)(mb_virt + offset);
 
         // Verificar límites
         if (offset + tag->size > total_size) {
@@ -123,7 +136,7 @@ bool module_loader_init(struct multiboot_tag* mb_info) {
     uint32_t module_index = 0;
 
     while (offset < total_size && module_index < module_count) {
-        tag = (struct multiboot_tag*)((uint8_t*)mb_info + offset);
+        tag = (struct multiboot_tag*)(mb_virt + offset);
 
         if (tag->type == MULTIBOOT_TAG_TYPE_END) {
             break;
@@ -166,8 +179,9 @@ bool module_loader_init(struct multiboot_tag* mb_info) {
             }
 
             // Calcular la dirección virtual mapeada
+            // Mapeamos desde el inicio alineado, pero el puntero apunta al inicio real
             uint32_t aligned_start = ALIGN_4KB_DOWN(loaded_modules[module_index].start);
-            uint32_t virt_addr = KERNEL_VIRTUAL_BASE + aligned_start;
+            uint32_t virt_addr = KERNEL_VIRTUAL_BASE + loaded_modules[module_index].start;
             loaded_modules[module_index].data = (void*)virt_addr;
 
             terminal_printf(&main_terminal,

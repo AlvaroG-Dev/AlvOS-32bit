@@ -23,6 +23,7 @@ typedef enum {
   DEVICE_TYPE_SATA_DISK,
   DEVICE_TYPE_SATAPI_CDROM,
   DEVICE_TYPE_USB_DISK,
+  DEVICE_TYPE_RAMDISK, /* Imagen en memoria (p. ej. módulo GRUB) */
   DEVICE_TYPE_UNKNOWN
 } device_type_t;
 
@@ -77,6 +78,8 @@ inline uint64_t rdtsc(void) {
 
 // Basic functions
 disk_err_t disk_init(disk_t *disk, uint8_t drive_number);
+/** Inicializar disco desde buffer en memoria (para módulo binfs.img) */
+disk_err_t disk_init_ramdisk(disk_t *disk, const void *data, uint32_t size_bytes);
 
 disk_err_t disk_read(disk_t *disk, uint64_t lba, uint32_t count, void *buffer);
 disk_err_t disk_write(disk_t *disk, uint64_t lba, uint32_t count,

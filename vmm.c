@@ -606,9 +606,7 @@ void *vmm_brk(address_space_t *as, void *addr) {
 
     if (!vmm_map_region(as, old_brk, expand_size,
                         PAGE_PRESENT | PAGE_RW | PAGE_USER)) {
-      terminal_printf(&main_terminal,
-                      "[VMM] ERROR: Cannot expand heap by %u bytes\n",
-                      expand_size);
+      // El error detallado ya lo dio mmu_map_page
       return (void *)-1;
     }
 

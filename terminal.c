@@ -45,6 +45,7 @@ extern ahci_controller_t ahci_controller;
 // Forward declaration for cmd_top
 void cmd_top(Terminal *term);
 void cmd_stack_debug(Terminal *term);
+void terminal_show_enhanced_prompt(Terminal *term);
 
 // Decodifica un color ANSI a color RGB
 uint32_t ansi_to_color(uint8_t ansi_code, uint8_t is_bright) {
@@ -173,6 +174,104 @@ int terminal_resize(Terminal *term) {
   }
 
   return 1;
+}
+
+// =================================================================
+// FUNCIÓN PARA CARGAR SYMLINKS
+// =================================================================
+
+void terminal_load_symlinks(Terminal *term) {
+  if (!term)
+    return;
+
+  term->link_count = 0;
+  const char *symlink_file = "/bin/symlinks.alv";
+
+  terminal_printf(term, "[SYMLINK] Attempting to load %s\r\n", symlink_file);
+
+  int fd = vfs_open(symlink_file, VFS_O_RDONLY);
+  if (fd < 0) {
+    terminal_printf(term, "[SYMLINK] Failed to open %s. Error: %d\r\n",
+                    symlink_file, fd);
+    return;
+  }
+
+  char buffer[1024];
+  int bytes_read = vfs_read(fd, buffer, sizeof(buffer) - 1);
+  vfs_close(fd);
+
+  if (bytes_read <= 0) {
+    terminal_printf(term, "[SYMLINK] Read check: bytes_read=%d\r\n",
+                    bytes_read);
+    return;
+  }
+
+  terminal_printf(term, "[SYMLINK] Read %d bytes\r\n", bytes_read);
+
+  buffer[bytes_read] = '\0';
+
+  // Imprimir los primeros chars para ver formato
+  // terminal_printf(term, "Content preview: %.20s...\r\n", buffer);
+
+  // Parsear línea por línea
+  char *saveptr_line;
+  char *line = strtok_r(buffer, "\n\r", &saveptr_line);
+  while (line && term->link_count < 32) {
+    // Ignorar comentarios y lineas vacias
+    if (line[0] == '#' || strlen(line) == 0) {
+      line = strtok_r(NULL, "\n\r", &saveptr_line);
+      continue;
+    }
+
+    // terminal_printf(term, "Line: '%s'\r\n", line);
+
+    // Buscar el separador '='
+    char *separator = strchr(line, '=');
+    if (separator) {
+      *separator = '\0';
+      char *alias = line;
+      char *target = separator + 1;
+
+      // Limpiar espacios en blanco (básico)
+      while (*alias == ' ' || *alias == '\t')
+        alias++;
+      while (*target == ' ' || *target == '\t')
+        target++;
+
+      // Strip trailing spaces from alias part
+      int len = strlen(alias);
+      while (len > 0 && (alias[len - 1] == ' ' || alias[len - 1] == '\t')) {
+        alias[len - 1] = '\0';
+        len--;
+      }
+
+      // Strip trailing spaces from target part
+      len = strlen(target);
+      while (len > 0 && (target[len - 1] == ' ' || target[len - 1] == '\t')) {
+        target[len - 1] = '\0';
+        len--;
+      }
+
+      if (strlen(alias) > 0 && strlen(target) > 0) {
+        strncpy(term->links[term->link_count].alias, alias, 63);
+        term->links[term->link_count].alias[63] = '\0'; // Safety
+        strncpy(term->links[term->link_count].target, target, 255);
+        term->links[term->link_count].target[255] = '\0'; // Safety
+        terminal_printf(term, "Alias loaded: '%s' -> '%s'\r\n", alias, target);
+        term->link_count++;
+      } else {
+        terminal_printf(term,
+                        "[SYMLINK] Warning: Empty alias or target in line\r\n");
+      }
+    } else {
+      terminal_printf(
+          term, "[SYMLINK] Warning: No separator '=' in line: %s\r\n", line);
+    }
+
+    line = strtok_r(NULL, "\n\r", &saveptr_line);
+  }
+  terminal_printf(term, "[SYMLINK] Finished loading. Count: %u\r\n",
+                  term->link_count);
 }
 
 // =================================================================
@@ -738,33 +837,29 @@ void find_fs_callback(const char *mountpoint, const char *fs_name, void *arg) {
 static void resolve_relative_path(Terminal *term, const char *input,
                                   char *full_path) {
   if (!input || input[0] == '\0') {
-    // Sin argumento, usar CWD
-    strncpy(full_path, term->cwd, VFS_PATH_MAX);
-    full_path[VFS_PATH_MAX - 1] = '\0';
-  } else if (input[0] == '/') {
-    // Path absoluto
-    strncpy(full_path, input, VFS_PATH_MAX);
+    strncpy(full_path, vfs_cwd, VFS_PATH_MAX);
     full_path[VFS_PATH_MAX - 1] = '\0';
   } else {
-    // Path relativo
-    snprintf(full_path, VFS_PATH_MAX, "%s/%s", term->cwd, input);
-  }
-
-  // Normalizar el path resultante
-  char normalized[VFS_PATH_MAX];
-  if (vfs_normalize_path(full_path, normalized, VFS_PATH_MAX) == VFS_OK) {
-    strncpy(full_path, normalized, VFS_PATH_MAX);
-    full_path[VFS_PATH_MAX - 1] = '\0';
+    // vfs_normalize_path ya maneja la concatenación con vfs_cwd si el path es
+    // relativo
+    char normalized[VFS_PATH_MAX];
+    if (vfs_normalize_path(input, normalized, VFS_PATH_MAX) == VFS_OK) {
+      strncpy(full_path, normalized, VFS_PATH_MAX);
+      full_path[VFS_PATH_MAX - 1] = '\0';
+    } else {
+      // Fallback a concatenación manual si normalización falla (no debería)
+      if (input[0] == '/') {
+        strncpy(full_path, input, VFS_PATH_MAX - 1);
+      } else {
+        snprintf(full_path, VFS_PATH_MAX, "%s/%s", vfs_cwd, input);
+      }
+      full_path[VFS_PATH_MAX - 1] = '\0';
+    }
   }
 }
 
 static void terminal_update_prompt(Terminal *term) {
-  char prompt[64] = {0};
-  snprintf(prompt, sizeof(prompt), "%s> ", term->cwd);
-  uint8_t old_echo = term->echo;
-  term->echo = 1;
-  terminal_puts(term, prompt);
-  term->echo = old_echo;
+  terminal_show_enhanced_prompt(term);
 
   // Resetear colores después del prompt para que el input del usuario sea
   // normal
@@ -900,6 +995,9 @@ void terminal_init(Terminal *term) {
     buffer_lines = MAX_BUFFER_LINES;
   }
 
+  // Cargar symlinks
+  terminal_load_symlinks(term);
+
   // Inicializar el buffer circular
   if (!circular_buffer_init(&term->buffer, term->width, buffer_lines)) {
     // Error crítico: no se pudo inicializar el buffer
@@ -933,11 +1031,20 @@ void terminal_init(Terminal *term) {
   term->view_start_line = 0;
 
   strcpy(term->cwd, "/home");
+  strcpy(vfs_cwd, "/home");
   strcpy(term->prompt_info.username, "user");
 
   // Estadísticas
   term->total_lines_written = 0;
   term->page_faults_avoided = 0;
+
+  // Inicializar buffer de entrada
+  term->input_pos = 0;
+  memset(term->input_buffer, 0, sizeof(term->input_buffer));
+  term->in_history_mode = 0;
+  memset(term->saved_input, 0, sizeof(term->saved_input));
+  term->history_count = 0;
+  term->current_history = 0;
 
   // Inicializar atributos de texto
   term->current_attrs.fg_color = COLOR_WHITE;
@@ -956,6 +1063,9 @@ void terminal_init(Terminal *term) {
 
   // Agregar la primera línea al buffer
   circular_buffer_add_line(&term->buffer);
+
+  // Configurar path por defecto
+  strcpy(term->path, "/bin:/home");
 
   memset(term->dirty_lines, 1, term->height);
   set_font(FONT_8x16_VGA);
@@ -1021,9 +1131,6 @@ void terminal_clear(Terminal *term) {
 
   // Redibujar
   terminal_draw(term);
-
-  // Mostrar nuevo prompt
-  terminal_update_prompt(term);
 }
 
 void terminal_scroll_to_bottom(Terminal *term) {
@@ -1046,78 +1153,116 @@ void terminal_scroll_to_bottom(Terminal *term) {
   memset(term->dirty_lines, 1, term->height);
 }
 
-void terminal_putchar(Terminal *term, char c) {
-  if (!term)
-    return;
-
-  if (!term->echo && c != '\n' && c != '\r' && c != '\b') {
-    return;
-  }
-
+void terminal_putchar_raw(Terminal *term, char c) {
   // IMPORTANTE: Establecer los colores antes de dibujar cada carácter
+  // Usamos los colores actuales definidos por las secuencias ANSI
   set_colors(term->current_attrs.fg_color, term->current_attrs.bg_color);
 
   if (c == '\n') {
-    // Agregar nueva línea al buffer circular
     if (!circular_buffer_add_line(&term->buffer)) {
-      return; // Error al agregar línea
+      return;
     }
-
     term->total_lines_written++;
-
-    // Mover cursor
     term->cursor_x = 0;
-
-    // Si estamos en la parte inferior de la pantalla, hacer scroll
     if (term->cursor_y >= term->height - 1) {
-      // Scroll automático si estamos siguiendo el final del buffer
-      if (term->view_start_line + term->height >= term->buffer.count - 1) {
-        term->view_start_line++;
-        memset(term->dirty_lines, 1, term->height);
+      if (term->buffer.count > term->height) {
+        term->view_start_line = term->buffer.count - term->height;
       }
+      memset(term->dirty_lines, 1, term->height);
     } else {
       term->cursor_y++;
     }
-
     if (term->cursor_y < term->height) {
       term->dirty_lines[term->cursor_y] = 1;
     }
-  } else if (c == '\b') {
-    return; // El backspace se maneja en terminal_handle_key
   } else if (c == '\r') {
     term->cursor_x = 0;
+  } else if (c == '\b') {
+    // El backspace básico si se llama desde printf o similar
+    if (term->cursor_x > 0) {
+      term->cursor_x--;
+      // Opcionalmente borrar el carácter en el buffer
+    }
   } else {
-    // Obtener la línea actual del buffer
     uint32_t current_buffer_line = term->view_start_line + term->cursor_y;
-
-    // Asegurar que la línea existe
     while (current_buffer_line >= term->buffer.count) {
       if (!circular_buffer_add_line(&term->buffer)) {
         return;
       }
       term->total_lines_written++;
     }
-
     char *line = circular_buffer_get_line(&term->buffer, current_buffer_line);
     if (line && term->cursor_x < term->width) {
       line[term->cursor_x] = c;
-
-      // Guardar color actual en per-character buffer
       uint32_t *colors =
           circular_buffer_get_colors(&term->buffer, current_buffer_line);
       if (colors) {
         colors[term->cursor_x] = term->current_attrs.fg_color;
       }
-
       if (term->cursor_y < term->height) {
         term->dirty_lines[term->cursor_y] = 1;
       }
-
       term->cursor_x++;
       if (term->cursor_x >= term->width) {
-        terminal_putchar(term, '\n'); // Auto-wrap
+        terminal_putchar_raw(term, '\n');
       }
     }
+  }
+}
+
+void terminal_putchar(Terminal *term, char c) {
+  if (!term)
+    return;
+
+  if (!term->echo && c != '\n' && c != '\r' && c != '\b') {
+    // return; // Removed this guard as user output should always work?
+    // Actually AlvOS seems to use echo flag for something else.
+    // I'll keep it for now but maybe it's why some things don't print.
+  }
+
+  // Si es el inicio de una secuencia de escape ANSI
+  if (c == 0x1B && term->ansi_parser_state == ANSI_STATE_NORMAL) {
+    term->ansi_parser_state = ANSI_STATE_ESCAPE;
+    term->ansi_buffer_pos = 0;
+    return;
+  }
+
+  switch (term->ansi_parser_state) {
+  case ANSI_STATE_ESCAPE:
+    if (c == '[') {
+      term->ansi_parser_state = ANSI_STATE_CSI;
+    } else if (c == ']') {
+      term->ansi_parser_state = ANSI_STATE_OSC;
+    } else {
+      term->ansi_parser_state = ANSI_STATE_NORMAL;
+      terminal_putchar_raw(term, c);
+    }
+    break;
+
+  case ANSI_STATE_CSI:
+    if ((c >= '0' && c <= '9') || c == ';') {
+      if (term->ansi_buffer_pos < sizeof(term->ansi_buffer) - 1) {
+        term->ansi_buffer[term->ansi_buffer_pos++] = c;
+      }
+    } else if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) {
+      term->ansi_buffer[term->ansi_buffer_pos] = '\0';
+      terminal_process_ansi_sequence(term, term->ansi_buffer);
+      term->ansi_parser_state = ANSI_STATE_NORMAL;
+    } else {
+      term->ansi_parser_state = ANSI_STATE_NORMAL;
+    }
+    break;
+
+  case ANSI_STATE_OSC:
+    if (c == 0x07 || c == 0x1B) {
+      term->ansi_parser_state = ANSI_STATE_NORMAL;
+    }
+    break;
+
+  case ANSI_STATE_NORMAL:
+  default:
+    terminal_putchar_raw(term, c);
+    break;
   }
 }
 
@@ -1197,29 +1342,6 @@ void terminal_puts(Terminal *term, const char *str) {
     return;
 
   while (*str) {
-    // Si encontramos una secuencia de escape ANSI
-    if (*str == 0x1B && *(str + 1) == '[') {
-      // Saltar el escape y el '['
-      str += 2;
-
-      // Procesar la secuencia ANSI
-      char ansi_seq[32] = {0};
-      int i = 0;
-
-      // Copiar hasta encontrar 'm' (final de secuencia color)
-      while (*str && *str != 'm' && i < sizeof(ansi_seq) - 1) {
-        ansi_seq[i++] = *str++;
-      }
-
-      if (*str == 'm') {
-        str++; // Saltar la 'm'
-        // Procesar la secuencia ANSI
-        terminal_process_ansi_sequence(term, ansi_seq);
-      }
-      continue;
-    }
-
-    // Carácter normal
     terminal_putchar(term, *str++);
   }
   terminal_draw(term);
@@ -1425,9 +1547,9 @@ void terminal_handle_key(Terminal *term, int key) {
       terminal_update_prompt(term);
       terminal_puts(term, term->input_buffer);
 
-      // Reposicionar cursor
-      uint32_t prompt_len = strlen(term->cwd) + 2; // +2 para "> "
-      term->cursor_x = prompt_len + term->input_pos;
+      // Reposicionar cursor basándose en la longitud real del prompt (ya
+      // calculada en terminal_show_enhanced_prompt)
+      term->cursor_x = term->prompt_length + term->input_pos;
       if (term->cursor_y < term->height) {
         term->dirty_lines[term->cursor_y] = 1;
       }
@@ -1461,32 +1583,25 @@ void terminal_handle_key(Terminal *term, int key) {
       terminal_putchar(term, '\n');
     }
 
-    // Guardar en historial solo si no está vacío
     if (term->input_pos > 0) {
       uint32_t hist_idx = term->history_count % COMMAND_HISTORY_SIZE;
-      strcpy(term->command_history[hist_idx], term->input_buffer);
+      strncpy(term->command_history[hist_idx], term->input_buffer, 255);
+      term->command_history[hist_idx][255] = '\0';
+
       if (term->history_count < COMMAND_HISTORY_SIZE) {
         term->history_count++;
       }
       term->current_history = term->history_count;
+
       terminal_process_command(term);
+    } else {
+      terminal_update_prompt(term);
     }
 
     // Resetear estado
     term->input_pos = 0;
     memset(term->input_buffer, 0, sizeof(term->input_buffer));
     term->in_history_mode = 0;
-
-    // Limpiar línea antes de mostrar nuevo prompt
-    if (term->echo) {
-      term->cursor_x = 0;
-      fill_rect(0, term->cursor_y * g_current_font.height,
-                term->width * (g_current_font.width + g_current_font.spacing),
-                g_current_font.height, term->bg_color);
-    }
-
-    // Usar el nuevo prompt mejorado
-    terminal_show_enhanced_prompt(term);
   } else if (key == '\b' || key == 127) { // Backspace or DEL
     if (term->input_pos > 0) {
       term->input_pos--;
@@ -1527,6 +1642,24 @@ void terminal_handle_key(Terminal *term, int key) {
     }
     memset(term->input_buffer, 0, sizeof(term->input_buffer));
     term->in_history_mode = 0;
+  } else if (key == 0x03) { // Ctrl+C
+    terminal_puts(term, "^C\n");
+    if (term->foreground_task) {
+      task_terminate(term->foreground_task, -1);
+    } else {
+      // Kill the current task if it's a user process and not the kernel shell /
+      // idle tasks.
+      task_t *curr = scheduler.current_task;
+      if (curr && (curr->flags & TASK_FLAG_USER_MODE) && curr->task_id > 2) {
+        task_terminate(curr, -1);
+      }
+    }
+    term->input_pos = 0;
+    memset(term->input_buffer, 0, sizeof(term->input_buffer));
+
+    if (!term->foreground_task) {
+      terminal_update_prompt(term);
+    }
   } else if (key >= 32 && key <= 255) { // Printable chars
     if (term->input_pos < sizeof(term->input_buffer) - 1) {
       if (term->in_history_mode) {
@@ -2744,14 +2877,25 @@ void terminal_execute(Terminal *term, const char *cmd) {
     if (argc < 2) {
       terminal_puts(term, "Usage: exec <program_path> [args...]\r\n");
     } else {
-      terminal_printf(term, "exec: Loading program: %s\r\n", argv[1]);
+      if (exec_verbose) {
+        serial_printf(COM1_BASE, "exec: Loading program: %s\r\n", argv[1]);
+      }
 
       // Cargar y ejecutar con argumentos (saltando 'exec')
       task_t *task = exec_load_and_run(argc - 1, &argv[1]);
 
       if (task) {
-        terminal_printf(term, "exec: Program started (PID %u)\r\n",
+        term->foreground_task = task; // Marcar como foreground
+        if (exec_verbose) {
+          serial_printf(COM1_BASE, "exec: Program started (PID %u)\r\n",
                         task->task_id);
+        }
+        // ESPERAR a que la tarea termine para evitar que el prompt se mezcle
+        // con la salida
+        while (task->state != TASK_FINISHED && task->state != TASK_ZOMBIE) {
+          task_yield();
+        }
+        term->foreground_task = NULL; // Limpiar foreground
       } else {
         terminal_printf(term, "exec: Failed to load or execute program\r\n");
       }
@@ -3470,71 +3614,6 @@ void terminal_execute(Terminal *term, const char *cmd) {
 
     vfs_close(fd);
     terminal_printf(term, "Total bytes read: %d\r\n", total_read);
-  } else if (strcmp(command, "ls") == 0) {
-    char full_path[VFS_PATH_MAX];
-    resolve_relative_path(term, args[0] ? args : "",
-                          full_path); // Usa CWD si no hay args
-
-    const char *relpath;
-    vfs_superblock_t *sb = find_mount_for_path(full_path, &relpath);
-    if (!sb) {
-      terminal_printf(term, "ls: No filesystem mounted at %s\r\n", full_path);
-      log_message(LOG_ERROR, "ls failed: no mount for %s\n", full_path);
-      return;
-    }
-    vfs_node_t *dir = resolve_path_to_vnode(sb, relpath);
-    if (!dir) {
-      terminal_printf(term, "ls: Could not resolve directory %s\r\n",
-                      full_path);
-      log_message(LOG_ERROR, "ls failed: could not resolve %s\n", full_path);
-      return;
-    }
-    if (dir->type != VFS_NODE_DIR) {
-      terminal_printf(term, "ls: %s is not a directory\r\n", full_path);
-      log_message(LOG_ERROR, "ls failed: %s not a directory\n", full_path);
-      dir->refcount--;
-      if (dir->refcount == 0 && dir->ops->release) {
-        dir->ops->release(dir);
-      }
-      return;
-    }
-    vfs_dirent_t *dirents =
-        (vfs_dirent_t *)kernel_malloc(sizeof(vfs_dirent_t) * 10);
-    if (!dirents) {
-      terminal_printf(term, "ls: Out of memory\r\n");
-      dir->refcount--;
-      if (dir->refcount == 0 && dir->ops->release) {
-        dir->ops->release(dir);
-      }
-      return;
-    }
-
-    uint32_t count = 10;
-    if (dir->ops->readdir(dir, dirents, &count, 0) == 0) {
-      terminal_printf(term, "Directory listing for %s: %u entries\r\n",
-                      full_path, count);
-      for (uint32_t i = 0; i < count; i++) {
-        const char *type_str = "dir";
-        if (dirents[i].type == VFS_NODE_FILE)
-          type_str = "file";
-        else if (dirents[i].type == VFS_NODE_CHRDEV)
-          type_str = "chr";
-        else if (dirents[i].type == VFS_NODE_BLKDEV)
-          type_str = "blk";
-        else if (dirents[i].type == VFS_NODE_SYMLINK)
-          type_str = "sym";
-
-        terminal_printf(term, "%s (%s)\r\n", dirents[i].name, type_str);
-      }
-    } else {
-      terminal_printf(term, "ls: Failed to list directory %s\r\n", full_path);
-      log_message(LOG_ERROR, "ls failed to list %s\n", full_path);
-    }
-    kernel_free(dirents);
-    dir->refcount--;
-    if (dir->refcount == 0 && dir->ops->release) {
-      dir->ops->release(dir);
-    }
   } else if (strcmp(command, "mounts") == 0) {
     int count = vfs_list_mounts(mounts_callback, term);
     terminal_printf(term, "Current mounts (%d):\r\n", count);
@@ -3608,8 +3687,8 @@ void terminal_execute(Terminal *term, const char *cmd) {
     vfs_close(fd);
   } else if (strcmp(command, "cd") == 0) {
     char full_path[VFS_PATH_MAX];
-    resolve_relative_path(term, args[0] ? args : "/",
-                          full_path); // Default a root si no hay args
+    resolve_relative_path(term, args[0] ? args : "/home",
+                          full_path); // Default a /home si no hay args
 
     const char *rel;
     vfs_superblock_t *sb = find_mount_for_path(full_path, &rel);
@@ -3635,8 +3714,11 @@ void terminal_execute(Terminal *term, const char *cmd) {
     // Actualizar CWD con path normalizado
     char normalized[VFS_PATH_MAX];
     if (vfs_normalize_path(full_path, normalized, VFS_PATH_MAX) == VFS_OK) {
-      strncpy(term->cwd, normalized, VFS_PATH_MAX);
-      term->cwd[VFS_PATH_MAX - 1] = '\0';
+      strncpy(vfs_cwd, normalized, VFS_PATH_MAX);
+      vfs_cwd[VFS_PATH_MAX - 1] = '\0';
+      // Mantener term->cwd sincronizado para el prompt (aunque luego lo
+      // actualizaremos)
+      strncpy(term->cwd, vfs_cwd, VFS_PATH_MAX);
     } else {
       terminal_printf(term, "cd: Failed to normalize path %s\r\n", full_path);
       log_message(LOG_ERROR, "cd failed to normalize path %s\n", full_path);
@@ -3653,6 +3735,8 @@ void terminal_execute(Terminal *term, const char *cmd) {
     }
 
     log_message(LOG_INFO, "cd successful to %s\n", term->cwd);
+  } else if (strcmp(command, "pwd") == 0) {
+    terminal_printf(term, "%s\r\n", vfs_cwd);
   } else if (strcmp(command, "touch") == 0) {
     if (args[0] == '\0') {
       terminal_puts(term, "touch: Usage: touch <path>\r\n");
@@ -3880,50 +3964,111 @@ void terminal_execute(Terminal *term, const char *cmd) {
       }
     }
   } else {
-    // Intento de buscar en el PATH
-    bool found = false;
+    // 0. Check for Symlinks/Aliases first
+    const char *resolved_command = command;
+    char alias_buffer[256];
 
-    // Si tiene /, es un camino explícito
-    if (strchr(command, '/')) {
-      terminal_printf(
-          term, "bash: %s: command not found (execution not implemented)\r\n",
-          command);
-      found = true;
-    } else {
-      // Buscar en PATH
-      char path_copy[512];
-      strncpy(path_copy, term->path, 511);
-      char *saveptr_path;
-      char *dir = strtok_r(path_copy, ":", &saveptr_path);
+    // Strip any trailing CR/LF from command just in case
+    int cmd_len = strlen(command);
+    if (cmd_len > 0 &&
+        (command[cmd_len - 1] == '\n' || command[cmd_len - 1] == '\r')) {
+      ((char *)command)[cmd_len - 1] = '\0';
+    }
 
-      while (dir) {
-        char full_path[VFS_PATH_MAX];
-        snprintf(full_path, VFS_PATH_MAX, "%s/%s", dir, command);
-
-        // Verificar si existe y es un archivo
-        // Nota: resolve_path_to_vnode puede fallar si el directorio no está
-        // montado o no existe Para simplificar, asumimos que funciona para
-        // paths normales En un sistema real usaríamos stat()
-
-        /* Implementación futura de chequeo:
-       vfs_node_t* node = resolve_path_to_vnode(NULL, full_path);
-       if (node) {
-           if (node->type == VFS_NODE_FILE) {
-              terminal_printf(term, "bash: %s: execution not implemented yet
-       (found at %s)\r\n", command, full_path); found = true;
-           }
-           if (node->ops && node->ops->release) node->ops->release(node);
-           else if (node->refcount > 0) node->refcount--;
-
-           if (found) break;
-       }
-       */
-
-        dir = strtok_r(NULL, ":", &saveptr_path);
+    for (uint32_t i = 0; i < term->link_count; i++) {
+      // terminal_printf(term, "Checking alias '%s' vs '%s'\r\n",
+      // term->links[i].alias, command);
+      if (strcmp(term->links[i].alias, command) == 0) {
+        // Alias found!
+        strncpy(alias_buffer, term->links[i].target, sizeof(alias_buffer) - 1);
+        alias_buffer[255] = '\0';
+        resolved_command = alias_buffer;
+        if (exec_verbose) {
+          serial_printf(COM1_BASE, "Alias: %s -> %s\r\n", command,
+                        resolved_command);
+        }
+        break;
       }
     }
 
-    if (!found) {
+    // Intento de buscar en el PATH o ejecutar ruta explícita (usando
+    // resolved_command)
+    bool found = false;
+    char executable_path[VFS_PATH_MAX] = {0};
+
+    // Si tiene /, es un camino explícito (absoluto o relativo)
+    // Si tiene /, es un camino explícito (absoluto o relativo)
+    if (strchr(resolved_command, '/')) {
+      char full_path[VFS_PATH_MAX];
+      resolve_relative_path(term, resolved_command, full_path);
+
+      // Verificar si existe intentando abrirlo
+      int fd = vfs_open(full_path, VFS_O_RDONLY);
+      if (fd >= 0) {
+        vfs_close(fd);
+        strncpy(executable_path, full_path, sizeof(executable_path) - 1);
+        found = true;
+      }
+    } else {
+      // Buscar en PATH (usando el comando original o el resuelto si era alias
+      // simple sin path)
+      if (strlen(term->path) > 0) {
+        char path_copy[512];
+        strncpy(path_copy, term->path, 511);
+        path_copy[511] = '\0';
+        char *saveptr_path;
+        char *dir = strtok_r(path_copy, ":", &saveptr_path);
+
+        while (dir) {
+          char full_path[VFS_PATH_MAX];
+          // Construir path: dir + / + command
+          if (dir[strlen(dir) - 1] == '/') {
+            snprintf(full_path, VFS_PATH_MAX, "%s%s", dir, resolved_command);
+          } else {
+            snprintf(full_path, VFS_PATH_MAX, "%s/%s", dir, resolved_command);
+          }
+
+          int fd = vfs_open(full_path, VFS_O_RDONLY);
+          if (fd >= 0) {
+            vfs_close(fd);
+            strncpy(executable_path, full_path, sizeof(executable_path) - 1);
+            found = true;
+            break;
+          }
+          dir = strtok_r(NULL, ":", &saveptr_path);
+        }
+      }
+    }
+
+    if (found) {
+      // Ejecutar programa encontrado
+      char *original_cmd = argv[0];
+      argv[0] = executable_path; // Usar path completo
+
+      // terminal_printf(term, "DEBUG: Executing resolved: %s\r\n",
+      // executable_path);
+
+      // ✅ CRITICAL BUGFIX: Limpiar buffer de teclado ANTES de lanzar
+      // Esto elimina el "Enter" pulsado por el usuario para lanzar el comando.
+      keyboard_clear_buffer();
+
+      task_t *task = exec_run_quiet(argc, argv);
+
+      if (task) {
+        if (exec_verbose) {
+          serial_printf(COM1_BASE, "Program started (PID %u)\r\n",
+                        task->task_id);
+        }
+        // ESPERAR a que la tarea termine
+        while (task->state != TASK_FINISHED && task->state != TASK_ZOMBIE) {
+          task_yield();
+        }
+      } else {
+        terminal_printf(term, "Failed to execute %s\r\n", executable_path);
+      }
+
+      argv[0] = original_cmd; // Restaurar pointer (buena práctica)
+    } else {
       terminal_printf(term, "Unknown command: %s\r\n", command);
     }
   }

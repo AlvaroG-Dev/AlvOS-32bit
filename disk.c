@@ -48,6 +48,10 @@
 #define DISK_LOCK() __asm__ __volatile__("cli")
 #define DISK_UNLOCK() __asm__ __volatile__("sti")
 
+/* Disco en memoria (módulo binfs.img cargado por GRUB) */
+static const uint8_t *ramdisk_data = NULL;
+static uint32_t ramdisk_size_bytes = 0;
+
 static detected_device_t
     detected_devices[4]; // Primary master/slave, Secondary master/slave
 static int detected_device_count = 0;
@@ -1007,11 +1011,46 @@ disk_err_t disk_atapi_load(disk_t *disk) {
   }
 }
 
+/* Inicializar disco desde buffer en memoria (p. ej. módulo GRUB) */
+disk_err_t disk_init_ramdisk(disk_t *disk, const void *data,
+                             uint32_t size_bytes) {
+  if (!disk || !data || size_bytes == 0 || (size_bytes % 512) != 0) {
+    return DISK_ERR_INVALID_PARAM;
+  }
+  ramdisk_data = (const uint8_t *)data;
+  ramdisk_size_bytes = size_bytes;
+  memset(disk, 0, sizeof(disk_t));
+  disk->drive_number = 0xFE; /* identificador arbitrario */
+  disk->initialized = 1;
+  disk->present = 1;
+  disk->supports_lba48 = 0;
+  disk->sector_count = size_bytes / 512;
+  disk->type = DEVICE_TYPE_RAMDISK;
+  disk->partition_lba_offset = 0;
+  disk->is_partition = 0;
+  disk->physical_disk = NULL;
+  return DISK_ERR_NONE;
+}
+
 // Actualizar disk_read_dispatch para incluir USB:
 disk_err_t disk_read_dispatch(disk_t *disk, uint64_t lba, uint32_t count,
                               void *buffer) {
   if (!disk || !disk->initialized) {
     return DISK_ERR_NOT_INITIALIZED;
+  }
+
+  /* Disco en memoria (módulo binfs) */
+  if (disk->type == DEVICE_TYPE_RAMDISK) {
+    if (!ramdisk_data || ramdisk_size_bytes == 0) {
+      return DISK_ERR_NOT_INITIALIZED;
+    }
+    uint64_t offset = lba * 512ULL;
+    uint32_t len = count * 512;
+    if (offset + len > ramdisk_size_bytes) {
+      return DISK_ERR_LBA_OUT_OF_RANGE;
+    }
+    memcpy(buffer, ramdisk_data + (size_t)offset, len);
+    return DISK_ERR_NONE;
   }
 
   // NUEVO: Aplicar offset si es partición
@@ -1190,10 +1229,20 @@ disk_err_t disk_write_dispatch(disk_t *disk, uint64_t lba, uint32_t count,
     return DISK_ERR_NOT_INITIALIZED;
   }
 
-  // terminal_printf(&main_terminal,
-  //                 "DISK: Write dispatch called - drive=0x%02x, type=%d, "
-  //                 "LBA=%llu, count=%u\n",
-  //                 disk->drive_number, disk->type, lba, count);
+  /* RAMDISK read/writeable logic */
+  if (disk->type == DEVICE_TYPE_RAMDISK) {
+    if (!ramdisk_data || ramdisk_size_bytes == 0) {
+      return DISK_ERR_NOT_INITIALIZED;
+    }
+    uint64_t offset = lba * 512ULL;
+    uint32_t len = count * 512;
+    if (offset + len > ramdisk_size_bytes) {
+      return DISK_ERR_LBA_OUT_OF_RANGE;
+    }
+    // Cast away const since we are writing to the "disk" (RAM)
+    memcpy((void *)(ramdisk_data + (size_t)offset), buffer, len);
+    return DISK_ERR_NONE;
+  }
 
   // ============================================================
   // 1. Aplicar offset si es partición (CON VALIDACIONES MEJORADAS)

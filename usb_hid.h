@@ -48,6 +48,7 @@ typedef struct {
 
   // Buffer for interrupt transfers
   uint8_t *transfer_buffer;
+  uint8_t *prev_report; // Store previous report for change detection
 } usb_hid_device_t;
 
 void usb_hid_register_driver(void);

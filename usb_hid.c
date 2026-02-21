@@ -122,10 +122,17 @@ bool usb_hid_init(usb_device_t *device) {
                                  .wLength = 0};
   usb_control_transfer(device, &set_idle, NULL, 0);
 
-  // Allocate buffer
+  // Allocate buffers
   hid->transfer_buffer = (uint8_t *)kernel_malloc(hid->max_packet_size);
-  if (!hid->transfer_buffer)
+  hid->prev_report = (uint8_t *)kernel_malloc(hid->max_packet_size);
+  if (!hid->transfer_buffer || !hid->prev_report) {
+    if (hid->transfer_buffer)
+      kernel_free(hid->transfer_buffer);
+    if (hid->prev_report)
+      kernel_free(hid->prev_report);
     return false;
+  }
+  memset(hid->prev_report, 0, hid->max_packet_size);
 
   hid->initialized = true;
   device->driver_data = hid;
@@ -143,6 +150,8 @@ void usb_hid_cleanup(usb_device_t *device) {
     usb_hid_device_t *hid = (usb_hid_device_t *)device->driver_data;
     if (hid->transfer_buffer)
       kernel_free(hid->transfer_buffer);
+    if (hid->prev_report)
+      kernel_free(hid->prev_report);
     hid->initialized = false;
     device->driver_data = NULL;
   }
@@ -242,52 +251,60 @@ void usb_hid_poll(void) {
     if (!hid->initialized || !hid->device->connected)
       continue;
 
-    // Attempt transfer
-    // Note: usb_bulk_transfer is used as a proxy for interrupt transfer
     if (usb_bulk_transfer(hid->device, hid->ep_in, hid->transfer_buffer,
                           hid->max_packet_size, true)) {
 
       if (hid->is_keyboard) {
-        // Parse Keyboard Report (8 bytes)
-        // [Mods, Reserved, Key1, Key2, Key3, Key4, Key5, Key6]
-        uint8_t modifiers = hid->transfer_buffer[0];
+        // [Mods, Reserved, Key1...Key6]
 
-        // Very basic handling: iterate keys
+        // 1. Detectar PRESIÓN (teclas nuevas)
         for (int k = 2; k < 8; k++) {
           uint8_t usage = hid->transfer_buffer[k];
           if (usage == 0)
             continue;
 
-          // Simple logic: if key is present, assume pressed.
-          // To do this properly we need to diff against previous report.
-          // For now, let's just inject. But without diffing, this will spam
-          // keys every time we poll if the key is held down. We need
-          // 'prev_report' in hid_device struct.
+          bool was_pressed = false;
+          for (int pk = 2; pk < 8; pk++) {
+            if (hid->prev_report[pk] == usage) {
+              was_pressed = true;
+              break;
+            }
+          }
 
-          // Ignoring diffing for brevity as requested "detect improved", but
-          // spamming is bad. Let's implement minimal diff? No space in struct
-          // currently defined in file... Actually I can add it to struct in
-          // header or just static hack since I control the code. I'll add
-          // static buffers here locally or rely on "just working" for detection
-          // proof. "Detectar mejor" was the request.
-
-          uint8_t scancode = usb_to_ps2_scancode(usage);
-          if (scancode) {
-            keyboard_inject_scancode(scancode);
-            // Note: We need to send "release" codes (scancode | 0x80) when key
-            // disappears. This is complex for a simple patch. User asked to
-            // "Detect better" and "detect as keyboard". Parsing is extra credit
-            // but good.
+          if (!was_pressed) {
+            uint8_t scancode = usb_to_ps2_scancode(usage);
+            if (scancode)
+              keyboard_inject_scancode(scancode);
           }
         }
+
+        // 2. Detectar LIBERACIÓN (teclas que ya no están)
+        for (int pk = 2; pk < 8; pk++) {
+          uint8_t usage = hid->prev_report[pk];
+          if (usage == 0)
+            continue;
+
+          bool still_pressed = false;
+          for (int k = 2; k < 8; k++) {
+            if (hid->transfer_buffer[k] == usage) {
+              still_pressed = true;
+              break;
+            }
+          }
+
+          if (!still_pressed) {
+            uint8_t scancode = usb_to_ps2_scancode(usage);
+            if (scancode)
+              keyboard_inject_scancode(scancode | 0x80);
+          }
+        }
+
+        memcpy(hid->prev_report, hid->transfer_buffer, hid->max_packet_size);
+
       } else if (hid->is_mouse) {
-        // Parse Mouse Report (3 or 4 bytes)
-        // [Buttons, X, Y, (Wheel)]
-        // Relative coords
         uint8_t buttons = hid->transfer_buffer[0];
         int8_t dx = (int8_t)hid->transfer_buffer[1];
         int8_t dy = (int8_t)hid->transfer_buffer[2];
-
         mouse_inject_event(dx, dy, buttons);
       }
     }

@@ -35,6 +35,9 @@ typedef enum {
 // Flags para tareas
 #define TASK_FLAG_USER_MODE 0x00000001  // Ejecuta en modo usuario (Ring 3)
 #define TASK_FLAG_USER_STACK 0x00000002 // Tiene stack de usuario asignado
+#define TASK_FLAG_QUIET 0x00000004 // Silencia debug info al cargar/ejecutar
+#define TASK_FLAG_KBD_CLEAN_REQUIRED                                           \
+  0x00000008 // Limpieza obligatoria al 1er read
 
 // Contexto de CPU para cambio de tareas
 typedef struct {
@@ -101,6 +104,14 @@ typedef struct task {
 
   // Tabla de descriptores de archivos por proceso
   struct vfs_file *fd_table[VFS_MAX_FDS];
+
+  // Jerarquía y espera
+  uint32_t wait_for_pid;
+  uint8_t has_waited;
+  struct task *parent;
+
+  // Directorio de trabajo por proceso
+  char cwd[256];
 } task_t;
 
 // Planificador de tareas
@@ -125,6 +136,7 @@ void task_destroy(task_t *task);
 void task_yield(void);         // Ceder voluntariamente el CPU
 void task_sleep(uint32_t ms);  // Dormir por tiempo específico
 void task_exit(int exit_code); // Terminar tarea actual
+void task_terminate(task_t *task, int exit_code); // Terminar cualquier tarea
 
 // Control del planificador
 void scheduler_start(void);
