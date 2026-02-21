@@ -13,8 +13,8 @@
 bool exec_verbose = false;
 
 // Forward declarations
-static bool map_user_pages(uint32_t virt_start, uint32_t size,
-                           const char *region_name);
+static bool map_user_pages(address_space_t *as, uint32_t virt_start,
+                           uint32_t size, const char *region_name);
 static bool copy_code_to_user(const void *kernel_buffer, uint32_t size,
                               uint32_t user_dest);
 
@@ -272,7 +272,8 @@ static bool elf_apply_relocations(const void *file_data, uint32_t delta) {
 /**
  * Carga los segmentos de un archivo ELF en memoria
  */
-static bool elf_load_segments(const void *data, uint32_t size, uint32_t delta) {
+static bool elf_load_segments(const void *data, uint32_t size, uint32_t delta,
+                              address_space_t *as) {
   Elf32_Ehdr *header = (Elf32_Ehdr *)data;
   Elf32_Phdr *ph_table = (Elf32_Phdr *)((uint8_t *)data + header->e_phoff);
 
@@ -301,8 +302,8 @@ static bool elf_load_segments(const void *data, uint32_t size, uint32_t delta) {
           "  Segment %d: offset=0x%x, vaddr=0x%x, filesz=0x%x, memsz=0x%x\r\n",
           i, phdr->p_offset, vaddr, phdr->p_filesz, phdr->p_memsz);
 
-    // 1. Mapear la memoria necesaria
-    if (!map_user_pages(vaddr, phdr->p_memsz, "ELF_SEGMENT")) {
+    // 1. Mapear la memoria necesaria usando el VMM
+    if (!map_user_pages(as, vaddr, phdr->p_memsz, "ELF_SEGMENT")) {
       return false;
     }
 
@@ -357,8 +358,26 @@ static uint32_t detect_load_address(const void *data, uint32_t size) {
 /**
  * Mapea páginas en memoria de usuario con verificación completa
  */
-static bool map_user_pages(uint32_t virt_start, uint32_t size,
-                           const char *region_name) {
+static bool map_user_pages(address_space_t *as, uint32_t virt_start,
+                           uint32_t size, const char *region_name) {
+  if (exec_verbose)
+    terminal_printf(&main_terminal,
+                    ANSI_COLOR_CYAN
+                    "[EXEC]" ANSI_COLOR_RESET
+                    " Mapping region %s at 0x%08x (%u bytes)\r\n",
+                    region_name, virt_start, size);
+
+  // Usar el VMM para gestionar el mapeado y la memoria física
+  return vmm_map_region(as, virt_start, size,
+                        PAGE_PRESENT | PAGE_RW | PAGE_USER);
+}
+
+/**
+ * Mapea páginas en memoria de usuario con verificación completa (versión
+ * legacy)
+ */
+static bool map_user_pages_legacy(uint32_t virt_start, uint32_t size,
+                                  const char *region_name) {
   uint32_t aligned_virt_start = ALIGN_4KB_DOWN(virt_start);
   uint32_t end_addr = virt_start + size;
   uint32_t aligned_end_addr = ALIGN_4KB_UP(end_addr);
@@ -688,11 +707,23 @@ task_t *exec_load_and_run(int argc, char **argv) {
     return NULL;
   }
 
-  // ====== PASO 2: Procesar formato (ELF o Plano) ======
+  // ====== PASO 2: Analizar formato y preparar espacio de direcciones ======
   if (exec_verbose)
     terminal_printf(&main_terminal,
                     "\r\n" ANSI_COLOR_BLUE "[STEP 2]" ANSI_COLOR_RESET
-                    " Processing file format...\r\n");
+                    " Preparing address space...\r\n");
+
+  address_space_t *as = vmm_create_address_space();
+  if (!as) {
+    terminal_printf(&main_terminal, ANSI_COLOR_RED
+                    "[EXEC] Failed to create address space" ANSI_COLOR_RESET
+                    "\r\n");
+    kernel_free(file_buffer);
+    return NULL;
+  }
+
+  uint32_t old_cr3 = mmu_get_current_cr3();
+  mmu_load_cr3(as->page_directory);
 
   uint32_t entry_point = 0;
   uint32_t code_size = file_size;
@@ -707,100 +738,56 @@ task_t *exec_load_and_run(int argc, char **argv) {
       terminal_printf(&main_terminal, ANSI_COLOR_GREEN
                       "  Format: ELF32" ANSI_COLOR_RESET "\r\n");
 
-    // Si es ET_DYN (PIE), podemos elegir cualquier base.
     if (header->e_type == ET_DYN) {
       static uint32_t next_auto_base = 0x04000000;
       base_delta = next_auto_base;
-      next_auto_base += 0x01000000; // Siguiente programa 16MB después
-      terminal_printf(
-          &main_terminal,
-          ANSI_COLOR_YELLOW
-          "  Type: PIE (Relocatable) -> Delta: 0x%08x" ANSI_COLOR_RESET "\r\n",
-          base_delta);
+      next_auto_base += 0x01000000;
     }
 
     entry_point = header->e_entry + base_delta;
 
-    // 1. Cargar segmentos con el delta aplicado
-    if (!elf_load_segments(file_buffer, file_size, base_delta)) {
-      terminal_printf(&main_terminal, ANSI_COLOR_RED
-                      "[EXEC] Failed to load ELF segments" ANSI_COLOR_RESET
-                      "\r\n");
+    if (!elf_load_segments(file_buffer, file_size, base_delta, as)) {
+      mmu_load_cr3(old_cr3);
+      vmm_destroy_address_space(as);
       kernel_free(file_buffer);
       return NULL;
     }
 
-    // 2. Aplicar relocaciones para PIE
     if (!elf_apply_relocations(file_buffer, base_delta)) {
-      terminal_printf(&main_terminal, ANSI_COLOR_RED
-                      "[EXEC] Failed to apply ELF relocations" ANSI_COLOR_RESET
-                      "\r\n");
+      mmu_load_cr3(old_cr3);
+      vmm_destroy_address_space(as);
       kernel_free(file_buffer);
       return NULL;
     }
   } else {
-    if (exec_verbose)
-      terminal_printf(&main_terminal, ANSI_COLOR_YELLOW
-                      "  Format: Flat Binary" ANSI_COLOR_RESET "\r\n");
     load_addr = EXEC_CODE_BASE;
     entry_point = load_addr;
 
-    // ====== PASO 3: Mapear memoria de código (solo para binarios planos)
-    // ======
-    if (exec_verbose)
-      terminal_printf(&main_terminal,
-                      "\r\n" ANSI_COLOR_BLUE "[STEP 3]" ANSI_COLOR_RESET
-                      " Mapping code memory...\r\n");
-
-    if (!map_user_pages(load_addr, ALIGN_4KB_UP(file_size), "CODE")) {
-      terminal_printf(&main_terminal, ANSI_COLOR_RED
-                      "[EXEC] Failed to map code pages" ANSI_COLOR_RESET
-                      "\r\n");
+    if (!map_user_pages(as, load_addr, ALIGN_4KB_UP(file_size), "CODE")) {
+      mmu_load_cr3(old_cr3);
+      vmm_destroy_address_space(as);
       kernel_free(file_buffer);
       return NULL;
     }
 
-    // ====== PASO 4: Copiar código a memoria de usuario (solo para binarios
-    // planos) ======
-    if (exec_verbose)
-      terminal_printf(&main_terminal,
-                      "\r\n" ANSI_COLOR_BLUE "[STEP 4]" ANSI_COLOR_RESET
-                      " Copying code to user space...\r\n");
-
     if (!copy_code_to_user(file_buffer, file_size, load_addr)) {
-      terminal_printf(&main_terminal, ANSI_COLOR_RED
-                      "[EXEC] Failed to copy code" ANSI_COLOR_RESET "\r\n");
+      mmu_load_cr3(old_cr3);
+      vmm_destroy_address_space(as);
       kernel_free(file_buffer);
       return NULL;
     }
   }
 
-  // Ya no necesitamos el buffer del kernel
+  // Restaurar CR3 original
+  mmu_load_cr3(old_cr3);
   kernel_free(file_buffer);
 
   // ====== PASO 5: Crear tarea en modo usuario ======
-  if (exec_verbose)
-    terminal_printf(&main_terminal,
-                    "\r\n" ANSI_COLOR_BLUE "[STEP 5]" ANSI_COLOR_RESET
-                    " Creating user mode task...\r\n");
-
-  // Extraer nombre del programa
   const char *name = strrchr(path, '/');
   name = name ? name + 1 : path;
 
-  if (exec_verbose)
-    terminal_printf(
-        &main_terminal,
-        ANSI_COLOR_GREEN "  Program name:" ANSI_COLOR_RESET " %s\r\n", name);
-  if (exec_verbose)
-    terminal_printf(&main_terminal,
-                    ANSI_COLOR_GREEN "  Entry point:" ANSI_COLOR_RESET
-                                     " 0x%08x\r\n",
-                    entry_point);
-
-  // Crear tarea usando task_create_user
   task_t *task = task_create_user(name, (void *)(uintptr_t)entry_point, argc,
-                                  argv, code_size, TASK_PRIORITY_NORMAL);
+                                  argv, code_size, TASK_PRIORITY_NORMAL, as);
 
   if (!task) {
     if (exec_verbose)
@@ -926,16 +913,23 @@ task_t *exec_run_quiet(int argc, char **argv) {
   }
 
   // Procesar formato (ELF o Plano)
+  address_space_t *as = vmm_create_address_space();
+  if (!as) {
+    kernel_free(buffer);
+    return NULL;
+  }
+
+  uint32_t old_cr3 = mmu_get_current_cr3();
+  mmu_load_cr3(as->page_directory);
+
   uint32_t entry_point = 0;
   uint32_t code_size = total_read;
   uint32_t base_delta = 0;
   uint32_t load_addr = 0;
-  bool is_elf = false;
 
-  Elf32_Ehdr *header = (Elf32_Ehdr *)buffer;
-  if (total_read >= sizeof(Elf32_Ehdr) && elf_check_header(header)) {
-    is_elf = true;
-
+  if (total_read >= sizeof(Elf32_Ehdr) &&
+      elf_check_header((Elf32_Ehdr *)buffer)) {
+    Elf32_Ehdr *header = (Elf32_Ehdr *)buffer;
     if (header->e_type == ET_DYN) {
       static uint32_t next_auto_base_quiet = 0x04000000;
       base_delta = next_auto_base_quiet;
@@ -944,12 +938,16 @@ task_t *exec_run_quiet(int argc, char **argv) {
 
     entry_point = header->e_entry + base_delta;
 
-    if (!elf_load_segments(buffer, total_read, base_delta)) {
+    if (!elf_load_segments(buffer, total_read, base_delta, as)) {
+      mmu_load_cr3(old_cr3);
+      vmm_destroy_address_space(as);
       kernel_free(buffer);
       return NULL;
     }
 
     if (!elf_apply_relocations(buffer, base_delta)) {
+      mmu_load_cr3(old_cr3);
+      vmm_destroy_address_space(as);
       kernel_free(buffer);
       return NULL;
     }
@@ -957,26 +955,29 @@ task_t *exec_run_quiet(int argc, char **argv) {
     load_addr = EXEC_CODE_BASE;
     entry_point = load_addr;
 
-    if (!map_user_pages(load_addr, ALIGN_4KB_UP(total_read), "CODE")) {
+    if (!map_user_pages(as, load_addr, ALIGN_4KB_UP(total_read), "CODE")) {
+      mmu_load_cr3(old_cr3);
+      vmm_destroy_address_space(as);
       kernel_free(buffer);
       return NULL;
     }
 
     if (!copy_code_to_user(buffer, total_read, load_addr)) {
+      mmu_load_cr3(old_cr3);
+      vmm_destroy_address_space(as);
       kernel_free(buffer);
       return NULL;
     }
   }
 
+  mmu_load_cr3(old_cr3);
   kernel_free(buffer);
 
-  // Extraer nombre del programa
   const char *name = strrchr(path, '/');
   name = name ? name + 1 : path;
 
-  // Crear tarea
   task_t *task = task_create_user(name, (void *)(uintptr_t)entry_point, argc,
-                                  argv, code_size, TASK_PRIORITY_NORMAL);
+                                  argv, code_size, TASK_PRIORITY_NORMAL, as);
 
   exec_verbose = true; // Restore verbose mode
   return task;

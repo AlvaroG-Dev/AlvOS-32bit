@@ -44,50 +44,38 @@ static uint32_t vmm_alloc_page_directory(void) {
     return 0;
   }
 
-  // Mapear temporalmente en higher-half para inicializar
-  uint32_t pd_phys_addr = (uint32_t)pd_phys;
-  uint32_t pd_virt = KERNEL_VIRTUAL_BASE + pd_phys_addr;
-
-  // Asegurar que esté mapeado
-  if (!mmu_is_mapped(pd_virt)) {
-    if (!mmu_map_page(pd_virt, pd_phys_addr, PAGE_PRESENT | PAGE_RW)) {
-      pmm_free_page(pd_phys);
-      return 0;
-    }
-  }
+  // Usar mapeo higher-half directo (garantizado por mmu_init para el 1er GB)
+  uint32_t *pd_ptr = (uint32_t *)(KERNEL_VIRTUAL_BASE + (uint32_t)pd_phys);
 
   // Limpiar el PD
-  uint32_t *pd_ptr = (uint32_t *)pd_virt;
   memset(pd_ptr, 0, PAGE_SIZE);
 
-  log_message(LOG_INFO, "[VMM] Allocated PD at phys=0x%08x, virt=0x%08x",
-              pd_phys_addr, pd_virt);
-
-  return pd_phys_addr;
+  return (uint32_t)pd_phys;
 }
 
 /**
  * Copia mapeos del kernel al PD de usuario
  */
 static bool vmm_copy_kernel_mappings_to_pd(uint32_t user_pd_phys) {
-  uint32_t user_pd_virt = KERNEL_VIRTUAL_BASE + user_pd_phys;
-
-  if (!mmu_is_mapped(user_pd_virt)) {
-    terminal_printf(&main_terminal, "[VMM] ERROR: User PD 0x%08x not mapped\n",
-                    user_pd_phys);
-    return false;
-  }
-
-  uint32_t *user_pd = (uint32_t *)user_pd_virt;
+  uint32_t *user_pd = (uint32_t *)(KERNEL_VIRTUAL_BASE + user_pd_phys);
   uint32_t *kernel_pd = page_directory;
+
+  // Copiar mapeos identity del kernel (0-767) que no sean USER
+  // Esto permite al kernel usar su stack y datos en el primer GB
+  for (int i = 0; i < 768; i++) {
+    if (kernel_pd[i] & PAGE_PRESENT) {
+      user_pd[i] = kernel_pd[i];
+    }
+  }
 
   // Copiar entradas del kernel (768-1023) - 3GB-4GB
   for (int i = 768; i < 1024; i++) {
     user_pd[i] = kernel_pd[i];
   }
 
-  log_message(LOG_INFO, "[VMM] Copied kernel mappings to PD 0x%08x",
-              user_pd_phys);
+  // ✅ CRÍTICO: El PD de usuario debe mapearse a sí mismo en una dirección fija
+  // (Opcional, pero útil para recursive paging. AlvOS no lo usa por ahora)
+
   return true;
 }
 
@@ -278,10 +266,31 @@ void vmm_destroy_address_space(address_space_t *as) {
     region = next;
   }
 
-  // Liberar page directory y sus page tables
-  // TODO: Liberar page tables individuales del proceso
-
+  // Liberar page directory y sus page tables (solo las de usuario)
   if (as->page_directory) {
+    uint32_t *pd =
+        (uint32_t *)(KERNEL_VIRTUAL_BASE + (uint32_t)as->page_directory);
+
+    // Solo recorremos el espacio de usuario (0-767)
+    // Las entradas 768-1023 son compartidas con el kernel y no deben liberarse.
+    // OJO: La entrada 0 también puede ser el mapeo identity del kernel
+    // (estático).
+    extern uint32_t page_tables[1024][1024];
+    uint32_t static_pt_start = (uint32_t)(uintptr_t)page_tables;
+    uint32_t static_pt_end = static_pt_start + sizeof(page_tables);
+
+    for (int i = 0; i < 768; i++) {
+      if (pd[i] & PAGE_PRESENT) {
+        uint32_t pt_phys = pd[i] & ~0xFFF;
+
+        // Solo liberar si NO es una de nuestras tablas estáticas del kernel
+        if (pt_phys < static_pt_start || pt_phys >= static_pt_end) {
+          pmm_free_page((void *)(uintptr_t)pt_phys);
+        }
+        pd[i] = 0;
+      }
+    }
+
     pmm_free_page((void *)(uintptr_t)as->page_directory);
   }
 

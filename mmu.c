@@ -1,7 +1,8 @@
 #include "mmu.h"
 #include "drawing.h"
 #include "kernel.h"
-#include "memutils.h"
+#include "log.h"
+#include "pmm.h"
 #include "string.h"
 
 extern char _start;
@@ -33,7 +34,22 @@ uint32_t mmu_get_current_cr3(void) {
   return cr3;
 }
 
+uint32_t *mmu_get_current_pd_virt(void) {
+  uint32_t cr3 = mmu_get_current_cr3();
+  // Si coincide con el PD estático, devolverlo directamente
+  if (cr3 == (uint32_t)(uintptr_t)page_directory) {
+    return page_directory;
+  }
+  // Si no, intentar usar el mapeo higher-half (asumiendo que está mapeado)
+  return (uint32_t *)(KERNEL_VIRTUAL_BASE + cr3);
+}
+
 void mmu_enable_paging(void) {
+  uint32_t cr4;
+  __asm__ __volatile__("mov %%cr4, %0" : "=r"(cr4));
+  cr4 |= 0x10; // Bit 4: PSE (Page Size Extensions)
+  __asm__ __volatile__("mov %0, %%cr4" : : "r"(cr4));
+
   uint32_t cr0;
   __asm__ __volatile__("mov %%cr0, %0\n"
                        "or $0x80000001, %0\n" // PG=1, PE=1
@@ -46,6 +62,12 @@ void mmu_enable_paging(void) {
 }
 
 // ==================== FUNCIONES DE MAPEO ====================
+
+static bool mmu_paging_enabled(void) {
+  uint32_t cr0;
+  __asm__ __volatile__("mov %%cr0, %0" : "=r"(cr0));
+  return (cr0 & 0x80000000) != 0;
+}
 
 bool mmu_map_page(uint32_t virtual_addr, uint32_t physical_addr,
                   uint32_t flags) {
@@ -62,75 +84,77 @@ bool mmu_map_page(uint32_t virtual_addr, uint32_t physical_addr,
     return false;
   }
 
+  // Obtener el directorio de páginas actual (VIRTUAL)
+  uint32_t *pd_ptr;
+  if (mmu_paging_enabled()) {
+    pd_ptr = mmu_get_current_pd_virt();
+  } else {
+    pd_ptr = page_directory;
+  }
+
   // Manejar páginas grandes (4MB)
   if (flags & PAGE_4MB) {
     if ((virtual_addr & 0x3FFFFF) || (physical_addr & 0x3FFFFF)) {
       return false; // No alineado a 4MB
     }
 
-    page_directory[pd_index] = physical_addr | flags | PAGE_PRESENT | PAGE_4MB;
+    pd_ptr[pd_index] = physical_addr | flags | PAGE_PRESENT | PAGE_4MB;
     asm volatile("invlpg (%0)" : : "r"(virtual_addr));
     return true;
   }
 
   // Crear tabla de páginas si no existe
-  if (!(page_directory[pd_index] & PAGE_PRESENT)) {
-    uint32_t pt_phys = (uint32_t)&page_tables[pd_index];
+  if (!(pd_ptr[pd_index] & PAGE_PRESENT)) {
+    uint32_t pt_phys;
+    uint32_t *pt_virt;
+
+    if (mmu_paging_enabled()) {
+      // Allocar dinámicamente
+      void *new_pt = pmm_alloc_page();
+      if (!new_pt) {
+        return false;
+      }
+      pt_phys = (uint32_t)(uintptr_t)new_pt;
+      pt_virt = (uint32_t *)(KERNEL_VIRTUAL_BASE + pt_phys);
+      // Limpiar nueva tabla
+      memset(pt_virt, 0, PAGE_SIZE);
+    } else {
+      // Usar array estático durante el arranque
+      pt_phys = (uint32_t)(uintptr_t)&page_tables[pd_index];
+      pt_virt = page_tables[pd_index];
+      used_page_tables[pd_index] = 1;
+      memset(pt_virt, 0, PAGE_TABLE_ENTRIES * sizeof(uint32_t));
+    }
 
     // Establecer flags para la tabla de páginas
     uint32_t pd_flags = PAGE_PRESENT | PAGE_RW;
     if (flags & PAGE_USER)
       pd_flags |= PAGE_USER;
 
-    page_directory[pd_index] = pt_phys | pd_flags;
-    used_page_tables[pd_index] = 1;
+    pd_ptr[pd_index] = pt_phys | pd_flags;
 
-    // Limpiar la nueva tabla de páginas
-    memset(&page_tables[pd_index], 0, PAGE_TABLE_ENTRIES * sizeof(uint32_t));
-
-    // Invalidar TLB para toda la tabla
-    asm volatile("invlpg (%0)" : : "r"(virtual_addr & 0xFFC00000));
+    // Invalidar TLB
+    asm volatile("invlpg (%0)" : : "r"(virtual_addr));
+  } else if (pd_ptr[pd_index] & PAGE_4MB) {
+    // Conflicto: ya hay una página de 4MB aquí.
+    return false;
   }
 
-  // Verificar si ya está mapeado
-  if ((page_directory[pd_index] & PAGE_PRESENT)) {
-    if (!(page_directory[pd_index] & PAGE_4MB)) {
-      if (page_tables[pd_index][pt_index] & PAGE_PRESENT) {
-        uint32_t current_phys = page_tables[pd_index][pt_index] & ~0xFFF;
-        uint32_t current_flags = page_tables[pd_index][pt_index] & 0xFFF;
+  // Obtener dirección de la tabla de páginas
+  uint32_t pt_phys = pd_ptr[pd_index] & ~0xFFF;
+  uint32_t *pt_ptr;
 
-        if (current_phys == physical_addr) {
-          // Ya está mapeada a la misma dirección física, solo actualizar flags
-          // si es necesario
-          if (current_flags != (flags & 0xFFF)) {
-            page_tables[pd_index][pt_index] = physical_addr | (flags & 0xFFF);
-            asm volatile("invlpg (%0)" : : "r"(virtual_addr));
-          }
-          return true; // Éxito silencioso (o aviso)
-        } else {
-          terminal_printf(&main_terminal,
-                          ANSI_COLOR_YELLOW
-                          "[MMU] COLLISION at 0x%08x: Current Phys 0x%08x, New "
-                          "Phys 0x%08x" ANSI_COLOR_RESET "\r\n",
-                          virtual_addr, current_phys, physical_addr);
-          return false;
-        }
-      }
-    } else {
-      terminal_printf(
-          &main_terminal,
-          ANSI_COLOR_RED
-          "[MMU] ERROR: 0x%08x is already mapped as 4MB page" ANSI_COLOR_RESET
-          "\r\n",
-          virtual_addr);
-      return false;
-    }
+  if (mmu_paging_enabled()) {
+    // Usar mapeo higher-half para acceso seguro a PTs
+    pt_ptr = (uint32_t *)(KERNEL_VIRTUAL_BASE + pt_phys);
+  } else {
+    pt_ptr = (uint32_t *)(uintptr_t)pt_phys;
   }
 
   // Establecer la nueva entrada
-  page_tables[pd_index][pt_index] = physical_addr | (flags & 0xFFF);
+  pt_ptr[pt_index] = physical_addr | (flags & 0xFFF) | PAGE_PRESENT;
 
-  // Invalidar entrada TLB específica
+  // Invalidar entrada TLB
   asm volatile("invlpg (%0)" : : "r"(virtual_addr));
   return true;
 }
@@ -141,18 +165,31 @@ bool mmu_unmap_page(uint32_t virtual_addr) {
   uint32_t pd_index = virtual_addr >> 22;
   uint32_t pt_index = (virtual_addr >> 12) & 0x3FF;
 
-  if (pd_index >= PAGE_DIRECTORY_ENTRIES || pt_index >= PAGE_TABLE_ENTRIES) {
+  uint32_t *pd_ptr = mmu_get_current_pd_virt();
+
+  if (!(pd_ptr[pd_index] & PAGE_PRESENT)) {
     return false;
   }
 
   // Verificar si es una página grande
-  if (page_directory[pd_index] & PAGE_4MB) {
-    return false; // No se puede desmapear una página individual en un mapeo de
-                  // 4MB
+  if (pd_ptr[pd_index] & PAGE_4MB) {
+    pd_ptr[pd_index] = 0;
+    __asm__ volatile("invlpg (%0)" : : "r"(virtual_addr));
+    return true;
   }
 
-  if (page_directory[pd_index] & PAGE_PRESENT) {
-    page_tables[pd_index][pt_index] = 0;
+  uint32_t pt_phys = pd_ptr[pd_index] & ~0xFFF;
+  uint32_t *pt_ptr;
+
+  if (pt_phys >= (uint32_t)(uintptr_t)page_tables &&
+      pt_phys < (uint32_t)(uintptr_t)page_tables + sizeof(page_tables)) {
+    pt_ptr = (uint32_t *)(uintptr_t)pt_phys;
+  } else {
+    pt_ptr = (uint32_t *)(KERNEL_VIRTUAL_BASE + pt_phys);
+  }
+
+  if (pt_ptr[pt_index] & PAGE_PRESENT) {
+    pt_ptr[pt_index] = 0;
     __asm__ volatile("invlpg (%0)" : : "r"(virtual_addr));
     return true;
   }
@@ -176,14 +213,16 @@ bool mmu_map_region(uint32_t virtual_start, uint32_t physical_start,
   // Mapear las páginas
   uint32_t virt_ptr = aligned_virt_start;
   uint32_t phys_ptr = aligned_phys_start;
-  uint32_t end = aligned_virt_start + aligned_size;
+  uint32_t pages_to_map = aligned_size / PAGE_SIZE;
 
-  for (; virt_ptr < end; virt_ptr += PAGE_SIZE, phys_ptr += PAGE_SIZE) {
+  for (uint32_t i = 0; i < pages_to_map; i++) {
     if (!mmu_map_page(virt_ptr, phys_ptr, flags)) {
       // Deshacer mapeos si falla
-      mmu_unmap_region(aligned_virt_start, virt_ptr - aligned_virt_start);
+      mmu_unmap_region(aligned_virt_start, i * PAGE_SIZE);
       return false;
     }
+    virt_ptr += PAGE_SIZE;
+    phys_ptr += PAGE_SIZE;
   }
 
   return true;
@@ -201,14 +240,15 @@ bool mmu_unmap_region(uint32_t virtual_start, uint32_t size) {
   uint32_t aligned_size = ALIGN_4KB_UP(end_offset);
 
   // Desmapear las páginas
-  uint32_t end = aligned_virt_start + aligned_size;
+  uint32_t pages_to_unmap = aligned_size / PAGE_SIZE;
+  uint32_t virt_ptr = aligned_virt_start;
   bool success = true;
 
-  for (uint32_t virt_ptr = aligned_virt_start; virt_ptr < end;
-       virt_ptr += PAGE_SIZE) {
+  for (uint32_t i = 0; i < pages_to_unmap; i++) {
     if (!mmu_unmap_page(virt_ptr)) {
       success = false;
     }
+    virt_ptr += PAGE_SIZE;
   }
 
   return success;
@@ -220,21 +260,29 @@ uint32_t mmu_virtual_to_physical(uint32_t virtual_addr) {
   uint32_t pd_index = virtual_addr >> 22;
   uint32_t pt_index = (virtual_addr >> 12) & 0x3FF;
 
-  if (pd_index >= PAGE_DIRECTORY_ENTRIES || pt_index >= PAGE_TABLE_ENTRIES) {
+  uint32_t *pd_ptr = mmu_get_current_pd_virt();
+
+  if (!(pd_ptr[pd_index] & PAGE_PRESENT)) {
     return 0;
   }
 
   // Verificar si es una página grande
-  if (page_directory[pd_index] & PAGE_4MB) {
-    uint32_t base = page_directory[pd_index] & 0xFFC00000;
+  if (pd_ptr[pd_index] & PAGE_4MB) {
+    uint32_t base = pd_ptr[pd_index] & 0xFFC00000;
     return base + (virtual_addr & 0x3FFFFF);
   }
 
-  if (!(page_directory[pd_index] & PAGE_PRESENT)) {
-    return 0;
+  uint32_t pt_phys = pd_ptr[pd_index] & ~0xFFF;
+  uint32_t *pt_ptr;
+
+  if (pt_phys >= (uint32_t)(uintptr_t)page_tables &&
+      pt_phys < (uint32_t)(uintptr_t)page_tables + sizeof(page_tables)) {
+    pt_ptr = (uint32_t *)(uintptr_t)pt_phys;
+  } else {
+    pt_ptr = (uint32_t *)(KERNEL_VIRTUAL_BASE + pt_phys);
   }
 
-  uint32_t pt_entry = page_tables[pd_index][pt_index];
+  uint32_t pt_entry = pt_ptr[pt_index];
   if (!(pt_entry & PAGE_PRESENT)) {
     return 0;
   }
@@ -247,28 +295,40 @@ bool mmu_is_mapped(uint32_t virtual_addr) {
 }
 
 bool mmu_set_flags(uint32_t virtual_addr, uint32_t flags) {
-  virtual_addr = ALIGN_4KB_DOWN(virtual_addr);
-
   uint32_t pd_index = virtual_addr >> 22;
   uint32_t pt_index = (virtual_addr >> 12) & 0x3FF;
 
-  if (pd_index >= PAGE_DIRECTORY_ENTRIES || pt_index >= PAGE_TABLE_ENTRIES) {
+  uint32_t *pd_ptr = mmu_get_current_pd_virt();
+
+  if (!(pd_ptr[pd_index] & PAGE_PRESENT)) {
     return false;
   }
 
-  // No se pueden cambiar flags en páginas grandes directamente
-  if (page_directory[pd_index] & PAGE_4MB) {
-    return false;
-  }
-
-  if (page_directory[pd_index] & PAGE_PRESENT) {
-    uint32_t phys_addr = page_tables[pd_index][pt_index] & ~0xFFF;
-    page_tables[pd_index][pt_index] = phys_addr | (flags & 0xFFF);
+  if (pd_ptr[pd_index] & PAGE_4MB) {
+    pd_ptr[pd_index] = (pd_ptr[pd_index] & 0xFFC00000) | (flags & 0xFFF) |
+                       PAGE_PRESENT | PAGE_4MB;
     __asm__ volatile("invlpg (%0)" : : "r"(virtual_addr));
     return true;
   }
 
-  return false;
+  uint32_t pt_phys = pd_ptr[pd_index] & ~0xFFF;
+  uint32_t *pt_ptr;
+
+  if (pt_phys >= (uint32_t)(uintptr_t)page_tables &&
+      pt_phys < (uint32_t)(uintptr_t)page_tables + sizeof(page_tables)) {
+    pt_ptr = (uint32_t *)(uintptr_t)pt_phys;
+  } else {
+    pt_ptr = (uint32_t *)(KERNEL_VIRTUAL_BASE + pt_phys);
+  }
+
+  if (!(pt_ptr[pt_index] & PAGE_PRESENT)) {
+    return false;
+  }
+
+  pt_ptr[pt_index] =
+      (pt_ptr[pt_index] & ~0xFFF) | (flags & 0xFFF) | PAGE_PRESENT;
+  __asm__ volatile("invlpg (%0)" : : "r"(virtual_addr));
+  return true;
 }
 
 void mmu_map_bios_regions(void) {
@@ -305,8 +365,8 @@ void mmu_init(void) {
   memset(page_tables, 0, sizeof(page_tables));
   memset(used_page_tables, 0, sizeof(used_page_tables));
 
-  uint32_t pd_phys = (uint32_t)&page_directory;
-  uint32_t pt_phys = (uint32_t)&page_tables;
+  uint32_t pd_phys = (uint32_t)(uintptr_t)page_directory;
+  uint32_t pt_phys = (uint32_t)(uintptr_t)page_tables;
 
   // Mapear tablas de páginas (solo kernel)
   mmu_map_region(pd_phys, pd_phys, PAGE_SIZE, PAGE_PRESENT | PAGE_RW);
@@ -314,48 +374,45 @@ void mmu_init(void) {
                  PAGE_PRESENT | PAGE_RW);
 
   // **KERNEL: SIN PAGE_USER!**
+  // 1. Identity mapping del kernel (SOLO KERNEL)
+  // Mapeamos los primeros 1MB (BIOS/VGA) y luego la imagen del kernel
+  mmu_map_region(0, 0, 0x100000, PAGE_PRESENT | PAGE_RW);
+
   uint32_t kernel_phys_start = 0x100000;
   uint32_t kernel_size = (uint32_t)&_end - kernel_phys_start;
-
-  // 1. Identity mapping para kernel (SOLO KERNEL)
   mmu_map_region(kernel_phys_start, kernel_phys_start, kernel_size,
-                 PAGE_PRESENT | PAGE_RW); // SIN PAGE_USER!
+                 PAGE_PRESENT | PAGE_RW);
 
-  // 2. Higher-half mapping para kernel (SOLO KERNEL)
-  uint32_t kernel_virt_start = KERNEL_VIRTUAL_BASE + kernel_phys_start;
-  mmu_map_region(kernel_virt_start, kernel_phys_start, kernel_size,
-                 PAGE_PRESENT | PAGE_RW); // SIN PAGE_USER!
-
-  terminal_printf(&main_terminal, "Kernel mapped (kernel-only):\n");
-  terminal_printf(&main_terminal, "  Identity: 0x%08x - 0x%08x\n",
-                  kernel_phys_start, kernel_phys_start + kernel_size);
-
-  // Stack del kernel (SOLO KERNEL)
-  uint32_t stack_size = (uint32_t)&_stack_top - (uint32_t)&_stack_bottom;
-  mmu_map_region((uint32_t)&_stack_bottom, (uint32_t)&_stack_bottom, stack_size,
-                 PAGE_PRESENT | PAGE_RW); // SIN PAGE_USER!
-
-  // Heap del kernel (SOLO KERNEL)
-  mmu_map_region((uint32_t)kernel_heap, (uint32_t)kernel_heap, STATIC_HEAP_SIZE,
-                 PAGE_PRESENT | PAGE_RW); // SIN PAGE_USER!
-
-  // **ÁREA ESPECIAL PARA CÓDIGO DE USUARIO**
-  // El usuario necesita su propio código en una dirección diferente
-  uint32_t user_code_area = 0x200000; // 2MB - área para código de usuario
-
-  terminal_printf(&main_terminal, "User code area at 0x%08x-0x%08x\r\n",
-                  user_code_area, user_code_area + 0x100000);
-
-  // Mapear área de código de usuario
-  for (uint32_t i = 0; i < 0x100000; i += PAGE_SIZE) {
-    uint32_t virt = user_code_area + i;
-    if (!mmu_is_mapped(virt)) {
-      // Identity mapping para código de usuario
-      mmu_map_page(virt, virt, PAGE_PRESENT | PAGE_RW | PAGE_USER);
-    }
+  // 1. Mapear la memoria física en el higher-half usando páginas de 4MB
+  // Mapeamos los primeros 512MB para evitar conflictos con el Framebuffer
+  // (0xE0000000)
+  uint32_t ram_to_map = 512 * 1024 * 1024; // 512MB
+  for (uint32_t addr = 0; addr < ram_to_map; addr += PAGE_SIZE_4MB) {
+    uint32_t virt_addr = KERNEL_VIRTUAL_BASE + addr;
+    mmu_map_page(virt_addr, addr, PAGE_PRESENT | PAGE_RW | PAGE_4MB);
   }
 
-  terminal_puts(&main_terminal, "User space mapping complete\r\n");
+  terminal_printf(
+      &main_terminal,
+      "Kernel mapped (512MB higher-half at 0x%08x using 4MB pages)\n",
+      KERNEL_VIRTUAL_BASE);
+
+  // Stack del kernel
+  uint32_t stack_size =
+      (uint32_t)(uintptr_t)&_stack_top - (uint32_t)(uintptr_t)&_stack_bottom;
+  mmu_map_region((uint32_t)(uintptr_t)&_stack_bottom,
+                 (uint32_t)(uintptr_t)&_stack_bottom, stack_size,
+                 PAGE_PRESENT | PAGE_RW);
+
+  // Heap del kernel
+  mmu_map_region((uint32_t)(uintptr_t)kernel_heap,
+                 (uint32_t)(uintptr_t)kernel_heap, STATIC_HEAP_SIZE,
+                 PAGE_PRESENT | PAGE_RW);
+
+  // NOTA: Eliminamos el mapeado identity del área de usuario global.
+  // Ahora cada proceso tendrá su propio espacio de usuario aislado.
+  terminal_puts(&main_terminal,
+                "Process isolation enabled (no global user area)\r\n");
 
   // Resto del código (BIOS, framebuffer, etc.)
   mmu_map_bios_regions();
@@ -780,8 +837,17 @@ bool mmu_copy_kernel_mappings(uint32_t *user_pd) {
   if (!user_pd)
     return false;
 
-  // Copiar primeros 768 entries (0-3GB) del kernel
+  // Copiar mapeos identity del kernel (0-767) que no sean USER
+  // Esto es necesario porque el kernel de AlvOS usa stack y datos en el primer
+  // GB
   for (int i = 0; i < 768; i++) {
+    if (page_directory[i] & PAGE_PRESENT) {
+      user_pd[i] = page_directory[i];
+    }
+  }
+
+  // Copiar entradas del kernel (768-1023) - 3GB-4GB
+  for (int i = 768; i < 1024; i++) {
     user_pd[i] = page_directory[i];
   }
 
@@ -792,18 +858,27 @@ uint32_t mmu_get_page_flags(uint32_t virtual_addr) {
   uint32_t pd_index = virtual_addr >> 22;
   uint32_t pt_index = (virtual_addr >> 12) & 0x3FF;
 
-  if (pd_index >= PAGE_DIRECTORY_ENTRIES)
-    return 0;
+  uint32_t *pd_ptr = mmu_get_current_pd_virt();
 
-  if (!(page_directory[pd_index] & PAGE_PRESENT)) {
+  if (!(pd_ptr[pd_index] & PAGE_PRESENT)) {
     return 0;
   }
 
-  if (page_directory[pd_index] & PAGE_4MB) {
-    return page_directory[pd_index] & 0xFFF;
+  if (pd_ptr[pd_index] & PAGE_4MB) {
+    return pd_ptr[pd_index] & 0xFFF;
   }
 
-  return page_tables[pd_index][pt_index] & 0xFFF;
+  uint32_t pt_phys = pd_ptr[pd_index] & ~0xFFF;
+  uint32_t *pt_ptr;
+
+  if (pt_phys >= (uint32_t)(uintptr_t)page_tables &&
+      pt_phys < (uint32_t)(uintptr_t)page_tables + sizeof(page_tables)) {
+    pt_ptr = (uint32_t *)(uintptr_t)pt_phys;
+  } else {
+    pt_ptr = (uint32_t *)(KERNEL_VIRTUAL_BASE + pt_phys);
+  }
+
+  return pt_ptr[pt_index] & 0xFFF;
 }
 
 bool mmu_set_page_user(uint32_t virtual_addr) {
@@ -812,29 +887,34 @@ bool mmu_set_page_user(uint32_t virtual_addr) {
   uint32_t pd_index = virtual_addr >> 22;
   uint32_t pt_index = (virtual_addr >> 12) & 0x3FF;
 
-  if (pd_index >= PAGE_DIRECTORY_ENTRIES) {
+  uint32_t *pd_ptr = mmu_get_current_pd_virt();
+
+  if (!(pd_ptr[pd_index] & PAGE_PRESENT)) {
     return false;
   }
 
-  // ✅ CRÍTICO: Si es una página grande, no podemos modificar
-  if (page_directory[pd_index] & PAGE_4MB) {
-    return false;
+  // ✅ CRÍTICO: Establecer PAGE_USER en el PDE
+  pd_ptr[pd_index] |= PAGE_USER;
+
+  if (pd_ptr[pd_index] & PAGE_4MB) {
+    __asm__ volatile("invlpg (%0)" : : "r"(virtual_addr));
+    return true;
   }
 
-  // ✅ CRÍTICO: Asegurar que la tabla existe
-  if (!(page_directory[pd_index] & PAGE_PRESENT)) {
-    return false;
+  uint32_t pt_phys = pd_ptr[pd_index] & ~0xFFF;
+  uint32_t *pt_ptr;
+
+  if (pt_phys >= (uint32_t)(uintptr_t)page_tables &&
+      pt_phys < (uint32_t)(uintptr_t)page_tables + sizeof(page_tables)) {
+    pt_ptr = (uint32_t *)(uintptr_t)pt_phys;
+  } else {
+    pt_ptr = (uint32_t *)(KERNEL_VIRTUAL_BASE + pt_phys);
   }
 
-  // ✅ CRÍTICO: Establecer PAGE_USER en el PDE (nivel del directorio)
-  page_directory[pd_index] |= PAGE_USER;
+  // ✅ Establecer PAGE_USER en el PTE
+  pt_ptr[pt_index] |= PAGE_USER;
 
-  // ✅ Establecer PAGE_USER en el PTE (nivel de tabla)
-  page_tables[pd_index][pt_index] |= PAGE_USER;
-
-  // Invalidar entrada TLB
-  __asm__ volatile("invlpg (%0)" : : "r"(virtual_addr) : "memory");
-
+  __asm__ volatile("invlpg (%0)" : : "r"(virtual_addr));
   return true;
 }
 
@@ -845,14 +925,12 @@ bool mmu_can_user_access(uint32_t virtual_addr, bool write) {
     return false;
   }
 
-  // Verificar si es página de usuario
   if (!(flags & PAGE_USER)) {
-    return false; // Página del kernel, usuario no puede acceder
+    return false;
   }
 
-  // Si necesita escritura, verificar flag RW
   if (write && !(flags & PAGE_RW)) {
-    return false; // Página es solo lectura
+    return false;
   }
 
   return true;

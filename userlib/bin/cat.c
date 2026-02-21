@@ -33,18 +33,32 @@ int main(int argc, char **argv) {
       continue;
     }
 
-    char buf[1024]; // Increased buffer size
+    char buf[1024];
     int n;
-    while ((n = _read(fd, buf, sizeof(buf))) > 0) {
+    int total_read = 0;
+    const int limit = 5000;
+
+    while (total_read < limit && (n = _read(fd, buf, sizeof(buf))) > 0) {
+      int to_write = n;
+      if (total_read + n > limit) {
+        to_write = limit - total_read;
+      }
+
       int written = 0;
-      while (written < n) {
-        int w = _write(1, buf + written, n - written);
+      while (written < to_write) {
+        int w = _write(1, buf + written, to_write - written);
         if (w <= 0) {
           print("cat: Write error\n");
           _close(fd);
           return 1;
         }
         written += w;
+      }
+      total_read += to_write;
+
+      if (total_read >= limit && n > to_write) {
+        print("\n--- Truncated at 5000 bytes ---\n");
+        break;
       }
     }
 

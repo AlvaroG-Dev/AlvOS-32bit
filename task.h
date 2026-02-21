@@ -3,6 +3,7 @@
 
 #include "isr.h"
 #include "memory.h"
+#include "pmm.h"
 #include "vfs.h"
 #include <stdbool.h>
 #include <stddef.h>
@@ -71,6 +72,7 @@ typedef struct task {
   // Stack de usuario (solo para tareas usuario)
   void *user_stack_base;
   void *user_stack_top;
+  void *user_stack_phys; // NUEVO: Dirección física del stack (para liberación)
   size_t user_stack_size;
 
   // **NUEVO: Flags para la tarea**
@@ -112,6 +114,7 @@ typedef struct task {
 
   // Directorio de trabajo por proceso
   char cwd[256];
+  bool stdin_buffer_dirty;
 } task_t;
 
 // Planificador de tareas
@@ -162,7 +165,7 @@ void cleanup_task(void *arg);
 // USER MODE
 task_t *task_create_user(const char *name, void *user_code_addr, int argc,
                          char **argv, uint32_t code_size,
-                         task_priority_t priority);
+                         task_priority_t priority, address_space_t *as);
 void task_setup_user_mode(task_t *task, void (*entry_point)(void *), void *arg,
                           void *user_stack);
 // Macros útiles

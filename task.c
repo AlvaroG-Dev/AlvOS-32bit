@@ -1,12 +1,10 @@
 #include "task.h"
 #include "exec.h"
-#include "gdt.h"
-#include "io.h"
 #include "irq.h"
 #include "kernel.h"
 #include "memory.h"
-#include "memutils.h"
 #include "mmu.h"
+#include "pmm.h"
 #include "serial.h"
 #include "string.h"
 #include "task_utils.h"
@@ -136,6 +134,14 @@ static void perform_context_switch(task_t *from, task_t *to) {
 
   // CRÃTICO: Realizar cambio de contexto
   // Esta funciÃ³n debe preservar el estado del stack correctamente
+  // ✅ MMU: Cambiar espacio de direcciones si es necesario
+  if (to->address_space && to->address_space->page_directory) {
+    mmu_load_cr3(to->address_space->page_directory);
+  } else {
+    // Si no tiene address space (tarea kernel), usar PD del kernel
+    mmu_load_cr3((uint32_t)&page_directory);
+  }
+
   task_switch_context(&from->context, &to->context);
 
   // NOTA: DespuÃ©s de task_switch_context, estamos ejecutando en el contexto de
@@ -342,10 +348,17 @@ void task_destroy(task_t *task) {
     kernel_free(task->stack_base);
   }
 
-  // Liberar stack de usuario si existe
-  if (task->user_stack_base) {
-    kernel_free(task->user_stack_base);
-    task->user_stack_base = NULL;
+  // Liberar recursos de usuario (aislamiento)
+  if (task->user_stack_phys) {
+    pmm_free_pages(task->user_stack_phys, task->user_stack_size / PAGE_SIZE);
+    task->user_stack_phys = NULL;
+  }
+
+  // Si la tarea tiene un espacio de direcciones privado (aislado), destruirlo
+  // El VMM se encargará de liberar el directorio de páginas y las regiones.
+  if (task->address_space && task->address_space != &kernel_address_space) {
+    vmm_destroy_address_space(task->address_space);
+    task->address_space = NULL;
   }
 
   // Liberar descriptores de archivo abiertos
@@ -686,17 +699,21 @@ static void user_mode_entry_wrapper(void *arg) {
     __asm__ volatile("invlpg (%0)" : : "r"(code_page));
   }
 
-  // Verificar permisos de página
-  uint32_t pd_index = code_page >> 22;
-  uint32_t pt_index = (code_page >> 12) & 0x3FF;
-
-  if (page_directory[pd_index] & PAGE_PRESENT) {
-    uint32_t flags = page_tables[pd_index][pt_index] & 0xFFF;
-    if (!(flags & PAGE_USER)) {
-      terminal_puts(&main_terminal,
-                    "  Adding PAGE_USER flag to code page...\r\n");
-      page_tables[pd_index][pt_index] |= PAGE_USER;
-      __asm__ volatile("invlpg (%0)" : : "r"(code_page));
+  // Verificar y asegurar permisos de usuario para la página de código
+  uint32_t current_flags = mmu_get_page_flags(code_page);
+  if (!(current_flags & PAGE_USER)) {
+    if (!(current->flags & TASK_FLAG_QUIET)) {
+      serial_printf(COM1_BASE,
+                    "[USER_WRAPPER] Adding PAGE_USER flag to 0x%08x\r\n",
+                    code_page);
+    }
+    if (!mmu_set_page_user(code_page)) {
+      if (!(current->flags & TASK_FLAG_QUIET)) {
+        serial_printf(COM1_BASE,
+                      "[USER_WRAPPER] ERROR: Failed to set PAGE_USER!\r\n");
+      }
+      task_exit(-1);
+      return;
     }
   }
 
@@ -779,147 +796,98 @@ static void user_mode_entry_wrapper(void *arg) {
 
 task_t *task_create_user(const char *name, void *user_code_addr, int argc,
                          char **argv, uint32_t code_size,
-                         task_priority_t priority) {
-  if (!exec_verbose) {
-    // Note: We don't have task yet, but we'll set it in task->flags later
-  }
-
+                         task_priority_t priority, address_space_t *as) {
   if (exec_verbose) {
     terminal_printf(&main_terminal,
                     "[USER_CREATE] Creating user task: %s at 0x%08x\r\n", name,
                     (uint32_t)user_code_addr);
   }
 
-  // ... (validations remain the same) ...
-  // (Assuming I should keep the existing validations and logic)
-
-  // 1. Validar dirección de código
-  if ((uint32_t)user_code_addr < 0x200000 ||
-      (uint32_t)user_code_addr >= 0xC0000000) {
-    terminal_printf(&main_terminal,
-                    "[USER_CREATE] ERROR: Invalid code address 0x%08x\r\n",
-                    (uint32_t)user_code_addr);
-    return NULL;
+  // 1. Validar o crear el espacio de direcciones
+  if (!as) {
+    as = vmm_create_address_space();
+    if (!as) {
+      terminal_puts(&main_terminal,
+                    "[USER_CREATE] ERROR: Failed to create address space\r\n");
+      return NULL;
+    }
   }
 
-  // 2. Verificar que el código esté mapeado con PAGE_USER
-  uint32_t code_page = (uint32_t)user_code_addr & ~0xFFF;
-  uint32_t code_flags = mmu_get_page_flags(code_page);
+  // 2. Cambiar temporalmente al nuevo espacio de direcciones para la
+  // configuración
+  uint32_t old_cr3 = mmu_get_current_cr3();
+  mmu_load_cr3(as->page_directory);
 
-  if (!(code_flags & PAGE_PRESENT)) {
-    terminal_puts(&main_terminal,
-                  "[USER_CREATE] ERROR: Code page not mapped\r\n");
-    return NULL;
-  }
-
-  if (!(code_flags & PAGE_USER)) {
-    mmu_set_page_user(code_page);
-  }
-
-  // 3. Asignar stack con GUARD PAGE
+  // 3. Asignar stack con GUARD PAGE en el nuevo espacio
   size_t aligned_stack_size = (USER_STACK_SIZE + 0xFFF) & ~0xFFF;
   size_t total_alloc_size = aligned_stack_size + PAGE_SIZE;
 
-  void *user_stack = kernel_malloc(total_alloc_size);
-  if (!user_stack)
+  // El kernel aloca memoria física para el stack
+  void *phys_stack = pmm_alloc_pages(total_alloc_size / PAGE_SIZE);
+  if (!phys_stack) {
+    mmu_load_cr3(old_cr3);
+    terminal_puts(&main_terminal,
+                  "[USER_CREATE] ERROR: Out of physical memory for stack\r\n");
     return NULL;
-  memset(user_stack, 0, total_alloc_size);
-
-  uint32_t alloc_base = (uint32_t)user_stack;
-  uint32_t guard_page = alloc_base & ~0xFFF;
-  uint32_t stack_real_base = guard_page + PAGE_SIZE;
-  uint32_t stack_end = alloc_base + total_alloc_size;
-
-  // 5. Mapear stack y asegurar permisos de usuario
-  for (uint32_t page = stack_real_base; page < stack_end; page += PAGE_SIZE) {
-    mmu_map_page(page, page, PAGE_PRESENT | PAGE_RW | PAGE_USER);
-    // Forzar actualización de flags si ya estaba mapeada
-    mmu_set_page_user(page);
   }
 
-  // 6. Preparar stack top y ARGC/ARGV (System V ABI i386)
-  uint32_t stack_top = (stack_end - 32) & ~0xF;
+  // Mapear el stack en una dirección fija de usuario (p.ej. 0xBFFFF000)
+  uint32_t user_stack_virt = 0xC0000000 - total_alloc_size;
+  for (uint32_t i = PAGE_SIZE; i < total_alloc_size; i += PAGE_SIZE) {
+    mmu_map_page(user_stack_virt + i, (uint32_t)phys_stack + i,
+                 PAGE_PRESENT | PAGE_RW | PAGE_USER);
+  }
+  // La primera página es de guarda (no mapeada o sin permisos)
+
+  // 4. Preparar stack top y ARGC/ARGV (accedemos vía mapeo kernel directo)
+  uint32_t stack_top_virt = (0xC0000000 - 32) & ~0xF;
+
+  // Para ESCRIBIR en el stack desde el kernel, usamos la dirección virtual
+  // mapeada PERO como acabamos de cambiar CR3, si intentamos acceder a
+  // user_stack_virt, el MMU usará la tabla que acabamos de crear. ¡Perfecto!
 
   if (argc > 0 && argv != NULL) {
-    // 6.1. Copiar los strings de los argumentos al stack (en la parte superior)
     uint32_t arg_ptrs[argc];
     for (int i = argc - 1; i >= 0; i--) {
       size_t len = strlen(argv[i]) + 1;
-      stack_top -= len;
-      memcpy((void *)stack_top, argv[i], len);
-      arg_ptrs[i] = stack_top;
+      stack_top_virt -= len;
+      memcpy((void *)stack_top_virt, argv[i], len);
+      arg_ptrs[i] = stack_top_virt;
     }
 
-    // 6.2. Calcular el espacio para punteros y argc (1 + argc + 1) * 4
     uint32_t ptr_space = (argc + 2) * 4;
+    uint32_t aligned_esp = (stack_top_virt - ptr_space) & ~0xF;
+    stack_top_virt = aligned_esp + ptr_space;
 
-    // 6.3. ALINEACIÓN CRÍTICA: Asegurar que el ESP final esté alineado a 16
-    // bytes. El ESP final será (stack_top - ptr_space). Queremos que eso sea
-    // múltiplo de 16.
-    uint32_t current_esp = stack_top - ptr_space;
-    uint32_t aligned_esp = current_esp & ~0xF;
+    stack_top_virt -= 4;
+    *(uint32_t *)stack_top_virt = 0;
 
-    // Ajustamos stack_top para que el resultado final sea el alineado
-    stack_top -= (current_esp - aligned_esp);
-
-    // 6.4. Push NULL terminator for argv[argc]
-    stack_top -= 4;
-    *(uint32_t *)stack_top = 0;
-
-    // 6.5. Push pointers to strings (argv[argc-1] down to argv[0])
     for (int i = argc - 1; i >= 0; i--) {
-      stack_top -= 4;
-      *(uint32_t *)stack_top = arg_ptrs[i];
+      stack_top_virt -= 4;
+      *(uint32_t *)stack_top_virt = arg_ptrs[i];
     }
 
-    // 6.6. Push argc - EL ESP FINAL DEBERÁ APUNTAR EXACTAMENTE AQUÍ
-    stack_top -= 4;
-    *(uint32_t *)stack_top = (uint32_t)argc;
-
-    if (exec_verbose) {
-      terminal_printf(
-          &main_terminal,
-          "[USER_CREATE] Stack setup complete: argc=%d, esp=0x%08x\r\n", argc,
-          stack_top);
-    }
+    stack_top_virt -= 4;
+    *(uint32_t *)stack_top_virt = (uint32_t)argc;
   }
 
-  // 7. El ESP final debe apuntar exactamente a argc
+  // 5. Restaurar CR3 anterior
+  mmu_load_cr3(old_cr3);
 
-  // 8. Crear tarea
+  // 6. Crear estructura de tarea
   task_t *task = task_create(name, user_mode_entry_wrapper, NULL, priority);
   if (!task) {
-    kernel_free(user_stack);
+    pmm_free_pages(phys_stack, total_alloc_size / PAGE_SIZE);
     return NULL;
   }
 
-  // 9. Inicializar espacio de direcciones y HEAP para la tarea
-  // Usamos el PD actual (que ya tiene el código y stack mapeados identity)
-  // Pero lo encapsulamos en una estructura address_space
-  task->address_space =
-      (address_space_t *)kernel_malloc(sizeof(address_space_t));
-  if (task->address_space) {
-    memset(task->address_space, 0, sizeof(address_space_t));
-    // Obtener el CR3 actual (dirección física del directorio de páginas)
-    task->address_space->page_directory = mmu_get_current_cr3();
+  // 7. Asociar espacio de direcciones
+  task->address_space = as;
 
-    // El heap comienza en una zona segura (256MB) alejada del código (128MB)
-    uint32_t heap_base = 0x10000000;
-    task->address_space->heap_start = heap_base;
-    task->address_space->heap_current = heap_base;
-
-    // NO mapeamos el heap inicial aquí para evitar colisiones durante la
-    // creación. La syscall SBRK (vmm_brk) lo hará bajo demanda cuando se llame
-    // a malloc.
-    if (exec_verbose) {
-      terminal_printf(&main_terminal,
-                      "[USER_CREATE] Heap boundaries set at 0x%08x\r\n",
-                      heap_base);
-    }
-  }
-
-  task->user_stack_base = user_stack;
-  task->user_stack_top = (void *)stack_top;
+  // Configurar metadatos de usuario
+  task->user_stack_base = (void *)user_stack_virt;
+  task->user_stack_top = (void *)stack_top_virt;
+  task->user_stack_phys = phys_stack;
   task->user_stack_size = total_alloc_size;
   task->user_entry_point = user_code_addr;
   task->user_code_base = user_code_addr;
@@ -930,18 +898,16 @@ task_t *task_create_user(const char *name, void *user_code_addr, int argc,
     task->flags |= TASK_FLAG_QUIET;
   }
 
+  // Inicializar tabla de descriptores
   for (int i = 0; i < VFS_MAX_FDS; i++)
     task->fd_table[i] = NULL;
 
-  // Reserve 0, 1, 2 for stdin/stdout/stderr so that the first open() gets FD 3
-  // and doesn't conflict with hardcoded terminal logic in syscalls.c
   task->fd_table[0] = (void *)1;
   task->fd_table[1] = (void *)1;
   task->fd_table[2] = (void *)1;
 
-  // ✅ CRITICAL BUGFIX: Limpieza obligatoria al 1er READ de stdin
-  // Esto asegura que el programa no lea el residual del Shell.
-  task->flags |= TASK_FLAG_KBD_CLEAN_REQUIRED;
+  // ✅ Limpieza obligatoria al 1er READ de stdin (compatibilidad AlvOS)
+  task->stdin_buffer_dirty = true;
 
   return task;
 }
