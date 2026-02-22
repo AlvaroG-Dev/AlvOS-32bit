@@ -217,15 +217,12 @@ static int create_socket_fd(int socket_id) {
 void syscall_handler(struct regs *r) {
   uint32_t syscall_num = r->eax;
 
-  // LOG UNIVERSAL: Comentado para evitar ruido, ya sabemos que el kernel
-  // funciona. serial_printf(COM1_BASE, "[SYSCALL] PID %d calling %d
-  // (EBX=%d)\r\n",
-  //               (scheduler.current_task ? scheduler.current_task->task_id :
-  //               0), syscall_num, r->ebx);
+  // El handler corre con el CR3 del proceso usuario, lo cual es correcto:
+  // necesitamos acceder a memoria del usuario (copy_from_user, etc.)
+  // El PD del usuario ya tiene los mapeos del kernel copiados en
+  // vmm_copy_kernel_mappings_to_pd (indices 0-15 y 768-1023).
 
-  // Habilitar interrupciones para permitir que el timer y el teclado
-
-  // funcionen durante syscalls bloqueantes (como READ)
+  // Habilitar interrupciones para syscalls bloqueantes (READ, etc.)
   __asm__ volatile("sti");
 
   uint32_t result = 0;

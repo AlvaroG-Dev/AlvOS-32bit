@@ -135,9 +135,26 @@ bool mmu_map_page(uint32_t virtual_addr, uint32_t physical_addr,
 
     // Invalidar TLB
     asm volatile("invlpg (%0)" : : "r"(virtual_addr));
-  } else if (pd_ptr[pd_index] & PAGE_4MB) {
-    // Conflicto: ya hay una página de 4MB aquí.
-    return false;
+  } else {
+    // Si ya existe la entrada y no es página de 4MB, asegurar que los flags
+    // sean compatibles (especialmente PAGE_USER y PAGE_RW si se solicitan)
+    if (!(pd_ptr[pd_index] & PAGE_4MB)) {
+      uint32_t current_pd_flags = pd_ptr[pd_index] & 0xFFF;
+      uint32_t new_pd_flags = current_pd_flags;
+      
+      if (flags & PAGE_USER) new_pd_flags |= PAGE_USER;
+      if (flags & PAGE_RW) new_pd_flags |= PAGE_RW;
+      
+      if (new_pd_flags != current_pd_flags) {
+        pd_ptr[pd_index] = (pd_ptr[pd_index] & ~0xFFF) | new_pd_flags;
+        // No es estrictamente necesario invalidar para el PD si usamos invlpg después,
+        // pero por seguridad invalidamos la región.
+        asm volatile("invlpg (%0)" : : "r"(virtual_addr));
+      }
+    } else {
+      // Conflicto: ya hay una página de 4MB aquí.
+      return false;
+    }
   }
 
   // Obtener dirección de la tabla de páginas
@@ -375,18 +392,21 @@ void mmu_init(void) {
 
   // **KERNEL: SIN PAGE_USER!**
   // 1. Identity mapping del kernel (SOLO KERNEL)
-  // Mapeamos los primeros 1MB (BIOS/VGA) y luego la imagen del kernel
-  mmu_map_region(0, 0, 0x100000, PAGE_PRESENT | PAGE_RW);
+  // Mapeamos desde el primer MB y el kernel. NO mapeamos la pÃ¡gina 0 (NULL).
+  mmu_map_region(PAGE_SIZE, PAGE_SIZE, 0x100000 - PAGE_SIZE, PAGE_PRESENT | PAGE_RW);
 
   uint32_t kernel_phys_start = 0x100000;
   uint32_t kernel_size = (uint32_t)&_end - kernel_phys_start;
   mmu_map_region(kernel_phys_start, kernel_phys_start, kernel_size,
                  PAGE_PRESENT | PAGE_RW);
 
-  // 1. Mapear la memoria física en el higher-half usando páginas de 4MB
-  // Mapeamos los primeros 512MB para evitar conflictos con el Framebuffer
-  // (0xE0000000)
-  uint32_t ram_to_map = 512 * 1024 * 1024; // 512MB
+  // 1. Mapear TODA la memoria fÃ­sica detectada en el higher-half usando pÃ¡ginas de 4MB
+  // Esto es crucial para que el kernel pueda acceder a cualquier PD/PT creado.
+  uint32_t total_ram = pmm_get_total_pages() * PAGE_SIZE;
+  // Limitar a lo que quepa antes del Framebuffer (0xE0000000 - 0xC0000000 = 512MB)
+  // Si hay mÃ¡s de 512MB, mapeamos solo 512MB para evitar colisiones.
+  uint32_t ram_to_map = (total_ram > 512 * 1024 * 1024) ? (512 * 1024 * 1024) : total_ram;
+
   for (uint32_t addr = 0; addr < ram_to_map; addr += PAGE_SIZE_4MB) {
     uint32_t virt_addr = KERNEL_VIRTUAL_BASE + addr;
     mmu_map_page(virt_addr, addr, PAGE_PRESENT | PAGE_RW | PAGE_4MB);
@@ -394,8 +414,8 @@ void mmu_init(void) {
 
   terminal_printf(
       &main_terminal,
-      "Kernel mapped (512MB higher-half at 0x%08x using 4MB pages)\n",
-      KERNEL_VIRTUAL_BASE);
+      "Kernel mapped (%u MB higher-half at 0x%08x using 4MB pages)\n",
+      ram_to_map / (1024 * 1024), KERNEL_VIRTUAL_BASE);
 
   // Stack del kernel
   uint32_t stack_size =
@@ -735,49 +755,61 @@ bool mmu_ensure_physical_accessible(uint32_t phys_start, uint32_t size,
     return true;
   }
 
-  // Usar región de mapeo directo del kernel (KERNEL_VIRTUAL_BASE)
-  uint32_t target_virt = KERNEL_VIRTUAL_BASE + aligned_start;
+  // Usar región de mapeo directo del kernel (KERNEL_VIRTUAL_BASE) si cabe.
+  // IMPORTANTE: Si la física es > 1GB (0x40000000), sumar 0xC0000000 desbordaría
+  // y terminaríamos mapeando el dispositivo en el espacio del usuario (0-3GB).
+  // Dispositivos como APIC (0xFEE00000) desbordarían a 0xBEE00000.
+  uint32_t target_virt;
+  bool use_alt_search = false;
 
-  // Verificar si la región virtual está disponible
-  for (uint32_t offset = 0; offset < aligned_size; offset += PAGE_SIZE) {
-    uint32_t check_virt = target_virt + offset;
-    if (mmu_is_mapped(check_virt)) {
-      uint32_t existing_phys = mmu_virtual_to_physical(check_virt);
-      if (existing_phys != (aligned_start + offset)) {
-        // Conflicto: buscar otra región virtual
-        terminal_printf(
-            &main_terminal,
-            "Virtual address conflict at 0x%08x, searching alternative\n",
-            check_virt);
+  if (aligned_start < 0x3F000000) {
+    target_virt = KERNEL_VIRTUAL_BASE + aligned_start;
+  } else {
+    // Físicas muy altas (APIC, IOAPIC, PCIe) van a la zona dinámica.
+    target_virt = 0xD0000000;
+    use_alt_search = true;
+  }
 
-        // Buscar región alternativa
-        uint32_t alt_base = 0xD0000000; // Región alternativa
-        for (uint32_t try_base = alt_base; try_base < 0xF0000000;
-             try_base += 0x100000) {
-          bool region_free = true;
-          for (uint32_t test_offset = 0; test_offset < aligned_size;
-               test_offset += PAGE_SIZE) {
-            if (mmu_is_mapped(try_base + test_offset)) {
-              region_free = false;
-              break;
-            }
-          }
-          if (region_free) {
-            target_virt = try_base;
-            terminal_printf(&main_terminal,
-                            "Using alternative virtual base 0x%08x\n",
-                            target_virt);
-            break;
-          }
+  // Verificar si la región virtual está disponible (o buscar alternativa si hubo conflicto/MMIO alto)
+  bool conflict = false;
+  
+  if (!use_alt_search) {
+    for (uint32_t offset = 0; offset < aligned_size; offset += PAGE_SIZE) {
+      uint32_t check_virt = target_virt + offset;
+      if (mmu_is_mapped(check_virt)) {
+        uint32_t existing_phys = mmu_virtual_to_physical(check_virt);
+        if (existing_phys != (aligned_start + offset)) {
+          conflict = true;
+          break;
         }
+      }
+    }
+  }
 
-        if (target_virt == KERNEL_VIRTUAL_BASE + aligned_start) {
-          terminal_printf(&main_terminal,
-                          "ERROR: No available virtual address space found\n");
-          return false;
+  if (use_alt_search || conflict) {
+    // Buscar otra región virtual entre 0xD0000000 y 0xF0000000
+    uint32_t alt_base = 0xD0000000;
+    bool found_alt = false;
+    
+    for (uint32_t try_base = alt_base; try_base < 0xF0000000; try_base += 0x100000) {
+      bool region_free = true;
+      for (uint32_t test_offset = 0; test_offset < aligned_size; test_offset += PAGE_SIZE) {
+        if (mmu_is_mapped(try_base + test_offset)) {
+          region_free = false;
+          break;
         }
+      }
+      if (region_free) {
+        target_virt = try_base;
+        found_alt = true;
+        // terminal_printf(&main_terminal, "Using alternative virtual base 0x%08x\n", target_virt);
         break;
       }
+    }
+
+    if (!found_alt) {
+      terminal_printf(&main_terminal, "ERROR: No available virtual address space found\n");
+      return false;
     }
   }
 

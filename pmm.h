@@ -31,6 +31,7 @@ extern pmm_bitmap_t pmm_bitmap;
 
 // Prototipos de funciones
 void pmm_init(struct multiboot_tag_mmap *mmap_tag);
+void pmm_mark_used(uint64_t start, uint32_t size);
 void pmm_exclude_kernel_heap(void *heap_start, size_t heap_size);
 void *pmm_alloc_page(void);
 void *pmm_alloc_pages(uint32_t count);

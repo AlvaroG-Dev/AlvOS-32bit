@@ -60,21 +60,22 @@ static bool vmm_copy_kernel_mappings_to_pd(uint32_t user_pd_phys) {
   uint32_t *user_pd = (uint32_t *)(KERNEL_VIRTUAL_BASE + user_pd_phys);
   uint32_t *kernel_pd = page_directory;
 
-  // Copiar mapeos identity del kernel (0-767) que no sean USER
-  // Esto permite al kernel usar su stack y datos en el primer GB
+  // 1. Copiar TODOS los mapeos del kernel en el espacio inferior (0-767).
+  // Cuando el kernel corre con el CR3 del usuario (durante syscalls/IRQs),
+  // necesita acceder a todos sus datos: tareas, stacks, page tables, etc.
+  // Marcamos todas estas entradas como Supervisor-only (sin PAGE_USER)
+  // para que el Ring 3 no pueda acceder a ellas directamente.
   for (int i = 0; i < 768; i++) {
     if (kernel_pd[i] & PAGE_PRESENT) {
-      user_pd[i] = kernel_pd[i];
+      user_pd[i] = kernel_pd[i] & ~PAGE_USER;
     }
   }
 
-  // Copiar entradas del kernel (768-1023) - 3GB-4GB
+  // 2. Copiar entradas del kernel superior (768-1023) - 3GB-4GB
+  // Este es el "higher-half" donde residen mapeos de RAM física completa.
   for (int i = 768; i < 1024; i++) {
     user_pd[i] = kernel_pd[i];
   }
-
-  // ✅ CRÍTICO: El PD de usuario debe mapearse a sí mismo en una dirección fija
-  // (Opcional, pero útil para recursive paging. AlvOS no lo usa por ahora)
 
   return true;
 }

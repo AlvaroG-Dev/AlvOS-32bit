@@ -247,20 +247,41 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
   // FASE DE BOOT CON MENSAJES FORMATEADOS
   // ============================================
 
-  // 1. Inicializar memoria
+  // 1. Inicializar memoria física
   if (boot_info.mmap) {
     pmm_init(boot_info.mmap);
+
+    // CRÍTICO: Reservar la estructura Multiboot2 en la memoria física
+    // para evitar que el PMM la use para otra cosa.
+    uint32_t mb_size = *(uint32_t *)mb_info;
+    pmm_mark_used((uintptr_t)mb_info, mb_size);
+
+    // Reservar módulos cargados por Multiboot2 (si existen)
+    struct multiboot_tag *module_tag =
+        (struct multiboot_tag *)((uint8_t *)mb_info + 8);
+    while (module_tag->type != MULTIBOOT_TAG_TYPE_END) {
+      if (module_tag->type == MULTIBOOT_TAG_TYPE_MODULE) {
+        struct multiboot_tag_module *m = (struct multiboot_tag_module *)module_tag;
+        uint32_t m_size = m->mod_end - m->mod_start;
+        pmm_mark_used(m->mod_start, m_size);
+      }
+      module_tag =
+          (struct multiboot_tag *)((uint8_t *)module_tag +
+                                   ((module_tag->size + 7) & ~7));
+    }
   } else {
     while (1) {
     }
   }
 
+  // Inicializar MMU y paginación
   mmu_init();
 
   size_t heap_size = STATIC_HEAP_SIZE;
   heap_init(kernel_heap, heap_size);
   pmm_exclude_kernel_heap(kernel_heap, heap_size);
 
+  // Inicializar VMM (gestor de regiones de usuario)
   vmm_init();
 
   // Inicializar framebuffer básico

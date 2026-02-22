@@ -50,9 +50,7 @@ void timer_irq_handler() {
   ticks++;
   ticks_since_boot++;
 
-  // ✅ EOI ANTES de scheduler_tick
-  // Esto es CRÍTICO: si el scheduler cambia de tarea, el APIC/PIC
-  // debe saber que la interrupción ya fue servida para no bloquear el timer
+  // EOI antes del scheduler_tick para no bloquear futuros interrupts del timer
   pic_send_eoi(0);
 
   if (scheduler.scheduler_enabled) {

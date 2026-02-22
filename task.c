@@ -94,58 +94,49 @@ static void task_entry_wrapper(void) {
 }
 
 static void perform_context_switch(task_t *from, task_t *to) {
-  if (!from || !to)
+  if (!from || !to || from == to)
     return;
 
-  // CRÃTICO: Si es la misma tarea, no hacer nada
-  if (from == to) {
-    return;
-  }
-
-  // Guardar estado anterior SOLO si estaba RUNNING
+  // 1. Guardar estado transitorio
   if (from->state == TASK_RUNNING) {
     from->state = TASK_READY;
   }
-
-  // Nueva tarea pasa a RUNNING
   to->state = TASK_RUNNING;
 
-  // Incrementar contadores
+  // 2. Actualizar metadatos
   from->switch_count++;
   to->switch_count++;
   scheduler.total_switches++;
-
-  // Resetear quantum de ambas tareas
-  from->time_slice = scheduler.quantum_ticks;
+  scheduler.current_task = to;
   to->time_slice = scheduler.quantum_ticks;
 
-  // Actualizar tarea actual ANTES del cambio de contexto
-  scheduler.current_task = to;
-
-  // Debug cada 50 switches
-  /*
-  if (scheduler.total_switches % 50 == 0) {
-    if (exec_verbose) {
-      serial_printf(COM1_BASE, "[CTX #%u] %s -> %s\r\n",
-                    scheduler.total_switches, from->name, to->name);
-    }
-  }
-  */
-
-  // CRÃTICO: Realizar cambio de contexto
-  // Esta funciÃ³n debe preservar el estado del stack correctamente
-  // ✅ MMU: Cambiar espacio de direcciones si es necesario
+  // 3. CAMBIO DE ESPACIO DE DIRECCIONES (CR3)
   if (to->address_space && to->address_space->page_directory) {
-    mmu_load_cr3(to->address_space->page_directory);
+    // SINCRONIZAR mapeos del kernel al PD de usuario.
+    // Si el kernel creó nuevas page tables después de que este proceso
+    // fue creado, deben ser visibles para el proceso ahora.
+    uint32_t user_pd_phys = to->address_space->page_directory;
+    uint32_t *user_pd = (uint32_t *)(KERNEL_VIRTUAL_BASE + user_pd_phys);
+    uint32_t *kernel_pd = page_directory;
+
+    for (int i = 0; i < 768; i++) {
+      if ((kernel_pd[i] & PAGE_PRESENT) && !(user_pd[i] & PAGE_PRESENT)) {
+        user_pd[i] = kernel_pd[i] & ~PAGE_USER; // Supervisor-only
+      }
+    }
+    for (int i = 768; i < 1024; i++) {
+      if (kernel_pd[i] != user_pd[i]) {
+        user_pd[i] = kernel_pd[i];
+      }
+    }
+
+    mmu_load_cr3(user_pd_phys);
   } else {
-    // Si no tiene address space (tarea kernel), usar PD del kernel
-    mmu_load_cr3((uint32_t)&page_directory);
+    mmu_load_cr3(mmu_get_kernel_pd());
   }
 
+  // 4. Salto final al nuevo contexto
   task_switch_context(&from->context, &to->context);
-
-  // NOTA: DespuÃ©s de task_switch_context, estamos ejecutando en el contexto de
-  // 'to' El cÃ³digo aquÃ­ se ejecuta cuando esta tarea vuelve a ser scheduled
 }
 
 void task_init(void) {
@@ -183,40 +174,23 @@ void task_yield(void) {
     return;
   }
 
-  // ✅ Deshabilitar interrupciones durante el cambio
+
+  // Guardar flags y deshabilitar interrupciones
   uint32_t flags;
   __asm__ __volatile__("pushf\n\tcli\n\tpop %0" : "=r"(flags));
 
+  task_t *from = scheduler.current_task;
   task_t *next = scheduler_next_task();
 
-  // ✅ FIX: Verificar que next sea diferente de current
-  if (!next || next == scheduler.current_task) {
-    __asm__ __volatile__("push %0\n\tpopf" : : "r"(flags));
-    return;
+  if (next && next != from) {
+    perform_context_switch(from, next);
   }
 
-  task_t *from = scheduler.current_task;
-
-  // ✅ FIX: Solo cambiar a READY si actualmente estamos RUNNING
-  if (from->state == TASK_RUNNING && from != scheduler.idle_task) {
-    from->state = TASK_READY;
-  }
-
-  next->state = TASK_RUNNING;
-  next->time_slice = scheduler.quantum_ticks;
-
-  from->switch_count++;
-  next->switch_count++;
-  scheduler.total_switches++;
-
-  scheduler.current_task = next;
-
-  // ✅ FIX: Switch de contexto con interrupciones deshabilitadas
-  task_switch_context(&from->context, &next->context);
-
-  // ✅ FIX: Restaurar interrupciones DESPUÉS del switch
+  // Restaurar interrupciones
   __asm__ __volatile__("push %0\n\tpopf" : : "r"(flags));
 }
+
+
 
 task_t *task_create(const char *name, void (*entry_point)(void *), void *arg,
                     task_priority_t priority) {
@@ -588,22 +562,9 @@ void scheduler_tick(void) {
     return;
   }
 
-  // 5. Realizar switch
+  // 5. Realizar switch unificado (maneja CR3 y estados)
   task_t *from = scheduler.current_task;
-
-  if (from->state == TASK_RUNNING) {
-    from->state = TASK_READY;
-  }
-  next->state = TASK_RUNNING;
-
-  from->switch_count++;
-  next->switch_count++;
-  scheduler.total_switches++;
-
-  next->time_slice = scheduler.quantum_ticks;
-  scheduler.current_task = next;
-
-  task_switch_context(&from->context, &next->context);
+  perform_context_switch(from, next);
 }
 
 task_t *scheduler_next_task(void) {
@@ -848,6 +809,7 @@ task_t *task_create_user(const char *name, void *user_code_addr, int argc,
 
   if (argc > 0 && argv != NULL) {
     uint32_t arg_ptrs[argc];
+    // 1. Copiar las cadenas de texto al stack
     for (int i = argc - 1; i >= 0; i--) {
       size_t len = strlen(argv[i]) + 1;
       stack_top_virt -= len;
@@ -855,10 +817,11 @@ task_t *task_create_user(const char *name, void *user_code_addr, int argc,
       arg_ptrs[i] = stack_top_virt;
     }
 
-    uint32_t ptr_space = (argc + 2) * 4;
-    uint32_t aligned_esp = (stack_top_virt - ptr_space) & ~0xF;
-    stack_top_virt = aligned_esp + ptr_space;
+    // Alinear stack a 16 bytes (importante para ABI de System V)
+    stack_top_virt &= ~0xF;
 
+    // 2. Crear el array argv[] (punteros a las cadenas) en el stack
+    // Primero, un terminador NULL para las listas (envp, luego argv)
     stack_top_virt -= 4;
     *(uint32_t *)stack_top_virt = 0;
 
@@ -867,9 +830,16 @@ task_t *task_create_user(const char *name, void *user_code_addr, int argc,
       *(uint32_t *)stack_top_virt = arg_ptrs[i];
     }
 
+    // 3. El formato que espera crt0.asm en Ring 3 es el estándar de Linux:
+    // [esp]     = argc
+    // [esp+4]   = argv[0]
+    // [esp+8]   = argv[1]
+    // ...
+    // Por tanto, solo tenemos que añadir argc encima de los punteros
     stack_top_virt -= 4;
     *(uint32_t *)stack_top_virt = (uint32_t)argc;
   }
+
 
   // 5. Restaurar CR3 anterior
   mmu_load_cr3(old_cr3);

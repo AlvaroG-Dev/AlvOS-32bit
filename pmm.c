@@ -1,4 +1,3 @@
-// pmm.c - NUEVO ARCHIVO
 #include "pmm.h"
 #include "kernel.h"
 #include "log.h"
@@ -9,10 +8,53 @@
 #include "terminal.h"
 
 // ==================== VARIABLES PMM ====================
+extern char _start;
+extern char _end;
 
 mem_region_t mem_regions[MAX_MEMORY_REGIONS];
 uint32_t mem_region_count = 0;
 pmm_bitmap_t pmm_bitmap = {0};
+
+/**
+ * Encuentra el índice global de una página en el bitmap basándose en su
+ * dirección física
+ */
+static int32_t pmm_get_page_idx(uint64_t addr) {
+  uint64_t current_base = 0;
+  for (uint32_t r = 0; r < mem_region_count; r++) {
+    uint32_t region_pages = mem_regions[r].length / PAGE_SIZE;
+    if (addr >= mem_regions[r].base &&
+        addr < mem_regions[r].base + mem_regions[r].length) {
+      return (int32_t)((addr - mem_regions[r].base) / PAGE_SIZE +
+                       (current_base / PAGE_SIZE));
+    }
+    current_base += mem_regions[r].length;
+  }
+  return -1;
+}
+
+/**
+ * Marca un rango de memoria como usado en el bitmap
+ */
+void pmm_mark_used(uint64_t start, uint32_t size) {
+  uint64_t end = ALIGN_4KB_UP(start + size);
+  uint64_t addr = ALIGN_4KB_DOWN(start);
+
+  while (addr < end) {
+    int32_t idx = pmm_get_page_idx(addr);
+    if (idx >= 0) {
+      uint32_t word = idx / 32;
+      uint32_t bit = idx % 32;
+
+      if (pmm_bitmap.bitmap && (pmm_bitmap.bitmap[word] & (1 << bit))) {
+        pmm_bitmap.bitmap[word] &= ~(1 << bit);
+        if (pmm_bitmap.free_pages > 0)
+          pmm_bitmap.free_pages--;
+      }
+    }
+    addr += PAGE_SIZE;
+  }
+}
 
 // ==================== FUNCIONES PMM ====================
 
@@ -124,10 +166,19 @@ void pmm_init(struct multiboot_tag_mmap *mmap_tag) {
 
       // Reducir tamaño de la región
       mem_regions[i].length -= bitmap_pages_needed * PAGE_SIZE;
+
+      // RESERVA CRÍTICA: Bloquear el primer MB (BIOS, IVT, EBDA)
+      pmm_mark_used(0, 0x100000);
+
+      // RESERVA CRÍTICA: Bloquear la imagen del kernel
+      uint32_t kernel_size = (uint32_t)&_end - (uint32_t)&_start;
+      pmm_mark_used((uint32_t)&_start, kernel_size);
+
       return;
     }
   }
 }
+
 
 void pmm_exclude_kernel_heap(void *heap_start, size_t heap_size) {
   uint64_t heap_begin = ALIGN_4KB_DOWN((uintptr_t)heap_start);
