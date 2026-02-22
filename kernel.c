@@ -128,6 +128,16 @@ void shutdown(void) {
   // 1. Deshabilitar interrupciones
   __asm__ volatile("cli");
 
+  // 4. Desmontar sistemas de archivos (DEBE ser antes de limpiar drivers para
+  // poder flashear caches)
+  vfs_list_mounts(unmount_callback, &unmount_data);
+
+  // 5. Limpiar sistema de drivers
+  driver_system_cleanup();
+
+  // 6. Limpiar módulos
+  module_loader_cleanup();
+  
   // 2. Detener el scheduler
   if (scheduler.scheduler_enabled) {
     scheduler_stop();
@@ -146,15 +156,6 @@ void shutdown(void) {
 
   task_cleanup_zombies();
 
-  // 4. Desmontar sistemas de archivos (DEBE ser antes de limpiar drivers para
-  // poder flashear caches)
-  vfs_list_mounts(unmount_callback, &unmount_data);
-
-  // 5. Limpiar sistema de drivers
-  driver_system_cleanup();
-
-  // 6. Limpiar módulos
-  module_loader_cleanup();
 
   // 7. Deshabilitar PICs
   outb(PIC1_DATA, 0xFF);
@@ -437,9 +438,6 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
 
   sata_disk_debug_port(4);
 
-  // 11. Inicializar logging
-  log_init();
-
   // Inicializar gestor de particiones
   partition_manager_init();
   disk_scan_all_buses();
@@ -472,7 +470,6 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
   task_profiling_enable();
 
   message_system_init();
-
   // disk_io_daemon_init();
   task_t *mem_defrag =
       task_create("Memory Defrag", memory_defrag_task, NULL, TASK_PRIORITY_LOW);
@@ -627,7 +624,8 @@ static void main_loop_task(void *arg) {
 
   // Cargar symlinks ahora que tenemos contexto de tarea
   terminal_load_symlinks(&main_terminal);
-
+  log_init();
+  log_message(LOG_INFO, "[MAIN_LOOP] Task started\r\n");
   keyboard_set_handler(keyboard_terminal_handler);
 
   while (1) {

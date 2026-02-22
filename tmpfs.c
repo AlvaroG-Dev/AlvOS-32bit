@@ -46,18 +46,18 @@ static vnode_ops_t tmp_vnode_ops = {.lookup = tmp_lookup,
                                     .unlink = tmp_unlink};
 
 static vfs_node_t *tmpnode_to_vnode(tmp_node_t *tn, vfs_superblock_t *sb) {
-  vfs_node_t *vn = (vfs_node_t *)kernel_malloc(sizeof(vfs_node_t));
+  vfs_node_t *vn = vfs_node_allocate();
+
   if (!vn)
     return NULL;
-  memset(vn, 0, sizeof(*vn));
   strncpy(vn->name, tn->name, VFS_NAME_MAX - 1);
   vn->type = tn->type;
   vn->fs_private = tn;
   vn->ops = &tmp_vnode_ops;
   vn->sb = sb;
-  vn->refcount = 1;
   return vn;
 }
+
 
 int tmpfs_mount(void *device, vfs_superblock_t **out_sb) {
   (void)device;

@@ -5,6 +5,8 @@
 #include "keyboard.h"
 #include "vfs.h"
 #include <stdbool.h>
+#include "mutex_types.h"
+
 
 #define ANSI_COLOR_BLACK "\033[30m"
 #define ANSI_COLOR_RED "\033[31m"
@@ -138,7 +140,9 @@ typedef struct {
 
   // Seguimiento de tareas
   struct task *foreground_task; // Tarea que tiene el foco
+  mutex_t mutex;                // ✅ NUEVO: Mutex para protección de acceso
 } Terminal;
+
 
 extern bool graphical_mode;
 

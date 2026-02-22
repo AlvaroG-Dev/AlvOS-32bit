@@ -1035,6 +1035,10 @@ void terminal_init(Terminal *term) {
   strcpy(term->cwd, "/home");
   strcpy(vfs_cwd, "/home");
   strcpy(term->prompt_info.username, "user");
+  
+  // ✅ NUEVO: Inicializar mutex de terminal
+  mutex_init(&term->mutex, "terminal_mutex");
+
 
   // Estadísticas
   term->total_lines_written = 0;
@@ -1357,11 +1361,14 @@ void terminal_puts(Terminal *term, const char *str) {
   if (!term || !str)
     return;
 
+  mutex_lock(&term->mutex);
   while (*str) {
     terminal_putchar(term, *str++);
   }
   terminal_draw(term);
+  mutex_unlock(&term->mutex);
 }
+
 
 void terminal_scroll_up(Terminal *term) {
   if (!term)
@@ -1393,6 +1400,7 @@ void terminal_draw(Terminal *term) {
   if (!term)
     return;
 
+  mutex_lock(&term->mutex);
   // Limpiar pantalla si es necesario (sólo para scroll completo)
   if (term->needs_full_redraw) {
     fill_rect(0, 0,
@@ -1407,6 +1415,7 @@ void terminal_draw(Terminal *term) {
   if (term->cursor_state_changed || term->last_cursor_x != term->cursor_x || term->last_cursor_y != term->cursor_y) {
     if (term->last_cursor_y < term->height) term->dirty_lines[term->last_cursor_y] = 1;
     if (term->cursor_y < term->height) term->dirty_lines[term->cursor_y] = 1;
+
     
     term->last_cursor_x = term->cursor_x;
     term->last_cursor_y = term->cursor_y;
@@ -1419,7 +1428,9 @@ void terminal_draw(Terminal *term) {
       terminal_draw_line(term, screen_y);
     }
   }
+  mutex_unlock(&term->mutex);
 }
+
 
 void terminal_handle_key(Terminal *term, int key) {
   while (!term) {
@@ -1677,9 +1688,12 @@ void terminal_printf(Terminal *term, const char *format, ...) {
 
   // Si cabe en el buffer estático
   if (len < (int)sizeof(buffer)) {
+    mutex_lock(&term->mutex);
     terminal_puts(term, buffer);
+    mutex_unlock(&term->mutex);
     return;
   }
+
 
   // Manejo de mensajes largos por partes
   const int chunk_size = sizeof(buffer) - 1;
@@ -2876,10 +2890,6 @@ void terminal_execute(Terminal *term, const char *cmd) {
     if (argc < 2) {
       terminal_puts(term, "Usage: ping <ip_address>\r\n");
       terminal_puts(term, "Example: ping 192.168.1.1\r\n");
-      terminal_puts(term, "Common targets:\r\n");
-      terminal_puts(term, "  192.168.1.1    - Router/Gateway\r\n");
-      terminal_puts(term, "  8.8.8.8        - Google DNS\r\n");
-      terminal_puts(term, "  1.1.1.1        - Cloudflare DNS\r\n");
       return;
     }
 
@@ -2889,36 +2899,39 @@ void terminal_execute(Terminal *term, const char *cmd) {
       return;
     }
 
-    terminal_printf(term, "PING %s with 64 bytes of data:\r\n", argv[1]);
+    typedef struct {
+      ip_addr_t ip;
+      char ip_str[32];
+    } ping_args_t;
+    ping_args_t *pargs = kernel_malloc(sizeof(ping_args_t));
+    if (!pargs) return;
+    memcpy(pargs->ip, target_ip, sizeof(ip_addr_t));
+    strncpy(pargs->ip_str, argv[1], 31);
+    pargs->ip_str[31] = '\0';
 
-    // Enviar 4 pings
-    for (int i = 1; i <= 4; i++) {
-      terminal_printf(term, "Sending ping #%d... ", i);
+    void ping_wrapper(void* arg) {
+      ping_args_t* p = (ping_args_t*)arg;
+      terminal_printf(&main_terminal, "PING %s with 64 bytes of data:\r\n", p->ip_str);
 
-      // Crear datos para el ping (timestamp)
-      uint8_t ping_data[32];
-      uint32_t *timestamp = (uint32_t *)ping_data;
-      *timestamp = ticks_since_boot;
+      // Enviar 4 pings
+      for (int i = 1; i <= 4; i++) {
+        terminal_printf(&main_terminal, "Sending ping #%d... ", i);
+        uint8_t ping_data[32];
+        uint32_t *timestamp = (uint32_t *)ping_data;
+        *timestamp = ticks_since_boot;
 
-      // Enviar ping
-      if (icmp_send_request(target_ip, 1234, i, ping_data, sizeof(ping_data))) {
-        terminal_puts(term, "Sent\r\n");
-      } else {
-        terminal_puts(term, "Failed to send\r\n");
+        if (icmp_send_request(p->ip, 1234, i, ping_data, sizeof(ping_data))) {
+          terminal_puts(&main_terminal, "Sent\r\n");
+        } else {
+          terminal_puts(&main_terminal, "Failed to send\r\n");
+        }
+        task_sleep(1000); // 1 segundo exacto sin bloquear
       }
-
-      // Esperar 1 segundo (100 ticks)
-      for (int j = 0; j < 100; j++) {
-        // Procesar paquetes recibidos
-        network_stack_tick();
-
-        // Pequeña espera
-        for (volatile int k = 0; k < 10000; k++)
-          ;
-      }
+      terminal_puts(&main_terminal, "\r\nPing statistics complete\r\n");
+      kernel_free(p);
+      task_exit(0);
     }
-
-    terminal_puts(term, "\r\nPing statistics complete\r\n");
+    task_create("ping", ping_wrapper, pargs, TASK_PRIORITY_NORMAL);
   } else if (strcmp(command, "net-stats") == 0) {
     // Mostrar estadísticas detalladas
     terminal_puts(term, "\r\n=== Network Statistics ===\r\n");
@@ -3014,13 +3027,23 @@ void terminal_execute(Terminal *term, const char *cmd) {
     if (args[0] == '\0') {
       terminal_puts(term, "Usage: lookup <hostname>\r\n");
     } else {
-      ip_addr_t ip;
-      if (dns_resolve(args, ip)) {
-        terminal_printf(term, "%s has address %d.%d.%d.%d\r\n", args, ip[0],
-                        ip[1], ip[2], ip[3]);
-      } else {
-        terminal_printf(term, "Could not resolve %s\r\n", args);
+      char *domain_arg = kernel_malloc(128);
+      if (!domain_arg) return;
+      strncpy(domain_arg, args, 127);
+      domain_arg[127] = '\0';
+
+      void lookup_wrapper(void* arg) {
+        char* domain = (char*)arg;
+        ip_addr_t ip;
+        if (dns_resolve(domain, ip)) {
+          terminal_printf(&main_terminal, "%s has address %d.%d.%d.%d\r\n", domain, ip[0], ip[1], ip[2], ip[3]);
+        } else {
+          terminal_printf(&main_terminal, "Could not resolve %s\r\n", domain);
+        }
+        kernel_free(domain);
+        task_exit(0);
       }
+      task_create("lookup", lookup_wrapper, domain_arg, TASK_PRIORITY_NORMAL);
     }
   } else if (strcmp(command, "wget") == 0) {
     // args tiene toda la línea de argumentos. Necesitamos separarlos.
@@ -3033,12 +3056,27 @@ void terminal_execute(Terminal *term, const char *cmd) {
     if (!space) {
       terminal_puts(term, "Usage: wget <url> <dest_path>\r\n");
     } else {
+      typedef struct {
+        char url[128];
+        char path[128];
+      } wget_args_t;
+      wget_args_t *wargs = kernel_malloc(sizeof(wget_args_t));
+      if (!wargs) return;
       int url_len = space - args;
-      strncpy(url, args, url_len);
-      url[url_len] = 0;
-      strcpy(path, space + 1);
+      if (url_len > 127) url_len = 127;
+      strncpy(wargs->url, args, url_len);
+      wargs->url[url_len] = '\0';
+      strncpy(wargs->path, space + 1, 127);
+      wargs->path[127] = '\0';
 
-      http_download(url, path);
+      void wget_wrapper(void *arg) {
+        wget_args_t *w = (wget_args_t *)arg;
+        terminal_printf(&main_terminal, "Downloading %s to %s...\r\n", w->url, w->path);
+        http_download(w->url, w->path);
+        kernel_free(w);
+        task_exit(0);
+      }
+      task_create("wget", wget_wrapper, wargs, TASK_PRIORITY_NORMAL);
     }
   } else if (strcmp(command, "net-help") == 0) {
     terminal_puts(term, "\r\n=== Network Commands ===\r\n");
@@ -3094,14 +3132,22 @@ void terminal_execute(Terminal *term, const char *cmd) {
     terminal_printf(&main_terminal, "Ticks since boot: %u\r\n",
                     ticks_since_boot);
   } else if (strcmp(command, "heaptest") == 0) {
-    heap_test_results_t test_results = heap_run_exhaustive_tests();
-    heap_print_test_results(&test_results, &main_terminal);
+    void heaptest_wrapper(void* arg) {
+      heap_test_results_t test_results = heap_run_exhaustive_tests();
+      heap_print_test_results(&test_results, &main_terminal);
+      task_exit(0);
+    }
+    task_create("heaptest", heaptest_wrapper, NULL, TASK_PRIORITY_NORMAL);
   } else if (strcmp(command, "async_read") == 0) {
     cmd_async_read_test();
   } else if (strcmp(command, "async_write") == 0) {
     cmd_async_write_test();
   } else if (strcmp(command, "defrag") == 0) {
-    cmd_force_defrag();
+    void defrag_wrapper(void* arg) {
+      cmd_force_defrag();
+      task_exit(0);
+    }
+    task_create("defrag", defrag_wrapper, NULL, TASK_PRIORITY_LOW);
   } else if (strcmp(command, "defrag_stats") == 0) {
     cmd_defrag_stats();
   } else if (strcmp(command, "disk") == 0) {
@@ -3113,13 +3159,17 @@ void terminal_execute(Terminal *term, const char *cmd) {
   } else if (strcmp(command, "lsblk") == 0) {
     cmd_lsblk();
   } else if (strcmp(command, "format") == 0) {
-    int result = fat32_format(&main_disk, "MYOS_DISK");
-    if (result == VFS_OK) {
-      terminal_printf(&main_terminal,
-                      "Disco formateado como FAT32 exitosamente\n");
-    } else {
-      terminal_printf(&main_terminal, "Error formateando disco: %d\n", result);
+    void format_wrapper(void* arg) {
+      int result = fat32_format(&main_disk, "MYOS_DISK");
+      if (result == VFS_OK) {
+        terminal_printf(&main_terminal,
+                        "Disco formateado como FAT32 exitosamente\n");
+      } else {
+        terminal_printf(&main_terminal, "Error formateando disco: %d\n", result);
+      }
+      task_exit(0);
     }
+    task_create("format", format_wrapper, NULL, TASK_PRIORITY_NORMAL);
   } else if (strcmp(command, "cpuinfo") == 0) {
     if (argc > 1 && strcmp(argv[1], "detailed") == 0) {
       cmd_cpuinfo_detailed(term, "");
@@ -3234,7 +3284,18 @@ void terminal_execute(Terminal *term, const char *cmd) {
   } else if (strcmp(command, "task_health") == 0) {
     task_monitor_health();
   } else if (strcmp(command, "sync-test") == 0) {
-    run_task_utils_test_suite();
+    void sync_test_wrapper(void* arg) {
+      run_task_utils_test_suite();
+      task_exit(0);
+    }
+    task_create("sync_test", sync_test_wrapper, NULL, TASK_PRIORITY_NORMAL);
+  } else if (strcmp(command, "itest") == 0) {
+    void itest_wrapper(void* arg) {
+      run_integration_tests();
+      task_exit(0);
+    }
+    task_create("itest", itest_wrapper, NULL, TASK_PRIORITY_NORMAL);
+
 
   } else if (strcmp(command, "install") == 0) {
 
@@ -3305,8 +3366,9 @@ void terminal_execute(Terminal *term, const char *cmd) {
     terminal_puts(term, "  start_scheduler    - Start the scheduler\r\n");
     terminal_puts(term, "  stop_scheduler     - Stop the scheduler\r\n");
     terminal_puts(term, "  create_test_task   - Create a new test task\r\n");
-    terminal_puts(term, "  task_health        - Show tasks health\r\n");
-    terminal_puts(term, "  sync-test          - Run Task/Sync/Msg Test Suite\r\n\r\n");
+    terminal_puts(term, "  task_health        - Diagnóstico de tareas zombi\r\n");
+    terminal_puts(term, "  sync-test          - Run Task/Sync/Msg Test Suite\r\n");
+    terminal_puts(term, "  itest              - Integration tests for System Sync\r\n\r\n");
     terminal_puts(term, "  help_tasks         - Show this help\r\n\r\n");
 
   } else if (strcmp(command, "mounts") == 0) {

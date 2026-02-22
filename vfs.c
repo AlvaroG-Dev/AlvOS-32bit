@@ -7,6 +7,8 @@
 #include <stdint.h>
 
 #include "task.h"
+#include "task_utils.h"  // Para mutex_lock/mutex_unlock
+
 
 /* Usar tus allocators */
 extern void *kernel_malloc(size_t size);
@@ -22,6 +24,9 @@ vfs_mount_info_t *mount_list = NULL;
 int mount_count = 0;
 char vfs_cwd[VFS_PATH_MAX] =
     "/home"; // Inicializar en /home como pide la terminal
+
+mutex_t vfs_global_mutex; // ✅ NUEVO: Mutex global para el VFS
+
 
 /* Global FD table REMOVED (now in task_t) */
 
@@ -157,7 +162,22 @@ void vfs_init(void) {
   vfs_cwd[VFS_PATH_MAX - 1] = '\0';
 
   vfs_unlock_restore_irq(f);
+
+  // ✅ NUEVO: Inicializar mutex global
+  mutex_init(&vfs_global_mutex, "vfs_global_mutex");
 }
+
+// ✅ NUEVO: Función centralizada para crear nodos VFS
+vfs_node_t *vfs_node_allocate(void) {
+  vfs_node_t *node = (vfs_node_t *)kernel_malloc(sizeof(vfs_node_t));
+  if (node) {
+    memset(node, 0, sizeof(vfs_node_t));
+    node->refcount = 1;
+    mutex_init(&node->mutex, "vnode_mutex");
+  }
+  return node;
+}
+
 
 /* find fs by name */
 static vfs_fs_type_t *find_fs(const char *name) {
@@ -211,9 +231,10 @@ vfs_superblock_t *find_mount_for_path(const char *path,
     return NULL;
   }
 
-  unsigned int f = vfs_lock_disable_irq();
+  mutex_lock(&vfs_global_mutex); // ✅ Protegemos acceso a mount_list
 
   vfs_superblock_t *best_sb = NULL;
+
   int best_len = -1;
   const char *best_relpath = NULL;
   char best_mountpoint[VFS_PATH_MAX] = "";
@@ -259,17 +280,19 @@ vfs_superblock_t *find_mount_for_path(const char *path,
   if (!best_sb) {
     terminal_printf(&main_terminal, "VFS: No mount found for path %s\r\n",
                     normalized);
-    vfs_unlock_restore_irq(f);
+    mutex_unlock(&vfs_global_mutex);
     return NULL;
   }
+
 
   /* serial_printf(COM1_BASE, "VFS: Matched mount %s for path %s (fs:
      %s)\r\n", best_mountpoint, normalized, best_sb->fs_name); */
 
   *out_relpath = best_relpath;
-  vfs_unlock_restore_irq(f);
+  mutex_unlock(&vfs_global_mutex);
   return best_sb;
 }
+
 
 /* Mount with proper error handling - FIXED VERSION */
 int vfs_mount(const char *mountpoint, const char *fsname, void *device) {
@@ -737,11 +760,14 @@ int vfs_read(int fd, void *buf, uint32_t size) {
   if (!f->node || !f->node->ops || !f->node->ops->read)
     return -1;
 
+  mutex_lock(&f->node->mutex); // ✅ Protegemos el nodo durante I/O
   int got = f->node->ops->read(f->node, (uint8_t *)buf, size, f->offset);
   if (got > 0)
     f->offset += got;
+  mutex_unlock(&f->node->mutex);
   return got;
 }
+
 
 int vfs_write(int fd, const void *buf, uint32_t size) {
   task_t *curr = scheduler.current_task;
@@ -756,12 +782,16 @@ int vfs_write(int fd, const void *buf, uint32_t size) {
 
   if (!f->node || !f->node->ops || !f->node->ops->write)
     return -1;
+
+  mutex_lock(&f->node->mutex); // ✅ Protegemos el nodo durante I/O
   int wrote =
       f->node->ops->write(f->node, (const uint8_t *)buf, size, f->offset);
   if (wrote > 0)
     f->offset += wrote;
+  mutex_unlock(&f->node->mutex);
   return wrote;
 }
+
 
 /* close */
 int vfs_close(int fd) {

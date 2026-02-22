@@ -11,13 +11,17 @@ extern Terminal main_terminal;
 static int log_fd = -1;
 static char log_path[VFS_PATH_MAX] = LOG_DEFAULT_PATH;
 static bool log_initialized = false;
+static mutex_t log_mutex; // ✅ NUEVO: Mutex para el sistema de logs
+
 
 // ========================================================================
 // INICIALIZACIÓN DEL SISTEMA DE LOGS
 // ========================================================================
 
 void log_init(void) {
+    mutex_init(&log_mutex, "log_mutex");
     // No intentar escribir en pantalla durante boot
+
     // Solo configurar el archivo de log
     
     log_fd = vfs_open(log_path, VFS_O_RDWR | VFS_O_CREAT);
@@ -76,8 +80,11 @@ void log_message(log_level_t level, const char *format, ...) {
     char buffer[LOG_MAX_MESSAGE_SIZE];
     uint32_t len = 0;
 
+    mutex_lock(&log_mutex); // ✅ Protegemos el buffer y el FD
+
     // Añadir timestamp
     len += snprintf(buffer, sizeof(buffer), "[%u] ", ticks_since_boot / 100);
+
 
     // Añadir nivel de log
     switch (level) {
@@ -115,8 +122,10 @@ void log_message(log_level_t level, const char *format, ...) {
     if (log_initialized && log_fd >= 0) {
         vfs_write(log_fd, buffer, len);
     }
-
+    
+    mutex_unlock(&log_mutex);
 }
+
 
 // ========================================================================
 // FUNCIONES DE LOGGING CONVENIENTES

@@ -60,7 +60,9 @@ compile "fat32.c"      "$GCC $GCC_OPTS -c fat32.c -o build/fat32.o"
 compile "task.c"       "$GCC $GCC_OPTS -c task.c -o build/task.o"
 compile "task_switch.s" "$GCC $GCC_OPTS -c task_switch.s -o build/task_switch.o"
 compile "task_utils.c" "$GCC $GCC_OPTS -c task_utils.c -o build/task_utils.o"
-compile "task_test.c"       "$GCC $GCC_OPTS -c task_test.c -o build/task_test.o"
+compile "task_test.c"           "$GCC $GCC_OPTS -c task_test.c -o build/task_test.o"
+compile "integration_tests.c"   "$GCC $GCC_OPTS -c integration_tests.c -o build/integration_tests.o"
+
 compile "serial.c"     "$GCC $GCC_OPTS -c serial.c -o build/serial.o"
 compile "log.c"        "$GCC $GCC_OPTS -c log.c -o build/log.o"
 compile "module_loader.c" "$GCC $GCC_OPTS -c module_loader.c -o build/module_loader.o"
@@ -118,7 +120,7 @@ ld -m elf_i386 -T linker.ld -o build/kernel.bin \
     build/pmm.o build/memory.o build/cpuid.o build/mmu.o build/memutils.o build/string.o \
     build/keyboard.o build/drawing.o build/math_utils.o build/terminal.o \
     build/disk.o build/disk_io_daemon.o build/task.o build/task_switch.o build/task_utils.o \
-    build/task_test.o build/serial.o build/vfs.o build/tmpfs.o build/fat32.o build/log.o \
+    build/task_test.o build/integration_tests.o build/serial.o build/vfs.o build/tmpfs.o build/fat32.o build/log.o \
     build/module_loader.o build/driver_system.o build/ide.o \
     build/pci.o build/acpi.o build/dma.o build/ahci.o build/sata_disk.o \
     build/atapi.o build/usb_core.o build/usb_disk_wrapper.o \

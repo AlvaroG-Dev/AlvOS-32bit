@@ -338,12 +338,11 @@ void task_destroy(task_t *task) {
   }
 
   // Liberar recursos de IPC
-  extern message_queue_t *message_queue_get(uint32_t task_id);
-  extern void message_queue_destroy(message_queue_t * queue);
   message_queue_t *mq = message_queue_get(task->task_id);
   if (mq) {
     message_queue_destroy(mq);
   }
+
 
   // Liberar descriptores de archivo abiertos
 
@@ -592,8 +591,8 @@ task_t *scheduler_next_task(void) {
 
   // Una vuelta completa buscando la mejor tarea READY
   do {
-    // Solo tareas en estado READY
-    if (current->state == TASK_READY) {
+    // Tareas READY o la propia que está RUNNING (evita ir a idle si no hay otra)
+    if (current->state == TASK_READY || current->state == TASK_RUNNING) {
       // Preferir non-idle tasks
       if (current != scheduler.idle_task) {
         // Encontramos una tarea real lista
@@ -602,10 +601,11 @@ task_t *scheduler_next_task(void) {
           best_priority = current->priority;
         }
       } else if (!best) {
-        // Idle solo si no hay nada mÃ¡s
+        // Idle solo si no hay nada más
         best = current;
       }
     }
+
 
     current = current->next;
   } while (current != start);

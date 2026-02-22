@@ -6,6 +6,7 @@
 #include "memory.h"
 #include "terminal.h"
 #include "string.h"
+#include "mutex_types.h"  // Tipos de sincronización sin dependencias circulares
 
 // ========================================================================
 // MACROS DE TESTING
@@ -49,13 +50,8 @@
 // WAIT QUEUES (COLAS DE ESPERA)
 // ========================================================================
 
-typedef struct {
-    task_t* head;
-    task_t* tail;
-    const char* name;
-    uint32_t count;
-} wait_queue_t;
-
+// wait_queue_t y mutex_t se definen en mutex_types.h (incluido arriba)
+// para evitar dependencias circulares.
 
 // Funciones de Wait Queues
 void wait_queue_init(wait_queue_t* wq, const char* name);
@@ -63,24 +59,12 @@ void wait_queue_sleep(wait_queue_t* wq);
 void wait_queue_wakeup(wait_queue_t* wq);
 void wait_queue_wakeup_all(wait_queue_t* wq);
 
-// ========================================================================
-// ESTRUCTURA MUTEX (MEJORADA CON WAIT QUEUES)
-// ========================================================================
-
-typedef struct {
-    volatile bool locked;
-    task_t* owner;
-    uint32_t lock_count;  // ✅ NUEVO: Para locks reentrantes
-    const char* name;
-    wait_queue_t wait_queue; // Cola de tareas esperando por este mutex
-} mutex_t;
-
-
-// Funciones de sincronización
+// Funciones de Mutex
 void mutex_init(mutex_t* mutex, const char* name);
 bool mutex_try_lock(mutex_t* mutex);
 void mutex_lock(mutex_t* mutex);
 void mutex_unlock(mutex_t* mutex);
+
 
 // ========================================================================
 // SISTEMA DE MENSAJES

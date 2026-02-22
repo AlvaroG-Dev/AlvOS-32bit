@@ -5,6 +5,9 @@
 #include "memutils.h"
 #include <stddef.h>
 #include <stdint.h>
+#include "mutex_types.h"
+
+
 
 /* Ajustes */
 #define VFS_MAX_FDS 64
@@ -61,7 +64,9 @@ typedef struct vfs_node {
   struct vnode_ops *ops;
   struct vfs_superblock *sb;
   uint32_t refcount;
+  mutex_t mutex; /* ✅ NUEVO: Mutex para thread-safety del nodo */
 } vfs_node_t;
+
 
 typedef enum { VFS_DEV_BLOCK = 1, VFS_DEV_CHAR = 2 } vfs_dev_type_t;
 
@@ -202,5 +207,6 @@ extern vfs_fs_type_t devfs_type;
 int vfs_mkdir(const char *path, vfs_node_t **out);
 int vfs_unmount(const char *mountpoint);
 void debug_hex_dump(const char *label, const char *str, size_t len);
+vfs_node_t *vfs_node_allocate(void);  // ✅ Aloca y inicializa un vnode con mutex
 
 #endif /* VFS_H */
