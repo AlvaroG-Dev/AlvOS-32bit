@@ -46,7 +46,25 @@
     } while(0)
 
 // ========================================================================
-// ESTRUCTURA MUTEX (MEJORADA)
+// WAIT QUEUES (COLAS DE ESPERA)
+// ========================================================================
+
+typedef struct {
+    task_t* head;
+    task_t* tail;
+    const char* name;
+    uint32_t count;
+} wait_queue_t;
+
+
+// Funciones de Wait Queues
+void wait_queue_init(wait_queue_t* wq, const char* name);
+void wait_queue_sleep(wait_queue_t* wq);
+void wait_queue_wakeup(wait_queue_t* wq);
+void wait_queue_wakeup_all(wait_queue_t* wq);
+
+// ========================================================================
+// ESTRUCTURA MUTEX (MEJORADA CON WAIT QUEUES)
 // ========================================================================
 
 typedef struct {
@@ -54,7 +72,9 @@ typedef struct {
     task_t* owner;
     uint32_t lock_count;  // ✅ NUEVO: Para locks reentrantes
     const char* name;
+    wait_queue_t wait_queue; // Cola de tareas esperando por este mutex
 } mutex_t;
+
 
 // Funciones de sincronización
 void mutex_init(mutex_t* mutex, const char* name);
@@ -85,7 +105,9 @@ typedef struct {
     uint32_t message_count;
     mutex_t queue_mutex;
     volatile bool has_messages;
+    wait_queue_t wait_queue; // ✅ NUEVO: Para recepción bloqueante eficiente
 } message_queue_t;
+
 
 // Funciones de mensajes
 void message_system_init(void);

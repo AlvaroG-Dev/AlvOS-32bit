@@ -34,7 +34,9 @@
 #include "string.h"
 #include "syscalls.h"
 #include "task.h"
+#include "task_test.h"
 #include "task_utils.h"
+
 #include "text_editor.h"
 #include "vfs.h"
 
@@ -1168,7 +1170,21 @@ void terminal_putchar_raw(Terminal *term, char c) {
       if (term->buffer.count > term->height) {
         term->view_start_line = term->buffer.count - term->height;
       }
-      memset(term->dirty_lines, 1, term->height);
+      // OPTIMIZACIÓN CRÍTICA: Desplazar framebuffer en lugar de redibujar todo
+      scroll_screen();
+      
+      // DESPLAZAR LÍNEAS SUCIAS: No perder cambios pendientes en otras líneas
+      for (uint32_t i = 0; i < term->height - 1; i++) {
+        term->dirty_lines[i] = term->dirty_lines[i + 1];
+      }
+      term->dirty_lines[term->height - 1] = 1;
+      
+      // DESPLAZAR RASTRO DEL CURSOR: El cursor físico se movió arriba
+      if (term->last_cursor_y > 0) {
+          term->last_cursor_y--;
+          // Forzar redibujado de la línea donde estaba el cursor para quitar "fantasma"
+          term->dirty_lines[term->last_cursor_y] = 1;
+      }
     } else {
       term->cursor_y++;
     }
@@ -1377,16 +1393,24 @@ void terminal_draw(Terminal *term) {
   if (!term)
     return;
 
-  static uint32_t last_cursor_x = 0, last_cursor_y = 0;
-  static uint8_t last_cursor_visible = 0;
-
-  // Limpiar pantalla si es necesario (solo para scroll completo)
+  // Limpiar pantalla si es necesario (sólo para scroll completo)
   if (term->needs_full_redraw) {
     fill_rect(0, 0,
               term->width * (g_current_font.width + g_current_font.spacing),
               term->height * g_current_font.height, term->bg_color);
     term->needs_full_redraw = 0;
     memset(term->dirty_lines, 1, term->height);
+    term->last_cursor_visible = 0;
+  }
+
+  // Asegurar que la línea del cursor actual esté marcada como sucia si el cursor cambió
+  if (term->cursor_state_changed || term->last_cursor_x != term->cursor_x || term->last_cursor_y != term->cursor_y) {
+    if (term->last_cursor_y < term->height) term->dirty_lines[term->last_cursor_y] = 1;
+    if (term->cursor_y < term->height) term->dirty_lines[term->cursor_y] = 1;
+    
+    term->last_cursor_x = term->cursor_x;
+    term->last_cursor_y = term->cursor_y;
+    term->cursor_state_changed = 0;
   }
 
   // Redibujar líneas sucias
@@ -1394,53 +1418,6 @@ void terminal_draw(Terminal *term) {
     if (term->dirty_lines[screen_y]) {
       terminal_draw_line(term, screen_y);
     }
-  }
-
-  // MANEJO DEL CURSOR - SIEMPRE VERIFICAR PARPADEO
-  int cursor_moved =
-      (last_cursor_x != term->cursor_x || last_cursor_y != term->cursor_y);
-  int cursor_visibility_changed = (last_cursor_visible != term->cursor_visible);
-
-  if (cursor_moved || cursor_visibility_changed || term->cursor_state_changed ||
-      term->cursor_visible != last_cursor_visible) {
-
-    // Borrar cursor anterior solo si estaba visible y en pantalla
-    if (last_cursor_visible && last_cursor_y < term->height) {
-      uint32_t prev_buffer_line = term->view_start_line + last_cursor_y;
-
-      if (prev_buffer_line < term->buffer.count) {
-        char *line = circular_buffer_get_line(&term->buffer, prev_buffer_line);
-        if (line && last_cursor_x < term->width) {
-          char prev_char = line[last_cursor_x];
-          if (prev_char != ' ' && prev_char != '\0') {
-            draw_char_with_shadow(
-                last_cursor_x * (g_current_font.width + g_current_font.spacing),
-                last_cursor_y * g_current_font.height, prev_char,
-                term->fg_color, term->bg_color, COLOR_DARK_GRAY, 0);
-          } else {
-            fill_rect(
-                last_cursor_x * (g_current_font.width + g_current_font.spacing),
-                last_cursor_y * g_current_font.height, g_current_font.width,
-                g_current_font.height, term->bg_color);
-          }
-        }
-      }
-    }
-
-    // Dibujar cursor nuevo si está visible y en pantalla
-    if (term->cursor_visible && term->cursor_y < term->height &&
-        term->cursor_x < term->width) {
-      fill_rect(term->cursor_x *
-                    (g_current_font.width + g_current_font.spacing),
-                term->cursor_y * g_current_font.height, g_current_font.width,
-                g_current_font.height, term->fg_color);
-    }
-
-    // Actualizar estado anterior
-    last_cursor_x = term->cursor_x;
-    last_cursor_y = term->cursor_y;
-    last_cursor_visible = term->cursor_visible;
-    term->cursor_state_changed = 0;
   }
 }
 
@@ -1690,7 +1667,8 @@ void terminal_process_command(Terminal *term) {
 }
 
 void terminal_printf(Terminal *term, const char *format, ...) {
-  char buffer[1024]; // Buffer en stack
+  char buffer[512]; // Buffer en stack
+
   va_list args;
 
   va_start(args, format);
@@ -3255,7 +3233,11 @@ void terminal_execute(Terminal *term, const char *cmd) {
     terminal_puts(term, "Scheduler stopped\r\n");
   } else if (strcmp(command, "task_health") == 0) {
     task_monitor_health();
+  } else if (strcmp(command, "sync-test") == 0) {
+    run_task_utils_test_suite();
+
   } else if (strcmp(command, "install") == 0) {
+
     install_err_t result = install_os_complete(&main_disk, &options);
     if (result == INSTALL_OK) {
       terminal_puts(&main_terminal, "¡Instalación completa exitosa!");
@@ -3323,8 +3305,10 @@ void terminal_execute(Terminal *term, const char *cmd) {
     terminal_puts(term, "  start_scheduler    - Start the scheduler\r\n");
     terminal_puts(term, "  stop_scheduler     - Stop the scheduler\r\n");
     terminal_puts(term, "  create_test_task   - Create a new test task\r\n");
-    terminal_puts(term, "  task_health        - Show tasks health\r\n\r\n");
+    terminal_puts(term, "  task_health        - Show tasks health\r\n");
+    terminal_puts(term, "  sync-test          - Run Task/Sync/Msg Test Suite\r\n\r\n");
     terminal_puts(term, "  help_tasks         - Show this help\r\n\r\n");
+
   } else if (strcmp(command, "mounts") == 0) {
     int count = vfs_list_mounts(mounts_callback, term);
     terminal_printf(term, "Current mounts (%d):\r\n", count);

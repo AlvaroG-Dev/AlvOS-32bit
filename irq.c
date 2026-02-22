@@ -46,7 +46,8 @@ void irq_common_handler(struct regs *r) {
   pic_send_eoi(irq);
 }
 
-void timer_irq_handler() {
+void timer_irq_handler(struct regs *r) {
+  (void)r;
   ticks++;
   ticks_since_boot++;
 
@@ -58,10 +59,13 @@ void timer_irq_handler() {
   }
 }
 
-void mouse_irq_handler() {
+
+void mouse_irq_handler(struct regs *r) {
+  (void)r;
   mouse_handle_irq();
   pic_send_eoi(12);
 }
+
 
 // Canal 0, modo 3 (Square Wave Generator), acceso low/high, modo binario
 #define PIT_CHANNEL0_PORT 0x40
@@ -172,10 +176,11 @@ void irq_setup_apic(void) {
                     "    IRQ 0 -> GSI %u -> Vector 48 (PIT via I/O APIC)\r\n",
                     gsi_timer);
 
-    // Configurar handler para vector 48 en IDT
-    extern void irq0_entry(); // Necesitarás crear este stub en assembly
-    idt_set_gate(48, (uintptr_t)irq0_entry, 0x08,
+    // Configurar handler para vector 48 en IDT (irq48_entry para reportar 48)
+    extern void irq48_entry();
+    idt_set_gate(48, (uintptr_t)irq48_entry, 0x08,
                  IDT_FLAG_PRESENT | IDT_FLAG_RING0 | IDT_FLAG_INTERRUPT32);
+
   }
 
   // Teclado - IRQ 1
@@ -185,9 +190,10 @@ void irq_setup_apic(void) {
                   "    IRQ 1 -> GSI %u -> Vector 49 (Keyboard)\r\n", gsi_kbd);
 
   // Configurar handler para vector 49
-  extern void irq1_entry();
-  idt_set_gate(49, (uintptr_t)irq1_entry, 0x08,
+  extern void irq49_entry();
+  idt_set_gate(49, (uintptr_t)irq49_entry, 0x08,
                IDT_FLAG_PRESENT | IDT_FLAG_RING0 | IDT_FLAG_INTERRUPT32);
+
 
   // COM2 - IRQ 3
   uint32_t gsi_serial2 = apic_irq_to_gsi(3);
@@ -214,9 +220,10 @@ void irq_setup_apic(void) {
                   "    IRQ 12 -> GSI %u -> Vector 60 (Mouse)\r\n", gsi_mouse);
 
   // Configurar handler para vector 60
-  extern void irq12_entry();
-  idt_set_gate(60, (uintptr_t)irq12_entry, 0x08,
+  extern void irq60_entry();
+  idt_set_gate(60, (uintptr_t)irq60_entry, 0x08,
                IDT_FLAG_PRESENT | IDT_FLAG_RING0 | IDT_FLAG_INTERRUPT32);
+
 
   // IDE - IRQ 14 y 15 (masked por ahora)
   uint32_t gsi_ide1 = apic_irq_to_gsi(14);

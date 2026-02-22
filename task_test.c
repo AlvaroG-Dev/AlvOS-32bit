@@ -6,6 +6,7 @@
 #include "kernel.h"
 #include "memory.h"
 #include "irq.h"
+#include "serial.h"
 
 // ========================================================================
 // TEST SUITE - VARIABLES GLOBALES
@@ -29,11 +30,19 @@ static void test_mutex_basic(void) {
     TEST_ASSERT(mutex.locked == true, "Mutex no marcado como locked");
     TEST_ASSERT(mutex.owner == task_current(), "Owner incorrecto");
     
-    TEST_ASSERT(mutex_try_lock(&mutex) == false, "Pudo adquirir mutex ya locked");
+    // ✅ ACTUALIZADO: El mutex es reentrante ahora
+    TEST_ASSERT(mutex_try_lock(&mutex) == true, "Debería poder re-adquirir (reentrancia)");
+    TEST_ASSERT(mutex.lock_count == 2, "Lock count incorrecto en reentrada");
     
     mutex_unlock(&mutex);
-    TEST_ASSERT(mutex.locked == false, "Mutex no se desbloqueó");
+    TEST_ASSERT(mutex.locked == true, "Mutex liberado prematuramente (lock_count=1)");
+    TEST_ASSERT(mutex.lock_count == 1, "Lock count incorrecto tras primer unlock");
+    
+    mutex_unlock(&mutex);
+    TEST_ASSERT(mutex.locked == false, "Mutex no se desbloqueó tras segundo unlock");
     TEST_ASSERT(mutex.owner == NULL, "Owner no se limpió");
+
+
     
     TEST_PASS();
 }
@@ -72,7 +81,9 @@ static volatile int race_condition_detected = 0;
 static void race_condition_task(void* arg) {
     int task_num = (int)(uintptr_t)arg;
     
+    serial_printf(COM1_BASE, "[RACE_%d] Starting\r\n", task_num);
     terminal_printf(&main_terminal, "[RACE_%d] Starting\r\n", task_num);
+
     
     for (int i = 0; i < 100; i++) {
         mutex_lock(&shared_mutex);
@@ -108,9 +119,9 @@ static void test_mutex_race_condition(void) {
     
     terminal_puts(&main_terminal, "\r\n[TEST] Creating race condition tasks...\r\n");
     
-    task_t* task1 = task_create("race1", race_condition_task, (void*)1, TASK_PRIORITY_NORMAL);
-    task_t* task2 = task_create("race2", race_condition_task, (void*)2, TASK_PRIORITY_NORMAL);
-    task_t* task3 = task_create("race3", race_condition_task, (void*)3, TASK_PRIORITY_NORMAL);
+    task_t* task1 = task_create("race1", race_condition_task, (void*)(uintptr_t)1, TASK_PRIORITY_HIGH);
+    task_t* task2 = task_create("race2", race_condition_task, (void*)(uintptr_t)2, TASK_PRIORITY_HIGH);
+    task_t* task3 = task_create("race3", race_condition_task, (void*)(uintptr_t)3, TASK_PRIORITY_HIGH);
     
     TEST_ASSERT(task1 != NULL, "No se pudo crear task1");
     TEST_ASSERT(task2 != NULL, "No se pudo crear task2");
@@ -119,21 +130,24 @@ static void test_mutex_race_condition(void) {
     terminal_puts(&main_terminal, "[TEST] Tasks created, waiting...\r\n");
     
     // Esperar hasta 20 segundos
-    for (int i = 0; i < 2000; i++) {
-        if (i % 100 == 0) {
+    for (int i = 0; i < 400; i++) {
+        if (i % 50 == 0) {
             terminal_printf(&main_terminal, "[TEST] Progress: counter=%d/300\r\n", shared_counter);
         }
         
-        if (shared_counter >= 300 &&
-            task1->state == TASK_FINISHED &&
-            task2->state == TASK_FINISHED &&
-            task3->state == TASK_FINISHED) {
-            terminal_puts(&main_terminal, "[TEST] All tasks completed!\r\n");
+        if (shared_counter >= 300) {
+            terminal_puts(&main_terminal, "[TEST] All tasks finished their work!\r\n");
+            // Dar tiempo extra para que las tareas terminen y llamen a task_exit
+            for(int j=0; j<10; j++) task_yield();
             break;
         }
         
-        task_sleep(10);
+        task_sleep(50);
+        task_yield(); // Yield extra
     }
+
+
+
     
     TEST_ASSERT(race_condition_detected == 0, "Se detectó race condition");
     TEST_ASSERT_FORMAT(shared_counter == 300, 
@@ -204,32 +218,24 @@ static void message_receiver_task(void* arg) {
     uint32_t start_time = ticks_since_boot;
     
     while (received_count < 10) {
-        // ✅ FIX: Verificar primero sin mutex para eficiencia
-        if (my_queue->message_count > 0) {
-            if (message_receive(&msg, false)) {
-                received_count++;
-                message_received_count = received_count;
-                
-                terminal_printf(&main_terminal, 
-                    "[RECEIVER] Got message %d (type=%u, data=%d)\r\n",
-                    received_count, msg.type, *(int*)msg.data);
-                
-                // Pequeña pausa para ver los mensajes
-                for (volatile int i = 0; i < 10000; i++);
-            }
-        } else {
-            // ✅ FIX: Si no hay mensajes, yield activo
-            task_yield();
+        // ✅ TEST: True blocking receive using wait queues
+        if (message_receive(&msg, true)) {
+            received_count++;
+            message_received_count = received_count;
             
-            // Timeout de seguridad
-            if (ticks_since_boot - start_time > 500) { // 5 segundos
-                terminal_printf(&main_terminal, 
-                    "[RECEIVER] TIMEOUT: Only received %d/10 messages after %u ticks\r\n",
-                    received_count, ticks_since_boot - start_time);
-                break;
-            }
+            terminal_printf(&main_terminal, 
+                "[RECEIVER] Got message %d (type=%u, data=%d)\r\n",
+                received_count, msg.type, *(int*)msg.data);
+            
+            // Simular algo de procesamiento
+            for (volatile int i = 0; i < 5000; i++);
+        } else {
+            // Si message_receive falló (no debería pasar en modo bloqueante si no hay timeouts)
+            terminal_puts(&main_terminal, "[RECEIVER] message_receive failed\r\n");
+            break;
         }
     }
+
     
     terminal_printf(&main_terminal, "[RECEIVER] Finished! Received %d messages\r\n", received_count);
     task_exit(0);

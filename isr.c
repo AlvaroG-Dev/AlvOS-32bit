@@ -441,7 +441,7 @@ void isr_handler(struct regs *r) {
 
   default:
     // Para otras excepciones: Log en terminal
-    char buffer[128];
+    char buffer[256];
     snprintf(buffer, sizeof(buffer),
              "\nException 0x%02x (%s) in %s mode\n"
              "Error Code: 0x%08x\nEIP: 0x%08x\n",
@@ -450,13 +450,10 @@ void isr_handler(struct regs *r) {
              user_mode ? "User" : "Kernel", r->err_code, r->eip);
     terminal_puts(&main_terminal, buffer);
 
-    // Intentar recuperación para algunas excepciones no críticas
     if (user_mode) {
-      // En modo usuario, excepciones no críticas pueden terminar la tarea
       if (scheduler.current_task) {
         terminal_printf(&main_terminal, "Terminating user task: %s\r\n",
                         scheduler.current_task->name);
-
         mmu_load_cr3(mmu_get_kernel_pd());
         task_destroy(scheduler.current_task);
         scheduler.current_task = scheduler.idle_task;
@@ -464,16 +461,12 @@ void isr_handler(struct regs *r) {
           scheduler.current_task->state = TASK_RUNNING;
         }
       }
-    } else if (r->int_no == 0) { // Divide by zero en modo kernel
-      // Recuperación para divide by zero
-      r->eax = 0;
-      r->eip += 2; // Skip instrucción DIV/IDIV (2 bytes típicos)
-      terminal_puts(&main_terminal,
-                    "Recovered from Divide by Zero in kernel mode\n");
     } else {
-      // Otras excepciones en modo kernel: continuar con cuidado
-      terminal_puts(&main_terminal,
-                    "Attempting to continue in kernel mode...\n");
+      // Para modo kernel, cualquier excepción no capturada explícitamente es FATAL
+      snprintf(buffer, sizeof(buffer), "%s\nMode: Kernel\nEIP: 0x%08x",
+               r->int_no < 32 ? exception_messages[r->int_no] : "Critical Error",
+               r->eip);
+      panic_screen(buffer, r);
     }
     break;
   }

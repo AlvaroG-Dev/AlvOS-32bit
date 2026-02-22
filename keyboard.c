@@ -207,7 +207,8 @@ void keyboard_inject_scancode(uint8_t scancode) {
   }
 }
 
-void keyboard_irq_handler() {
+void keyboard_irq_handler(struct regs *r) {
+  (void)r;
   // Check status register to ensure data is available
   uint8_t status = inb(KEYBOARD_STATUS_PORT);
   if (status & 0x01) {
@@ -216,6 +217,7 @@ void keyboard_irq_handler() {
   }
   pic_send_eoi(1);
 }
+
 
 void keyboard_set_handler(KeyboardCallback handler) {
   keyboard_callback = handler;

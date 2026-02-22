@@ -113,6 +113,8 @@ task_switch_context:
     
     iret
 
+
+
 .switch_error:
     popa
     ret
@@ -142,7 +144,7 @@ task_start_first:
     movl %ecx, %esp
     
     movl CTX_EFLAGS(%edi), %eax
-    orl $0x200, %eax
+    # orl $0x200, %eax        # NO forzar IF=1, respetar contexto
     pushl %eax
     pushl CTX_CS(%edi)
     pushl CTX_EIP(%edi)

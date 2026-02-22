@@ -125,7 +125,6 @@ static void mount_bin_directory(void) {
 void shutdown(void) {
   terminal_printf(&main_terminal, "\n\nSystem shutdown initiated\r\n");
   serial_write_string(COM1_BASE, "System shutdown initiated\r\n");
-  terminal_destroy(&main_terminal);
   // 1. Deshabilitar interrupciones
   __asm__ volatile("cli");
 
@@ -167,8 +166,11 @@ void shutdown(void) {
   heap_info_t heap_info = heap_stats();
   // 9. Intentar apagado ACPI
   if (acpi_is_supported()) {
+    terminal_destroy(&main_terminal);
     acpi_power_off();
   }
+  terminal_printf(&main_terminal, "\n\nSystem doesn't support ACPI, halting\r\n");
+  terminal_destroy(&main_terminal);
   // Halt final
   while (1) {
     __asm__ volatile("cli; hlt");
@@ -476,9 +478,10 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
       task_create("Memory Defrag", memory_defrag_task, NULL, TASK_PRIORITY_LOW);
   task_t *cleanup =
       task_create("cleanupd", cleanup_task, NULL, TASK_PRIORITY_LOW);
-  // Crear tarea principal del loop
+  // Crear tarea principal del loop con prioridad NORMAL
   task_t *main_loop =
-      task_create("main_loop", main_loop_task, NULL, TASK_PRIORITY_HIGH);
+      task_create("main_loop", main_loop_task, NULL, TASK_PRIORITY_NORMAL);
+
   if (!main_loop) {
     terminal_puts(&main_terminal, "FATAL: Failed to create main loop task\n");
     while (1)

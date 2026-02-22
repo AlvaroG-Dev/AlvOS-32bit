@@ -28,7 +28,8 @@ typedef enum {
 } task_priority_t;
 
 // Tamaño del stack para cada tarea
-#define TASK_STACK_SIZE (32 * 1024)
+#define TASK_STACK_SIZE (64 * 1024)
+
 #define USER_STACK_SIZE (16 * 1024) // Stack más grande para usuario
 #define MAX_TASKS 32
 #define TASK_NAME_MAX 32
@@ -92,6 +93,8 @@ typedef struct task {
   // Lista enlazada
   struct task *next; // Siguiente tarea en la lista
   struct task *prev; // Tarea anterior
+  struct task *wait_next; // ✅ NUEVO: Siguiente tarea en una cola de espera
+
 
   // Función de entrada y datos
   void (*entry_point)(void *); // Función principal de la tarea (kernel wrapper)

@@ -31,7 +31,8 @@ extern volatile uint32_t ticks_since_boot;
 typedef void (*irq_handler_t)(struct regs *);
 
 // Funciones públicas
-void timer_irq_handler(void); // <-- Debe estar visible
+void timer_irq_handler(struct regs *r); // <-- Debe estar visible
+
 void irq_common_handler(struct regs *r);
 void pic_send_eoi(uint8_t irq);
 void pit_init(uint32_t frequency);

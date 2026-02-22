@@ -103,7 +103,11 @@ typedef struct {
   uint32_t cursor_blink_rate;
   uint32_t last_blink_time;
   uint8_t cursor_state_changed;
+  uint32_t last_cursor_x; // ✅ NUEVO: Tracking para limpieza
+  uint32_t last_cursor_y; // ✅ NUEVO
+  uint8_t last_cursor_visible; // ✅ NUEVO
   uint8_t *dirty_lines; // Array dinámico de líneas sucias
+
   uint8_t flags;
   uint32_t current_fg_color; // Color actual del texto
   uint32_t current_bg_color; // Color actual del fondo

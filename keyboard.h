@@ -103,7 +103,9 @@ uint8_t keyboard_read_scancode();
 int keyboard_process_scancode(uint8_t scancode, KeyboardState *state,
                               uint8_t *extended_flag);
 uint8_t keyboard_get_modifiers(KeyboardState *state);
-void keyboard_irq_handler(void);
+struct regs;
+void keyboard_irq_handler(struct regs *r);
+
 typedef void (*KeyboardCallback)(int key);
 void keyboard_set_handler(KeyboardCallback handler);
 int keyboard_get_char(void);

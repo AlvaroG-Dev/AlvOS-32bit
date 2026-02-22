@@ -8,7 +8,80 @@
 #include "log.h"
 
 // ========================================================================
-// FUNCIONES DE SINCRONIZACIÓN BÁSICA (CORREGIDAS)
+// WAIT QUEUES (COLAS DE ESPERA)
+// ========================================================================
+
+void wait_queue_init(wait_queue_t* wq, const char* name) {
+    if (!wq) return;
+    wq->head = NULL;
+    wq->tail = NULL;
+    wq->name = name ? name : "unnamed_wq";
+    wq->count = 0;
+}
+
+void wait_queue_sleep(wait_queue_t* wq) {
+    if (!wq) return;
+    
+    uint32_t flags;
+    __asm__ __volatile__("pushf\n\tcli\n\tpop %0" : "=r"(flags));
+    
+    task_t* current = task_current();
+    if (!current) {
+        __asm__ __volatile__("push %0\n\tpopf" : : "r"(flags));
+        return;
+    }
+    
+    // Preparar tarea
+    current->wait_next = NULL;
+    
+    // Añadir a la cola
+    if (wq->tail) {
+        wq->tail->wait_next = current;
+        wq->tail = current;
+    } else {
+        wq->head = wq->tail = current;
+    }
+    wq->count++;
+    
+    // Cambiar estado de tarea a WAITING (no SLEEPING para evitar despertar prematuro por timer)
+    current->state = TASK_WAITING;
+
+    
+    // Yield (vuelve aquí después de ser despertada)
+    task_yield();
+    
+    __asm__ __volatile__("push %0\n\tpopf" : : "r"(flags));
+}
+
+void wait_queue_wakeup(wait_queue_t* wq) {
+    if (!wq || !wq->head) return;
+    
+    uint32_t flags;
+    __asm__ __volatile__("pushf\n\tcli\n\tpop %0" : "=r"(flags));
+    
+    task_t* task = wq->head;
+    wq->head = task->wait_next;
+    if (!wq->head) wq->tail = NULL;
+    wq->count--;
+    
+    task->wait_next = NULL;
+    if (task->state == TASK_SLEEPING || task->state == TASK_WAITING) {
+        task->state = TASK_READY;
+    }
+    
+    __asm__ __volatile__("push %0\n\tpopf" : : "r"(flags));
+}
+
+
+void wait_queue_wakeup_all(wait_queue_t* wq) {
+    if (!wq) return;
+    while (wq->head) {
+        wait_queue_wakeup(wq);
+    }
+}
+
+// ========================================================================
+// FUNCIONES DE SINCRONIZACIÓN BÁSICA (MEJORADAS)
 // ========================================================================
 
 void mutex_init(mutex_t* mutex, const char* name) {
@@ -17,30 +90,40 @@ void mutex_init(mutex_t* mutex, const char* name) {
     mutex->owner = NULL;
     mutex->lock_count = 0;
     mutex->name = name ? name : "unnamed_mutex";
+    wait_queue_init(&mutex->wait_queue, name);
 }
 
 bool mutex_try_lock(mutex_t* mutex) {
     if (!mutex) return false;
     
-    // Deshabilitar interrupciones para operación atómica
     uint32_t flags;
     __asm__ __volatile__("pushf\n\tcli\n\tpop %0" : "=r"(flags));
     
     bool success = false;
     task_t* current = task_current();
+    if (!current) {
+        __asm__ __volatile__("push %0\n\tpopf" : : "r"(flags));
+        return false;
+    }
     
-    // ✅ FIX: NO permitir reentrada en try_lock (comportamiento estándar)
-    // Solo permitir si el mutex está completamente libre
     if (!mutex->locked) {
         mutex->locked = true;
         mutex->owner = current;
         mutex->lock_count = 1;
         success = true;
+    } else if (mutex->owner == current || (mutex->owner && mutex->owner->task_id == current->task_id)) {
+        // ✅ REENTRANCIA
+        mutex->lock_count++;
+        success = true;
     }
+
+
     
     __asm__ __volatile__("push %0\n\tpopf" : : "r"(flags));
     return success;
 }
+
+
 
 void mutex_lock(mutex_t* mutex) {
     if (!mutex) return;
@@ -56,45 +139,15 @@ void mutex_lock(mutex_t* mutex) {
         return;
     }
     
-    uint32_t start_ticks = ticks_since_boot;
-    uint32_t attempts = 0;
-    uint32_t backoff = 1;  // ✅ NUEVO: Backoff exponencial
-    
+    // Bloquear eficientemente usando Wait Queues
     while (!mutex_try_lock(mutex)) {
-        attempts++;
-        
-        // Timeout de 5 segundos
-        if (ticks_since_boot - start_ticks > 500) {
-            log_message(LOG_INFO, 
-                "[MUTEX] TIMEOUT: %s waiting for %s (owner: %s, attempts: %u)\r\n",
-                current ? current->name : "unknown",
-                mutex->name,
-                mutex->owner ? mutex->owner->name : "none",
-                attempts);
-            return;
-        }
-        
-        // ✅ FIX: Backoff exponencial para reducir contención
-        for (volatile uint32_t i = 0; i < backoff; i++) {
-            __asm__ volatile("pause");
-        }
-        
-        // Aumentar backoff hasta un máximo
-        if (backoff < 1000) {
-            backoff *= 2;
-        }
-        
-        // Yield cada 10 intentos
-        if (attempts % 10 == 0) {
-            task_yield();
-        }
+        wait_queue_sleep(&mutex->wait_queue);
     }
 }
 
 void mutex_unlock(mutex_t* mutex) {
     if (!mutex || !mutex->locked) return;
     
-    // Verificar que solo el propietario pueda desbloquear
     if (mutex->owner != task_current()) {
         log_message(LOG_INFO, 
             "[MUTEX] WARNING: %s trying to unlock %s owned by %s\r\n",
@@ -107,7 +160,6 @@ void mutex_unlock(mutex_t* mutex) {
     uint32_t flags;
     __asm__ __volatile__("pushf\n\tcli\n\tpop %0" : "=r"(flags));
     
-    // ✅ FIX: Decrementar contador de locks reentrantes
     if (mutex->lock_count > 1) {
         mutex->lock_count--;
     } else {
@@ -115,12 +167,16 @@ void mutex_unlock(mutex_t* mutex) {
         mutex->owner = NULL;
         mutex->lock_count = 0;
         
-        // ✅ FIX: Barrera de memoria después de liberar (x86-32 compatible)
+        // Despertar a la siguiente tarea en espera
+        wait_queue_wakeup(&mutex->wait_queue);
+        
+        // Barrera de memoria
         __asm__ __volatile__("lock; addl $0, (%%esp)" ::: "memory", "cc");
     }
     
     __asm__ __volatile__("push %0\n\tpopf" : : "r"(flags));
 }
+
 
 // ========================================================================
 // SISTEMA DE MENSAJES ENTRE TAREAS (CORREGIDO)
@@ -142,7 +198,12 @@ void message_system_init(void) {
         char mutex_name[32];
         snprintf(mutex_name, sizeof(mutex_name), "msgqueue_%d", i);
         mutex_init(&message_queues[i].queue_mutex, mutex_name);
+        
+        char wq_name[32];
+        snprintf(wq_name, sizeof(wq_name), "msgqueue_wq_%d", i);
+        wait_queue_init(&message_queues[i].wait_queue, wq_name);
     }
+
     
     message_system_initialized = true;
     log_message(LOG_INFO, "Message system initialized\r\n");
@@ -239,22 +300,19 @@ bool message_send(uint32_t target_task_id, uint32_t type, const void* data, size
     // ✅ FIX: Establecer flag de señalización
     queue->has_messages = true;
     
-    // ✅ FIX: Usar barrera de memoria para asegurar visibilidad
-    __asm__ __volatile__("mfence" ::: "memory");
+    // ✅ FIX: Usar barrera de memoria compatible (lock prefix) para asegurar visibilidad
+    __asm__ __volatile__("lock; addl $0, (%%esp)" ::: "memory", "cc");
+
     
     log_message(LOG_INFO, 
         "[MSG] Sent type=%u to task %u (count=%u)\n",
         type, target_task_id, queue->message_count);
     
-    // ✅ FIX: Despertar tarea de manera segura
-    task_t* target_task = task_find_by_id(target_task_id);
-    if (target_task && target_task->state == TASK_SLEEPING) {
-        target_task->state = TASK_READY;
-        target_task->sleep_until = 0;  // Cancelar sleep
-        log_message(LOG_INFO, "[MSG] Woke up task %s\n", target_task->name);
-    }
+    // ✅ FIX: Despertar tarea esperando en la cola de mensajes
+    wait_queue_wakeup(&queue->wait_queue);
     
     __asm__ __volatile__("push %0\n\tpopf" : : "r"(flags));
+
     return true;
 }
 
@@ -323,19 +381,11 @@ bool message_receive(message_t* msg_out, bool blocking) {
             return false;
         }
         
-        // ✅ FIX: Timeout con yield frecuente
-        if (ticks_since_boot - wait_start > 500) { // 5 segundos
-            log_message(LOG_INFO, 
-                "[MSG] Timeout waiting for message (task %s, checks=%u)\r\n",
-                current->name, check_count);
-            return false;
-        }
-        
-        // ✅ FIX: Sleep corto en lugar de spin
-        // Esto permite que el sender se ejecute
-        task_sleep(10);  // 10ms
+        // ✅ FIX: Bloquear eficientemente usando Wait Queues
+        wait_queue_sleep(&queue->wait_queue);
     }
 }
+
 
 void message_queue_destroy(message_queue_t* queue) {
     if (!queue) return;
@@ -429,9 +479,11 @@ void task_monitor_health(void) {
                     healthy_tasks++;
                     break;
                 case TASK_SLEEPING:
+                case TASK_WAITING:
                     sleeping_tasks++;
                     healthy_tasks++;
                     break;
+
                 case TASK_ZOMBIE:
                 case TASK_FINISHED:
                     zombie_tasks++;

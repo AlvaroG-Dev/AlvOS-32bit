@@ -147,10 +147,12 @@ void task_init(void) {
 
   terminal_printf(&main_terminal, "Task system initialized\r\n");
 
-  // Crear tarea idle
+  // Crear tarea idle con la prioridad MÍNIMA
   scheduler.idle_task =
-      task_create("idle", idle_task_func, NULL, TASK_PRIORITY_HIGH);
+      task_create("idle", idle_task_func, NULL, TASK_PRIORITY_LOW);
+
   if (!scheduler.idle_task) {
+
     terminal_puts(&main_terminal, "FATAL: Failed to create idle task\r\n");
     return;
   }
@@ -335,7 +337,16 @@ void task_destroy(task_t *task) {
     task->address_space = NULL;
   }
 
+  // Liberar recursos de IPC
+  extern message_queue_t *message_queue_get(uint32_t task_id);
+  extern void message_queue_destroy(message_queue_t * queue);
+  message_queue_t *mq = message_queue_get(task->task_id);
+  if (mq) {
+    message_queue_destroy(mq);
+  }
+
   // Liberar descriptores de archivo abiertos
+
   for (int i = 0; i < VFS_MAX_FDS; i++) {
     if (task->fd_table[i] != NULL) {
       // vfs_close se encarga de liberar la estructura socket o file
@@ -994,9 +1005,10 @@ void task_setup_stack(task_t *task, void (*entry_point)(void *), void *arg) {
   task->context.gs = 0x10;
   task->context.ss = 0x10;
 
-  // ✅ FIX: EFLAGS con IF=0 (se habilitará con IRET)
+  // ✅ FIX: EFLAGS con IF=0 (se habilitará con IRET o STI en el wrapper)
   // Esto evita race conditions durante la inicialización
-  task->context.eflags = 0x200;
+  task->context.eflags = 0x002;
+
 
   if (!(task->flags & TASK_FLAG_QUIET)) {
     serial_printf(
