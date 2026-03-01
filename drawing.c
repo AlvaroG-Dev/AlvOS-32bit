@@ -79,53 +79,67 @@ void set_colors(uint32_t fg, uint32_t bg) {
 }
 
 // Dibuja un píxel en la posición (x,y)
-void put_pixel(uint32_t x, uint32_t y, uint32_t color) {
-  if (x >= g_fb.width || y >= g_fb.height)
+void put_pixel(int32_t x, int32_t y, uint32_t color) {
+  if (x < 0 || y < 0 || x >= (int32_t)g_fb.width || y >= (int32_t)g_fb.height)
     return;
 
   if (g_fb.bpp == 32) {
-    uint32_t pixel_offset = y * (g_fb.pitch / 4) + x;
+    uint32_t pixel_offset = (uint32_t)y * (g_fb.pitch / 4) + (uint32_t)x;
     g_fb.buffer32[pixel_offset] = color;
   } else if (g_fb.bpp == 24) {
-    Pixel24 *pixel = &g_fb.buffer24[y * (g_fb.pitch / 3) + x];
+    Pixel24 *pixel =
+        &g_fb.buffer24[(uint32_t)y * (g_fb.pitch / 3) + (uint32_t)x];
     pixel->red = (color >> 16) & 0xFF;
     pixel->green = (color >> 8) & 0xFF;
     pixel->blue = color & 0xFF;
   }
 }
 
-// Rellena un rectángulo
-void fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color) {
-  // Asegurarse de que el rectángulo esté dentro de los límites
-  if (x >= g_fb.width || y >= g_fb.height)
+// Rellena un rectángulo con clipping
+void fill_rect(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t color) {
+  if (w <= 0 || h <= 0)
     return;
-  if (x + w > g_fb.width)
-    w = g_fb.width - x;
-  if (y + h > g_fb.height)
-    h = g_fb.height - y;
+
+  // Clipping robusto
+  if (x < 0) {
+    w += x;
+    x = 0;
+  }
+  if (y < 0) {
+    h += y;
+    y = 0;
+  }
+  if (x >= (int32_t)g_fb.width || y >= (int32_t)g_fb.height)
+    return;
+  if (x + w > (int32_t)g_fb.width)
+    w = (int32_t)g_fb.width - x;
+  if (y + h > (int32_t)g_fb.height)
+    h = (int32_t)g_fb.height - y;
+
+  if (w <= 0 || h <= 0)
+    return;
 
   if (g_fb.bpp == 32) {
-    for (uint32_t dy = 0; dy < h; dy++) {
-      uint32_t *row = g_fb.buffer32 + (y + dy) * (g_fb.pitch / 4) + x;
-      for (uint32_t dx = 0; dx < w; dx++) {
-        row[dx] = color;
-      }
+    for (int32_t dy = 0; dy < h; dy++) {
+      uint32_t *row =
+          g_fb.buffer32 + (uint32_t)(y + dy) * (g_fb.pitch / 4) + (uint32_t)x;
+      memset32(row, color, (uint32_t)w);
     }
   } else if (g_fb.bpp == 24) {
-    Pixel24 pixel = {.red = (color >> 16) & 0xFF,
-                     .green = (color >> 8) & 0xFF,
-                     .blue = color & 0xFF};
-    for (uint32_t dy = 0; dy < h; dy++) {
-      Pixel24 *row = g_fb.buffer24 + (y + dy) * (g_fb.pitch / 3) + x;
-      for (uint32_t dx = 0; dx < w; dx++) {
-        row[dx] = pixel;
-      }
+    Pixel24 p24 = {.red = (color >> 16) & 0xFF,
+                   .green = (color >> 8) & 0xFF,
+                   .blue = color & 0xFF};
+    for (int32_t dy = 0; dy < h; dy++) {
+      Pixel24 *row =
+          g_fb.buffer24 + (uint32_t)(y + dy) * (g_fb.pitch / 3) + (uint32_t)x;
+      for (int32_t dx = 0; dx < w; dx++)
+        row[dx] = p24;
     }
   }
 }
 
 // Dibuja el contorno de un rectángulo
-void draw_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color) {
+void draw_rect(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t color) {
   // Líneas horizontales
   draw_line(x, y, x + w - 1, y, color);
   draw_line(x, y + h - 1, x + w - 1, y + h - 1, color);
@@ -136,7 +150,7 @@ void draw_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color) {
 }
 
 // Dibuja un rectángulo con bordes redondeados
-void draw_rounded_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+void draw_rounded_rect(int32_t x, int32_t y, int32_t w, int32_t h,
                        uint32_t radius, uint32_t color) {
   if (radius == 0) {
     draw_rect(x, y, w, h, color);
@@ -169,7 +183,7 @@ void draw_rounded_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
 }
 
 // Rellena un rectángulo con bordes redondeados
-void fill_rounded_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+void fill_rounded_rect(int32_t x, int32_t y, int32_t w, int32_t h,
                        uint32_t radius, uint32_t color) {
   if (radius == 0) {
     fill_rect(x, y, w, h, color);
@@ -433,7 +447,74 @@ void fill_triangle(uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1,
   }
 }
 
+// Función interna de dibujo de glifo (sin redirección ni lógica de scroll)
+static void draw_glyph_internal(uint32_t x, uint32_t y, char c, uint32_t fg,
+                                uint32_t bg) {
+  const uint8_t *glyph = NULL;
+  if (g_current_font.bytes_per_glyph == 8) {
+    glyph = ((const uint8_t (*)[8])g_current_font.glyphs)[(uint8_t)c];
+  } else if (g_current_font.bytes_per_glyph == 16) {
+    glyph = ((const uint8_t (*)[16])g_current_font.glyphs)[(uint8_t)c];
+  } else if (g_current_font.bytes_per_glyph == 6) {
+    glyph = ((const uint8_t (*)[6])g_current_font.glyphs)[(uint8_t)c];
+  }
+
+  if (!glyph)
+    return;
+
+  if (g_fb.bpp == 32) {
+    for (uint32_t dy = 0; dy < g_current_font.height; dy++) {
+      if (y + dy >= g_fb.height)
+        break;
+      uint8_t row = glyph[dy];
+      uint32_t *fb_row = g_fb.buffer32 + (y + dy) * (g_fb.pitch / 4);
+      for (uint32_t dx = 0; dx < g_current_font.width; dx++) {
+        if (x + dx >= g_fb.width)
+          break;
+        uint32_t bit_mask = (g_current_font.glyphs == font8x16_vga)
+                                ? (1 << (g_current_font.width - 1 - dx))
+                                : (1 << dx);
+        if (row & bit_mask) {
+          fb_row[x + dx] = fg;
+        } else if (bg != COLOR_TRANSPARENT) {
+          fb_row[x + dx] = bg;
+        }
+      }
+    }
+  } else {
+    for (uint32_t dy = 0; dy < g_current_font.height; dy++) {
+      if (y + dy >= g_fb.height)
+        break;
+      uint8_t row = glyph[dy];
+      for (uint32_t dx = 0; dx < g_current_font.width; dx++) {
+        if (x + dx >= g_fb.width)
+          break;
+        uint32_t bit_mask = (g_current_font.glyphs == font8x16_vga)
+                                ? (1 << (g_current_font.width - 1 - dx))
+                                : (1 << dx);
+        if (row & bit_mask) {
+          put_pixel(x + dx, y + dy, fg);
+        } else if (bg != COLOR_TRANSPARENT) {
+          put_pixel(x + dx, y + dy, bg);
+        }
+      }
+    }
+  }
+}
+
+void draw_char_at(uint32_t x, uint32_t y, char c, uint32_t fg, uint32_t bg) {
+  draw_glyph_internal(x, y, c, fg, bg);
+}
+
+extern Terminal main_terminal;
+
 void put_char(char c) {
+  extern volatile int g_in_panic;
+  if (main_terminal.windowed && !g_in_panic) {
+    terminal_putchar(&main_terminal, c);
+    return;
+  }
+
   if (c == '\n') {
     g_cursor_x = 0;
     g_cursor_y += g_current_font.height;
@@ -476,28 +557,7 @@ void put_char(char c) {
   if (!glyph)
     return; // Carácter no soportado
 
-  // Dibujar el glifo
-  for (uint32_t dy = 0; dy < g_current_font.height; dy++) {
-    uint8_t row = glyph[dy];
-    for (uint32_t dx = 0; dx < g_current_font.width; dx++) {
-      // Comprobar si el bit está activo para este píxel
-      // Modificado para manejar diferentes órdenes de bits según la fuente
-      uint32_t bit_mask;
-      if (g_current_font.glyphs == font8x16_vga) {
-        // Para VGA, el bit más significativo está a la izquierda
-        bit_mask = 1 << (g_current_font.width - 1 - dx);
-      } else {
-        // Para otras fuentes, el bit más significativo está a la derecha
-        bit_mask = 1 << dx;
-      }
-
-      if (row & bit_mask) {
-        put_pixel(g_cursor_x + dx, g_cursor_y + dy, g_fg_color);
-      } else if (g_bg_color != COLOR_TRANSPARENT) {
-        put_pixel(g_cursor_x + dx, g_cursor_y + dy, g_bg_color);
-      }
-    }
-  }
+  draw_glyph_internal(g_cursor_x, g_cursor_y, c, g_fg_color, g_bg_color);
 
   // Mover el cursor
   g_cursor_x += g_current_font.width + g_current_font.spacing;
@@ -518,27 +578,54 @@ void put_string(const char *str) {
   }
 }
 
+void draw_glyph_internal_clipped(uint32_t x, uint32_t y, char c, uint32_t fg,
+                                 uint32_t bg, int cx, int cy, int cw, int ch) {
+  const uint8_t *glyph = (const uint8_t *)g_current_font.glyphs +
+                         (uint8_t)c * g_current_font.bytes_per_glyph;
+
+  for (uint32_t dy = 0; dy < g_current_font.height; dy++) {
+    int py = y + dy;
+    if (py < cy || py >= cy + ch)
+      continue;
+
+    uint8_t row = glyph[dy];
+    for (uint32_t dx = 0; dx < g_current_font.width; dx++) {
+      int px = x + dx;
+      if (px < cx || px >= cx + cw)
+        continue;
+
+      uint32_t bit_mask = (g_current_font.glyphs == font8x16_vga)
+                              ? (1 << (g_current_font.width - 1 - dx))
+                              : (1 << dx);
+      if (row & bit_mask) {
+        put_pixel(px, py, fg);
+      } else if (bg != COLOR_TRANSPARENT) {
+        put_pixel(px, py, bg);
+      }
+    }
+  }
+}
+
+// Dibuja una cadena de texto en una posición específica con recorte
+void draw_string_clipped(uint32_t x, uint32_t y, const char *str,
+                         uint32_t fg_color, uint32_t bg_color, int cx, int cy,
+                         int cw, int ch) {
+  uint32_t current_x = x;
+  while (*str) {
+    draw_glyph_internal_clipped(current_x, y, *str++, fg_color, bg_color, cx,
+                                cy, cw, ch);
+    current_x += g_current_font.width + g_current_font.spacing;
+  }
+}
+
 // Dibuja una cadena de texto en una posición específica
 void draw_string(uint32_t x, uint32_t y, const char *str, uint32_t fg_color,
                  uint32_t bg_color) {
-  uint32_t old_fg = g_fg_color;
-  uint32_t old_bg = g_bg_color;
-  uint32_t old_x = g_cursor_x;
-  uint32_t old_y = g_cursor_y;
-
-  g_fg_color = fg_color;
-  g_bg_color = bg_color;
-  g_cursor_x = x;
-  g_cursor_y = y;
-
+  uint32_t current_x = x;
   while (*str) {
-    put_char(*str++);
+    draw_glyph_internal(current_x, y, *str++, fg_color, bg_color);
+    current_x += g_current_font.width + g_current_font.spacing;
   }
-
-  g_fg_color = old_fg;
-  g_bg_color = old_bg;
-  g_cursor_x = old_x;
-  g_cursor_y = old_y;
 }
 
 // Establece la posición del cursor
@@ -680,7 +767,7 @@ void draw_big_string(uint32_t x, uint32_t y, const char *str, uint32_t scale,
 
 void draw_char(uint32_t x, uint32_t y, char c, uint32_t fg_color,
                uint32_t bg_color) {
-  draw_char_with_shadow(x, y, c, fg_color, bg_color, bg_color, 0);
+  draw_glyph_internal(x, y, c, fg_color, bg_color);
 }
 
 // Dibuja un carácter con sombra
@@ -689,43 +776,12 @@ void draw_char_with_shadow(uint32_t x, uint32_t y, char c, uint32_t fg_color,
                            uint8_t shadow_offset) {
   // Dibujar sombra primero
   if (shadow_offset > 0) {
-    uint32_t old_fg = g_fg_color;
-    uint32_t old_bg = g_bg_color;
-
-    g_fg_color = shadow_color;
-    g_bg_color = COLOR_TRANSPARENT;
-
-    uint32_t old_x = g_cursor_x;
-    uint32_t old_y = g_cursor_y;
-
-    g_cursor_x = x + shadow_offset;
-    g_cursor_y = y + shadow_offset;
-    put_char(c);
-
-    g_cursor_x = old_x;
-    g_cursor_y = old_y;
-    g_fg_color = old_fg;
-    g_bg_color = old_bg;
+    draw_glyph_internal(x + shadow_offset, y + shadow_offset, c, shadow_color,
+                        COLOR_TRANSPARENT);
   }
 
   // Dibujar carácter principal
-  uint32_t old_fg = g_fg_color;
-  uint32_t old_bg = g_bg_color;
-
-  g_fg_color = fg_color;
-  g_bg_color = bg_color;
-
-  uint32_t old_x = g_cursor_x;
-  uint32_t old_y = g_cursor_y;
-
-  g_cursor_x = x;
-  g_cursor_y = y;
-  put_char(c);
-
-  g_cursor_x = old_x;
-  g_cursor_y = old_y;
-  g_fg_color = old_fg;
-  g_bg_color = old_bg;
+  draw_glyph_internal(x, y, c, fg_color, bg_color);
 }
 
 // Dibuja una cadena con sombra

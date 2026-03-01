@@ -1,9 +1,9 @@
-// mouse.c - Versión standalone sin Window Manager
 #include "mouse.h"
 #include "drawing.h"
 #include "io.h"
-#include "irq.h"
 #include "kernel.h"
+#include "log.h"
+#include "ps2.h"
 #include "string.h"
 
 static mouse_state_t mouse_state = {0};
@@ -14,37 +14,11 @@ static const uint8_t terminal_cursor[16] = {0x80, 0xC0, 0xE0, 0xF0, 0xF8, 0xFC,
                                             0xFE, 0xFF, 0xF8, 0xD8, 0x8C, 0x0C,
                                             0x06, 0x06, 0x03, 0x00};
 
-// Esperar al estado del puerto PS/2
-static void mouse_wait(bool is_input) {
-  uint32_t timeout = 100000;
-  if (is_input) {
-    while (timeout--) {
-      if ((inb(PS2_STATUS_PORT) & PS2_STATUS_OUTPUT_FULL) != 0) {
-        return;
-      }
-    }
-  } else {
-    while (timeout--) {
-      if ((inb(PS2_STATUS_PORT) & PS2_STATUS_INPUT_FULL) == 0) {
-        return;
-      }
-    }
-  }
-}
+// Escribir al mouse usando el gestor PS/2
+static void mouse_write(uint8_t value) { ps2_write_aux(value); }
 
-// Escribir al mouse
-static void mouse_write(uint8_t value) {
-  mouse_wait(false);
-  outb(PS2_COMMAND_PORT, 0xD4);
-  mouse_wait(false);
-  outb(PS2_DATA_PORT, value);
-}
-
-// Leer del mouse
-static uint8_t mouse_read(void) {
-  mouse_wait(true);
-  return inb(PS2_DATA_PORT);
-}
+// Leer del mouse usando el gestor PS/2
+static uint8_t mouse_read(void) { return ps2_read_data(); }
 
 // Configurar tasa de muestreo
 static void mouse_set_sample_rate(uint8_t rate) {
@@ -65,53 +39,98 @@ static void mouse_set_resolution(uint8_t resolution) {
 static bool mouse_install(void) {
   uint8_t status;
 
-  // Habilitar el aux device (mouse)
-  mouse_wait(false);
-  outb(PS2_COMMAND_PORT, 0xA8);
+  // Deshabilitar interrupciones durante inicialización crítica
+  __asm__ volatile("cli");
 
-  // Leer configuration byte
-  mouse_wait(false);
-  outb(PS2_COMMAND_PORT, 0x20);
-  mouse_wait(true);
-  status = inb(PS2_DATA_PORT);
+  // Limpiar buffer de entrada por si acaso hay basura del teclado
+  while (inb(PS2_STATUS_PORT) & PS2_STATUS_OUTPUT_FULL) {
+    inb(PS2_DATA_PORT);
+  }
 
-  // Habilitar IRQ12 (mouse) y mantener IRQ1 (teclado) habilitado
-  status |= 0x02; // IRQ12
-  status |= 0x01; // IRQ1 (teclado)
+  // Habilitar dispositivo mouse a través del comando PS/2 A8
+  ps2_write_command(PS2_CMD_ENABLE_SCAN2);
+  ps2_wait_write();
 
-  // Escribir configuration byte de vuelta
-  mouse_wait(false);
-  outb(PS2_COMMAND_PORT, 0x60);
-  mouse_wait(false);
-  outb(PS2_DATA_PORT, status);
+  // Leer configuración actual para no romper el teclado
+  ps2_write_command(PS2_CMD_READ_CONFIG);
+  status = ps2_read_data();
+
+  // Habilitar IRQ12 y preservar IRQ1
+  status |= 0x02;  // Habilitar mouse IRQ
+  status |= 0x01;  // Asegurar teclado habilitado
+  status &= ~0x20; // Habilitar clock del mouse (bit 5 es DISABLE_MOUSE_CLOCK)
+
+  ps2_write_command(PS2_CMD_WRITE_CONFIG);
+  ps2_write_data(status);
+  ps2_wait_write();
 
   // Resetear el mouse
   mouse_write(MOUSE_CMD_RESET);
   uint8_t ack = mouse_read();
   if (ack != 0xFA) {
+    __asm__ volatile("sti");
+    log_message(LOG_WARN, "Mouse: No se pudo resetear (ACK: 0x%02X)", ack);
     return false;
   }
 
-  // Leer BAT result
+  // Leer resultado del test (BAT)
   uint8_t bat_result = mouse_read();
   if (bat_result != 0xAA) {
+    __asm__ volatile("sti");
+    log_message(LOG_WARN, "Mouse: Test BAT falló (0x%02X)", bat_result);
     return false;
   }
 
-  // Leer device ID
-  mouse_read(); // device_id no usado en modo standalone
+  // IMPORTANTE: Después del BAT el mouse envía su ID (0x00)
+  // Si no se lee aquí, quedará en el buffer y romperá la secuencia de la rueda
+  mouse_read();
 
-  // Configurar defaults
+  // CONFIGURACIÓN INICIAL: Set defaults antes de la secuencia de la rueda
   mouse_write(MOUSE_CMD_SET_DEFAULTS);
-  mouse_read();
+  mouse_read(); // ACK
 
-  // Habilitar data reporting
-  mouse_write(MOUSE_CMD_ENABLE_DATA_REP);
+  // Intentar habilitar rueda (IntelliMouse sequence)
+  // Secuencia: Rate 200 -> Rate 100 -> Rate 80
+  mouse_write(MOUSE_CMD_SET_SAMPLE_RATE);
   mouse_read();
+  mouse_write(200);
+  mouse_read();
+  for (volatile int i = 0; i < 20000; i++)
+    ;
 
-  // Configurar sample rate y resolución
+  mouse_write(MOUSE_CMD_SET_SAMPLE_RATE);
+  mouse_read();
+  mouse_write(100);
+  mouse_read();
+  for (volatile int i = 0; i < 20000; i++)
+    ;
+
+  mouse_write(MOUSE_CMD_SET_SAMPLE_RATE);
+  mouse_read();
+  mouse_write(80);
+  mouse_read();
+  for (volatile int i = 0; i < 20000; i++)
+    ;
+
+  // Si devuelve ID 3 o 4, tiene rueda (4 es explorer mouse)
+  mouse_write(MOUSE_CMD_GET_DEVICE_ID);
+  mouse_read(); // ACK
+  uint8_t mouse_id = mouse_read();
+  mouse_state.has_wheel = (mouse_id == 3 || mouse_id == 4);
+
+  // Configurar parámetros finales
   mouse_set_sample_rate(MOUSE_SAMPLE_RATE);
   mouse_set_resolution(MOUSE_RESOLUTION);
+
+  // CONFIGURACIÓN FINAL: Habilitar reporting
+  mouse_write(MOUSE_CMD_ENABLE_DATA_REP);
+  mouse_read(); // ACK
+
+  // Re-enable interrupts AFTER final config calls
+  __asm__ volatile("sti");
+
+  log_message(LOG_INFO, "Mouse: ID detected: %d (has_wheel: %d)", mouse_id,
+              mouse_state.has_wheel);
 
   return true;
 }
@@ -148,31 +167,42 @@ void mouse_init(uint32_t screen_width, uint32_t screen_height) {
   mouse_initialized = true;
 }
 
-// Manejador de IRQ del mouse
 void mouse_handle_irq(void) {
-  if (!mouse_state.enabled)
-    return;
+  uint8_t status = ps2_read_status();
 
-  uint8_t status = inb(PS2_STATUS_PORT);
-  if (!(status & PS2_STATUS_OUTPUT_FULL))
-    return;
+  // CRÍTICO: Solo leer el puerto de datos si el bit 5 (AUX_OUTPUT) está activo.
+  // Si no está activo, el dato es del teclado y debemos dejar que su IRQ lo
+  // maneje.
+  if ((status & PS2_STATUS_OUTPUT_FULL) && (status & PS2_STATUS_AUX_OUTPUT)) {
+    uint8_t data = inb(PS2_DATA_PORT);
 
-  uint8_t data = inb(PS2_DATA_PORT);
+    if (!mouse_state.enabled)
+      return;
 
-  // Manejar paquetes de 3 bytes (mouse estándar)
-  if (mouse_state.packet_index == 0 && (data & 0x08)) {
-    mouse_state.packet[0] = data;
-    mouse_state.packet_index = 1;
-  } else if (mouse_state.packet_index == 1) {
-    mouse_state.packet[1] = data;
-    mouse_state.packet_index = 2;
-  } else if (mouse_state.packet_index == 2) {
-    mouse_state.packet[2] = data;
-    mouse_state.packet_index = 0;
-    mouse_state.packet_ready = true;
-    mouse_process_packet();
-  } else {
-    mouse_state.packet_index = 0;
+    // Manejar paquetes. Bit 3 del primer byte debe ser 1 (sync)
+    if (mouse_state.packet_index == 0 && (data & 0x08)) {
+      mouse_state.packet[0] = data;
+      mouse_state.packet_index = 1;
+    } else if (mouse_state.packet_index == 1) {
+      mouse_state.packet[1] = data;
+      mouse_state.packet_index = 2;
+    } else if (mouse_state.packet_index == 2) {
+      mouse_state.packet[2] = data;
+      if (mouse_state.has_wheel) {
+        mouse_state.packet_index = 3;
+      } else {
+        mouse_state.packet_index = 0;
+        mouse_state.packet_ready = true;
+        mouse_process_packet();
+      }
+    } else if (mouse_state.packet_index == 3) {
+      mouse_state.packet[3] = data;
+      mouse_state.packet_index = 0;
+      mouse_state.packet_ready = true;
+      mouse_process_packet();
+    } else {
+      mouse_state.packet_index = 0;
+    }
   }
 }
 
@@ -209,6 +239,21 @@ void mouse_process_packet(void) {
   }
   if (flags & MOUSE_Y_SIGN) {
     delta_y |= 0xFFFFFF00;
+  }
+
+  // Scroll wheel (4to byte) si está habilitada
+  if (mouse_state.has_wheel) {
+    // El scroll está en los 4 bits bajos del 4to byte (complemento a 2)
+    int8_t scroll_z = packet[3] & 0x0F;
+    if (scroll_z & 0x08) {
+      scroll_z |= 0xF0; // Extender signo de 4 bits a 8 bits
+    }
+
+    if (scroll_z != 0) {
+      // Acumular el delta en lugar de sobrescribir para no perder eventos
+      // entre frames de la GUI si el mouse se mueve simultáneamente.
+      mouse_state.scroll_delta += scroll_z;
+    }
   }
 
   // Limitar delta máximo
@@ -249,6 +294,12 @@ void mouse_process_packet(void) {
   }
 
   mouse_state.packet_ready = false;
+}
+
+int8_t mouse_get_scroll(void) {
+  int8_t delta = mouse_state.scroll_delta;
+  mouse_state.scroll_delta = 0; // Consumir delta
+  return delta;
 }
 
 void mouse_inject_event(int dx, int dy, uint8_t buttons) {

@@ -13,6 +13,7 @@
 #include "e1000.h"
 #include "fat32.h"
 #include "gdt.h"
+#include "gui.h"
 #include "ide.h"
 #include "idt.h"
 #include "io.h"
@@ -28,8 +29,10 @@
 #include "partition_manager.h"
 #include "pci.h"
 #include "pmm.h"
+#include "ps2.h"
 #include "sata_disk.h"
 #include "serial.h"
+#include "sse.h"
 #include "syscalls.h"
 #include "task.h"
 #include "task_utils.h"
@@ -40,6 +43,7 @@
 
 // Global definition of BootInfo.
 BootInfo boot_info;
+volatile int g_in_panic = 0;
 
 // Definición global del heap del kernel (16MB)
 uint8_t kernel_heap[STATIC_HEAP_SIZE] __attribute__((aligned(PAGE_SIZE)));
@@ -123,54 +127,49 @@ static void mount_bin_directory(void) {
 
 // Función de apagado del sistema operativo
 void shutdown(void) {
-  terminal_printf(&main_terminal, "\n\nSystem shutdown initiated\r\n");
-  serial_write_string(COM1_BASE, "System shutdown initiated\r\n");
   // 1. Deshabilitar interrupciones
   __asm__ volatile("cli");
 
-  // 4. Desmontar sistemas de archivos (DEBE ser antes de limpiar drivers para
-  // poder flashear caches)
+  // 1b. Preparar terminal para logs de cierre (Pantalla completa)
+  main_terminal.windowed = false;
+  graphical_mode = false;
+
+  // Detener bucle render gui si existe
+  extern gui_context_t gui;
+  gui.running = false;
+
+  terminal_recalculate_dimensions(&main_terminal);
+  terminal_clear(&main_terminal);
+  terminal_puts(&main_terminal, "System shutdown initiated\n");
+
+  // 4. Desmontar sistemas de archivos
   vfs_list_mounts(unmount_callback, &unmount_data);
 
   // 5. Limpiar sistema de drivers
   driver_system_cleanup();
 
   // 6. Limpiar módulos
+  terminal_puts(&main_terminal, "Cleaning up modules...\n");
   module_loader_cleanup();
-  
-  // 2. Detener el scheduler
-  if (scheduler.scheduler_enabled) {
-    scheduler_stop();
-  }
-  // 3. Terminar todas las tareas (excepto idle)
-  task_t *current = scheduler.task_list;
-  if (current) {
-    do {
-      task_t *next = current->next;
-      if (current != scheduler.idle_task) {
-        task_destroy(current);
-      }
-      current = next;
-    } while (current != scheduler.task_list);
-  }
-
-  task_cleanup_zombies();
-
 
   // 7. Deshabilitar PICs
+  terminal_puts(&main_terminal, "Disabling PICs...\n");
   outb(PIC1_DATA, 0xFF);
   outb(PIC2_DATA, 0xFF);
 
   // 8. Reportar estadísticas finales del heap
+  terminal_puts(&main_terminal, "DMA cleanup and heap stats...\n");
   dma_cleanup();
 
   heap_info_t heap_info = heap_stats();
   // 9. Intentar apagado ACPI
+  terminal_puts(&main_terminal, "Final ACPI shutdown attempt...\n");
   if (acpi_is_supported()) {
     terminal_destroy(&main_terminal);
     acpi_power_off();
   }
-  terminal_printf(&main_terminal, "\n\nSystem doesn't support ACPI, halting\r\n");
+  terminal_printf(&main_terminal,
+                  "\n\nSystem doesn't support ACPI, halting\r\n");
   terminal_destroy(&main_terminal);
   // Halt final
   while (1) {
@@ -264,13 +263,13 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
         (struct multiboot_tag *)((uint8_t *)mb_info + 8);
     while (module_tag->type != MULTIBOOT_TAG_TYPE_END) {
       if (module_tag->type == MULTIBOOT_TAG_TYPE_MODULE) {
-        struct multiboot_tag_module *m = (struct multiboot_tag_module *)module_tag;
+        struct multiboot_tag_module *m =
+            (struct multiboot_tag_module *)module_tag;
         uint32_t m_size = m->mod_end - m->mod_start;
         pmm_mark_used(m->mod_start, m_size);
       }
-      module_tag =
-          (struct multiboot_tag *)((uint8_t *)module_tag +
-                                   ((module_tag->size + 7) & ~7));
+      module_tag = (struct multiboot_tag *)((uint8_t *)module_tag +
+                                            ((module_tag->size + 7) & ~7));
     }
   } else {
     while (1) {
@@ -295,6 +294,7 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
   idt_init();
 
   cpuid_init();
+  sse_init();
 
   // Inicializar PIT a 100Hz temporalmente
   uint32_t divisor = 1193180 / 100;
@@ -325,8 +325,10 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
   // 7. Inicializar ACPI/PCI/APIC (MODIFICADO)
   irq_setup_apic();
 
-  // 3. Inicializar teclado
+  // 3. Inicializar controlador PS/2 y teclado
+  ps2_init();
   keyboard_init();
+  mouse_init(g_screen_width, g_screen_height);
 
   chardev_init();
 
@@ -451,9 +453,6 @@ void cmain(uint32_t magic, struct multiboot_tag *mb_info) {
   mount_bin_directory();
 
   syscall_init();
-
-  // 15. Inicializar mouse
-  mouse_init(g_screen_width, g_screen_height);
 
   // 12. Inicializar multitarea
   serial_write_string(COM1_BASE, "MicroKernel OS\r\n");
@@ -626,36 +625,18 @@ static void main_loop_task(void *arg) {
   terminal_load_symlinks(&main_terminal);
   log_init();
   log_message(LOG_INFO, "[MAIN_LOOP] Task started\r\n");
-  keyboard_set_handler(keyboard_terminal_handler);
+
+  // INICIAR LA TAREA DEL TERMINAL (Tareizar)
+  task_create("terminal_worker", terminal_main_task, &main_terminal,
+              TASK_PRIORITY_NORMAL);
 
   while (1) {
-    uint32_t current_time = ticks_since_boot * 10; // 10ms per tick a 100Hz
-    // Actualizar cada 50ms (5 ticks)
-    if (current_time - last_update >= 50) {
-      // Actualizar cursor de terminal
-      terminal_update_cursor_blink(&main_terminal, current_time);
-      static uint8_t last_cursor_visible = 1;
-      static uint32_t last_cursor_x = 0, last_cursor_y = 0;
-      if (main_terminal.cursor_state_changed ||
-          main_terminal.cursor_visible != last_cursor_visible ||
-          main_terminal.cursor_x != last_cursor_x ||
-          main_terminal.cursor_y != last_cursor_y) {
-        terminal_draw(&main_terminal);
-        last_cursor_visible = main_terminal.cursor_visible;
-        last_cursor_x = main_terminal.cursor_x;
-        last_cursor_y = main_terminal.cursor_y;
-      }
-      last_update = current_time;
-    }
-    // CRÍTICO: Procesar pila de red
-    // network_stack_tick();
+    // El terminal worker ahora se encarga de la entrada y el dibujo
 
-    // Poll USB HID (since we don't have proper USB interrupts yet)
+    // Poll USB HID
     usb_hid_poll();
 
-    // CRÍTICO: Dormir en lugar de yield inmediato
-    // Esto permite que otras tareas se ejecuten
-    task_sleep(1); // Dormir 10ms, luego el scheduler lo despertará
+    task_sleep(5);
   }
 }
 

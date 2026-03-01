@@ -76,6 +76,7 @@
 #define SYSCALL_RECV 0x44          // Recibir de socket
 #define SYSCALL_DNS_RESOLVE 0x45   // Resolver host DNS
 #define SYSCALL_RTC_GET_DATETIME 0x46 // Obtener fecha y hora real
+#define SYSCALL_GUI_ACTIVE 0x47       // Detectar si la GUI está activa
 
 // ✅ Definir códigos de error (versión simplificada)
 #define EPERM 1

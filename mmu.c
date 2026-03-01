@@ -1,4 +1,5 @@
 #include "mmu.h"
+#include "cpuid.h"
 #include "drawing.h"
 #include "kernel.h"
 #include "log.h"
@@ -45,20 +46,20 @@ uint32_t *mmu_get_current_pd_virt(void) {
 }
 
 void mmu_enable_paging(void) {
+  // Asegurar que el caché está habilitado (CR0.CD = 0, CR0.NW = 0)
+  uint32_t cr0;
+  __asm__ __volatile__("mov %%cr0, %0" : "=r"(cr0));
+  cr0 &= ~(1 << 30); // Clear CD (Cache Disable)
+  cr0 &= ~(1 << 29); // Clear NW (Not Write-through)
+  cr0 |= 0x80000001; // PG=1, PE=1
+  __asm__ __volatile__("mov %0, %%cr0" : : "r"(cr0) : "memory");
+
   uint32_t cr4;
   __asm__ __volatile__("mov %%cr4, %0" : "=r"(cr4));
   cr4 |= 0x10; // Bit 4: PSE (Page Size Extensions)
+  if (cpu_info.caps.has_pge)
+    cr4 |= 0x80; // Bit 7: PGE (Global Pages)
   __asm__ __volatile__("mov %0, %%cr4" : : "r"(cr4));
-
-  uint32_t cr0;
-  __asm__ __volatile__("mov %%cr0, %0\n"
-                       "or $0x80000001, %0\n" // PG=1, PE=1
-                       "mov %0, %%cr0\n"
-                       "jmp 1f\n"
-                       "1:\n"
-                       : "=r"(cr0)
-                       :
-                       : "memory");
 }
 
 // ==================== FUNCIONES DE MAPEO ====================
@@ -141,14 +142,16 @@ bool mmu_map_page(uint32_t virtual_addr, uint32_t physical_addr,
     if (!(pd_ptr[pd_index] & PAGE_4MB)) {
       uint32_t current_pd_flags = pd_ptr[pd_index] & 0xFFF;
       uint32_t new_pd_flags = current_pd_flags;
-      
-      if (flags & PAGE_USER) new_pd_flags |= PAGE_USER;
-      if (flags & PAGE_RW) new_pd_flags |= PAGE_RW;
-      
+
+      if (flags & PAGE_USER)
+        new_pd_flags |= PAGE_USER;
+      if (flags & PAGE_RW)
+        new_pd_flags |= PAGE_RW;
+
       if (new_pd_flags != current_pd_flags) {
         pd_ptr[pd_index] = (pd_ptr[pd_index] & ~0xFFF) | new_pd_flags;
-        // No es estrictamente necesario invalidar para el PD si usamos invlpg después,
-        // pero por seguridad invalidamos la región.
+        // No es estrictamente necesario invalidar para el PD si usamos invlpg
+        // después, pero por seguridad invalidamos la región.
         asm volatile("invlpg (%0)" : : "r"(virtual_addr));
       }
     } else {
@@ -375,9 +378,31 @@ void mmu_map_bios_regions(void) {
                 "BIOS memory regions mapped for ACPI compatibility\r\n");
 }
 
+void mmu_init_pat(void) {
+  if (!cpu_info.caps.has_pat) {
+    terminal_puts(&main_terminal, "MMU: PAT no soportado, usando UC para FB\n");
+    return;
+  }
+
+  // Configurar IA32_PAT MSR (0x277)
+  // Queremos que el índice 5 (PAT=1, PCD=0, PWT=1) sea Write-Combining (01h)
+  // El MSR tiene 8 entradas de 8 bits cada una.
+  uint32_t low, high;
+  __asm__ __volatile__("rdmsr" : "=a"(low), "=d"(high) : "c"(0x277));
+
+  // Índice 5 está en bits 8-15 de 'high' (porque 5*8 = 40, 40-32 = 8)
+  high &= ~(0xFF << 8);
+  high |= (0x01 << 8); // 01h = Write-Combining
+
+  __asm__ __volatile__("wrmsr" : : "a"(low), "d"(high), "c"(0x277));
+  terminal_puts(&main_terminal,
+                "MMU: PAT configurado (Index 5 = Write-Combining)\n");
+}
+
 // ==================== FUNCIONES DE INICIALIZACIÓN ====================
 
 void mmu_init(void) {
+  mmu_init_pat();
   memset(page_directory, 0, sizeof(page_directory));
   memset(page_tables, 0, sizeof(page_tables));
   memset(used_page_tables, 0, sizeof(used_page_tables));
@@ -393,19 +418,22 @@ void mmu_init(void) {
   // **KERNEL: SIN PAGE_USER!**
   // 1. Identity mapping del kernel (SOLO KERNEL)
   // Mapeamos desde el primer MB y el kernel. NO mapeamos la pÃ¡gina 0 (NULL).
-  mmu_map_region(PAGE_SIZE, PAGE_SIZE, 0x100000 - PAGE_SIZE, PAGE_PRESENT | PAGE_RW);
+  mmu_map_region(PAGE_SIZE, PAGE_SIZE, 0x100000 - PAGE_SIZE,
+                 PAGE_PRESENT | PAGE_RW);
 
   uint32_t kernel_phys_start = 0x100000;
   uint32_t kernel_size = (uint32_t)&_end - kernel_phys_start;
   mmu_map_region(kernel_phys_start, kernel_phys_start, kernel_size,
                  PAGE_PRESENT | PAGE_RW);
 
-  // 1. Mapear TODA la memoria fÃ­sica detectada en el higher-half usando pÃ¡ginas de 4MB
-  // Esto es crucial para que el kernel pueda acceder a cualquier PD/PT creado.
+  // 1. Mapear TODA la memoria fÃ­sica detectada en el higher-half usando
+  // pÃ¡ginas de 4MB Esto es crucial para que el kernel pueda acceder a
+  // cualquier PD/PT creado.
   uint32_t total_ram = pmm_get_total_pages() * PAGE_SIZE;
-  // Limitar a lo que quepa antes del Framebuffer (0xE0000000 - 0xC0000000 = 512MB)
-  // Si hay mÃ¡s de 512MB, mapeamos solo 512MB para evitar colisiones.
-  uint32_t ram_to_map = (total_ram > 512 * 1024 * 1024) ? (512 * 1024 * 1024) : total_ram;
+  // Limitar a lo que quepa antes del Framebuffer (0xE0000000 - 0xC0000000 =
+  // 512MB) Si hay mÃ¡s de 512MB, mapeamos solo 512MB para evitar colisiones.
+  uint32_t ram_to_map =
+      (total_ram > 512 * 1024 * 1024) ? (512 * 1024 * 1024) : total_ram;
 
   for (uint32_t addr = 0; addr < ram_to_map; addr += PAGE_SIZE_4MB) {
     uint32_t virt_addr = KERNEL_VIRTUAL_BASE + addr;
@@ -443,8 +471,7 @@ void mmu_init(void) {
                        boot_info.framebuffer->common.framebuffer_height;
 
     mmu_map_region(FRAMEBUFFER_BASE, fb_phys, fb_size,
-                   PAGE_PRESENT | PAGE_RW | PAGE_WRITETHROUGH |
-                       PAGE_CACHE_DISABLE); // SIN PAGE_USER!
+                   PAGE_PRESENT | PAGE_RW | PAGE_WC); // Write-Combining!
   }
 
   g_framebuffer = (uint32_t *)FRAMEBUFFER_BASE;
@@ -756,9 +783,10 @@ bool mmu_ensure_physical_accessible(uint32_t phys_start, uint32_t size,
   }
 
   // Usar región de mapeo directo del kernel (KERNEL_VIRTUAL_BASE) si cabe.
-  // IMPORTANTE: Si la física es > 1GB (0x40000000), sumar 0xC0000000 desbordaría
-  // y terminaríamos mapeando el dispositivo en el espacio del usuario (0-3GB).
-  // Dispositivos como APIC (0xFEE00000) desbordarían a 0xBEE00000.
+  // IMPORTANTE: Si la física es > 1GB (0x40000000), sumar 0xC0000000
+  // desbordaría y terminaríamos mapeando el dispositivo en el espacio del
+  // usuario (0-3GB). Dispositivos como APIC (0xFEE00000) desbordarían a
+  // 0xBEE00000.
   uint32_t target_virt;
   bool use_alt_search = false;
 
@@ -770,9 +798,10 @@ bool mmu_ensure_physical_accessible(uint32_t phys_start, uint32_t size,
     use_alt_search = true;
   }
 
-  // Verificar si la región virtual está disponible (o buscar alternativa si hubo conflicto/MMIO alto)
+  // Verificar si la región virtual está disponible (o buscar alternativa si
+  // hubo conflicto/MMIO alto)
   bool conflict = false;
-  
+
   if (!use_alt_search) {
     for (uint32_t offset = 0; offset < aligned_size; offset += PAGE_SIZE) {
       uint32_t check_virt = target_virt + offset;
@@ -790,10 +819,12 @@ bool mmu_ensure_physical_accessible(uint32_t phys_start, uint32_t size,
     // Buscar otra región virtual entre 0xD0000000 y 0xF0000000
     uint32_t alt_base = 0xD0000000;
     bool found_alt = false;
-    
-    for (uint32_t try_base = alt_base; try_base < 0xF0000000; try_base += 0x100000) {
+
+    for (uint32_t try_base = alt_base; try_base < 0xF0000000;
+         try_base += 0x100000) {
       bool region_free = true;
-      for (uint32_t test_offset = 0; test_offset < aligned_size; test_offset += PAGE_SIZE) {
+      for (uint32_t test_offset = 0; test_offset < aligned_size;
+           test_offset += PAGE_SIZE) {
         if (mmu_is_mapped(try_base + test_offset)) {
           region_free = false;
           break;
@@ -802,13 +833,15 @@ bool mmu_ensure_physical_accessible(uint32_t phys_start, uint32_t size,
       if (region_free) {
         target_virt = try_base;
         found_alt = true;
-        // terminal_printf(&main_terminal, "Using alternative virtual base 0x%08x\n", target_virt);
+        // terminal_printf(&main_terminal, "Using alternative virtual base
+        // 0x%08x\n", target_virt);
         break;
       }
     }
 
     if (!found_alt) {
-      terminal_printf(&main_terminal, "ERROR: No available virtual address space found\n");
+      terminal_printf(&main_terminal,
+                      "ERROR: No available virtual address space found\n");
       return false;
     }
   }

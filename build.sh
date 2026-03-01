@@ -109,7 +109,10 @@ compile "tcp.c" "$GCC $GCC_OPTS -c tcp.c -o build/tcp.o"
 compile "http.c" "$GCC $GCC_OPTS -c http.c -o build/http.o"
 compile "network_daemon.c" "$GCC $GCC_OPTS -c network_daemon.c -o build/network_daemon.o"
 compile "rtc.c" "$GCC $GCC_OPTS -c rtc.c -o build/rtc.o"
+compile "ps2.c" "$GCC $GCC_OPTS -c ps2.c -o build/ps2.o"
+compile "sse.c" "$GCC $GCC_OPTS -msse2 -c sse.c -o build/sse.o"
 compile "cmd_top.c" "$GCC $GCC_OPTS -c cmd_top.c -o build/cmd_top.o"
+compile "gui.c" "$GCC $GCC_OPTS -c gui.c -o build/gui.o"
 
 
 # Enlazado con linker.ld
@@ -131,7 +134,7 @@ ld -m elf_i386 -T linker.ld -o build/kernel.bin \
     build/sysfs.o build/devfs.o build/chardev.o build/chardev_vfs.o \
     build/e1000.o build/network.o build/ipv4.o build/arp.o build/network_stack.o \
     build/icmp.o build/udp.o build/dhcp.o build/dns.o build/tcp.o build/http.o build/network_daemon.o \
-    build/rtc.o build/cmd_top.o
+    build/rtc.o build/ps2.o build/sse.o build/cmd_top.o build/gui.o
 
 if [ $? -ne 0 ]; then
     echo -e "${RED}Error en el enlazado con linker.ld${RESET}"

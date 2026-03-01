@@ -275,7 +275,11 @@ void syscall_handler(struct regs *r) {
       for (size_t i = 0; i < count; i++) {
         terminal_putchar(&main_terminal, kernel_buffer[i]);
       }
-      terminal_draw(&main_terminal); // Refresh so user sees output streaming!
+      // Solo refrescar si NO estamos en ventana (el hilo de la GUI hará el
+      // refresh solo)
+      if (!main_terminal.windowed) {
+        terminal_draw(&main_terminal);
+      }
       task_yield();
       result = count;
     } else if (fd == 0) { // stdin
@@ -1309,6 +1313,10 @@ void syscall_handler(struct regs *r) {
     kernel_free(dirents);
     break;
   }
+
+  case SYSCALL_GUI_ACTIVE:
+    result = main_terminal.windowed ? 1 : 0;
+    break;
 
   case SYSCALL_LINK:
   case SYSCALL_SYMLINK:

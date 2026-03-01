@@ -148,6 +148,9 @@ const char *exception_messages[] = {
 
 // Función para pantalla de panic (usando drawing.h)
 void panic_screen(const char *exception_msg, struct regs *r) {
+  extern volatile int g_in_panic;
+  g_in_panic = 1;
+
   // Limpiar pantalla con fondo azul (como BSOD)
   fill_rect(0, 0, g_fb.width, g_fb.height, 0x000000FF); // Azul
 
@@ -462,9 +465,11 @@ void isr_handler(struct regs *r) {
         }
       }
     } else {
-      // Para modo kernel, cualquier excepción no capturada explícitamente es FATAL
+      // Para modo kernel, cualquier excepción no capturada explícitamente es
+      // FATAL
       snprintf(buffer, sizeof(buffer), "%s\nMode: Kernel\nEIP: 0x%08x",
-               r->int_no < 32 ? exception_messages[r->int_no] : "Critical Error",
+               r->int_no < 32 ? exception_messages[r->int_no]
+                              : "Critical Error",
                r->eip);
       panic_screen(buffer, r);
     }

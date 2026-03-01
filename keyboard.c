@@ -3,6 +3,7 @@
 #include "irq.h"
 #include "kernel.h"
 #include "memory.h"
+#include "ps2.h"
 #include "serial.h"
 #include "string.h"
 #include "terminal.h"
@@ -75,11 +76,7 @@ void keyboard_init() {
   keyboard_clear_buffer();
 }
 
-uint8_t keyboard_read_scancode() {
-  while (!(inb(KEYBOARD_STATUS_PORT) & 0x01))
-    ;
-  return inb(KEYBOARD_DATA_PORT);
-}
+uint8_t keyboard_read_scancode() { return ps2_read_data(); }
 
 int keyboard_process_scancode(uint8_t scancode, KeyboardState *state,
                               uint8_t *extended_flag) {
@@ -209,15 +206,16 @@ void keyboard_inject_scancode(uint8_t scancode) {
 
 void keyboard_irq_handler(struct regs *r) {
   (void)r;
-  // Check status register to ensure data is available
-  uint8_t status = inb(KEYBOARD_STATUS_PORT);
-  if (status & 0x01) {
-    uint8_t scancode = inb(KEYBOARD_DATA_PORT);
+  uint8_t status = ps2_read_status();
+
+  // CRÍTICO: Solo leer si el dato es del teclado (bit 5 de status es 0)
+  // Si ps2_is_mouse_data(status) es verdadero, NO debemos inb() aquí.
+  if ((status & PS2_STATUS_OUTPUT_FULL) && !ps2_is_mouse_data(status)) {
+    uint8_t scancode = inb(PS2_DATA_PORT);
     keyboard_inject_scancode(scancode);
   }
   pic_send_eoi(1);
 }
-
 
 void keyboard_set_handler(KeyboardCallback handler) {
   keyboard_callback = handler;

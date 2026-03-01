@@ -14,7 +14,10 @@
 #define PAGE_ACCESSED 0x020
 #define PAGE_DIRTY 0x040
 #define PAGE_GLOBAL 0x100
-#define PAGE_4MB 0x080 // Para páginas grandes (4MB)
+#define PAGE_4MB 0x080  // Para páginas grandes (4MB)
+#define PAGE_PAT 0x1000 // Para PAT (bit 12 en PDE/PTE o bit 7 en PTE)
+#define PAGE_WC                                                                \
+  (PAGE_WRITETHROUGH | PAGE_PAT) // Write-Combining (si PAT está configurado)
 
 // Constantes
 #define PAGE_DIRECTORY_ENTRIES 1024

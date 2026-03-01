@@ -56,7 +56,10 @@ typedef struct {
   uint8_t buttons; // Estado de botones (bit 0: izquierdo, bit 1: derecho, bit
                    // 2: medio)
   uint8_t last_buttons; // Estado anterior de botones
+  int8_t scroll_wheel;  // Posición actual de la rueda
+  int8_t scroll_delta;  // Último movimiento de la rueda
   bool enabled;         // Mouse habilitado
+  bool has_wheel;       // Soporte para rueda detected
   bool packet_ready;    // Paquete listo para procesar
   uint8_t packet[4];    // Buffer del paquete
   uint8_t packet_index; // Índice del paquete actual
@@ -75,6 +78,7 @@ void mouse_handle_irq(void);
 void mouse_update_bounds(uint32_t new_width, uint32_t new_height);
 void mouse_set_position(int32_t x, int32_t y);
 void mouse_get_position(int32_t *x, int32_t *y);
+int8_t mouse_get_scroll(void);
 uint8_t mouse_get_buttons(void);
 bool mouse_is_moved(void);
 bool mouse_is_clicked(uint8_t button);

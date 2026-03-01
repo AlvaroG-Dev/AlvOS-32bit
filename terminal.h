@@ -3,10 +3,9 @@
 
 #include "drawing.h"
 #include "keyboard.h"
+#include "mutex_types.h"
 #include "vfs.h"
 #include <stdbool.h>
-#include "mutex_types.h"
-
 
 #define ANSI_COLOR_BLACK "\033[30m"
 #define ANSI_COLOR_RED "\033[31m"
@@ -105,10 +104,10 @@ typedef struct {
   uint32_t cursor_blink_rate;
   uint32_t last_blink_time;
   uint8_t cursor_state_changed;
-  uint32_t last_cursor_x; // ✅ NUEVO: Tracking para limpieza
-  uint32_t last_cursor_y; // ✅ NUEVO
+  uint32_t last_cursor_x;      // ✅ NUEVO: Tracking para limpieza
+  uint32_t last_cursor_y;      // ✅ NUEVO
   uint8_t last_cursor_visible; // ✅ NUEVO
-  uint8_t *dirty_lines; // Array dinámico de líneas sucias
+  uint8_t *dirty_lines;        // Array dinámico de líneas sucias
 
   uint8_t flags;
   uint32_t current_fg_color; // Color actual del texto
@@ -141,14 +140,18 @@ typedef struct {
   // Seguimiento de tareas
   struct task *foreground_task; // Tarea que tiene el foco
   mutex_t mutex;                // ✅ NUEVO: Mutex para protección de acceso
-} Terminal;
 
+  // GUI integration
+  bool windowed;
+  int win_x, win_y;
+  int win_w, win_h;
+} Terminal;
 
 extern bool graphical_mode;
 
 // Funciones para calcular dimensiones de terminal
-uint32_t terminal_calculate_width(void);
-uint32_t terminal_calculate_height(void);
+uint32_t terminal_calculate_width(Terminal *term);
+uint32_t terminal_calculate_height(Terminal *term);
 void terminal_recalculate_dimensions(Terminal *term);
 int terminal_resize(Terminal *term);
 
@@ -182,6 +185,7 @@ void terminal_draw(Terminal *term);
 void terminal_scroll(Terminal *term);
 void terminal_execute(Terminal *term, const char *cmd);
 void terminal_update_cursor_blink(Terminal *term, uint32_t current_tick);
+void terminal_main_task(void *arg);
 void terminal_scroll_up(Terminal *term);
 void terminal_scroll_down(Terminal *term);
 void terminal_printf(Terminal *term, const char *format, ...);

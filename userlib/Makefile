@@ -27,7 +27,7 @@ libalvos.a: $(SUPPORT_OBJS)
 
 # Programa de prueba de la portación Newlib (modo usuario)
 newlib_test.elf: crt0.o syscalls.o newlib_test.o
-	$(LD) -m elf_i386 -o newlib_test.elf crt0.o newlib_test.o syscalls.o
+	$(CC) -m32 -nostdlib -o newlib_test.elf crt0.o newlib_test.o syscalls.o
 
 newlib_test.o: newlib_test.c
 	$(CC) $(CFLAGS) -c newlib_test.c -o newlib_test.o
@@ -40,7 +40,7 @@ BIN_PROGRAMS = $(patsubst $(BIN_DIR)/%.c, $(BIN_DIR)/%.elf, $(BIN_SOURCES))
 $(BIN_DIR)/%.elf: $(BIN_DIR)/%.c crt0.o syscalls.o
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -c $< -o $(BIN_DIR)/$*.o
-	$(LD) -m elf_i386 -o $@ crt0.o $(BIN_DIR)/$*.o syscalls.o
+	$(CC) -m32 -nostdlib -o $@ crt0.o $(BIN_DIR)/$*.o syscalls.o
 	@echo "Compilado: $@"
 
 # Compilar todos los programas

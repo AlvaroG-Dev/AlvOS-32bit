@@ -35,11 +35,14 @@ typedef enum {
 #define TASK_NAME_MAX 32
 
 // Flags para tareas
+#define SYSCALL_GUI_ACTIVE 0x47   // Detectar si la GUI está activa
+#define SYSCALL_SET_GUI_MODE 0x48 // Activar/desactivar modo GUI para la tarea
 #define TASK_FLAG_USER_MODE 0x00000001  // Ejecuta en modo usuario (Ring 3)
 #define TASK_FLAG_USER_STACK 0x00000002 // Tiene stack de usuario asignado
 #define TASK_FLAG_QUIET 0x00000004 // Silencia debug info al cargar/ejecutar
 #define TASK_FLAG_KBD_CLEAN_REQUIRED                                           \
-  0x00000008 // Limpieza obligatoria al 1er read
+  0x00000008                     // Limpieza obligatoria al 1er read
+#define TASK_FLAG_GUI 0x00000010 // Tarea con interfaz gráfica (o ventana)
 
 // Contexto de CPU para cambio de tareas
 typedef struct {
@@ -91,10 +94,9 @@ typedef struct task {
   uint32_t wake_time;   // Tiempo de despertar
 
   // Lista enlazada
-  struct task *next; // Siguiente tarea en la lista
-  struct task *prev; // Tarea anterior
+  struct task *next;      // Siguiente tarea en la lista
+  struct task *prev;      // Tarea anterior
   struct task *wait_next; // ✅ NUEVO: Siguiente tarea en una cola de espera
-
 
   // Función de entrada y datos
   void (*entry_point)(void *); // Función principal de la tarea (kernel wrapper)
@@ -118,6 +120,7 @@ typedef struct task {
   // Directorio de trabajo por proceso
   char cwd[256];
   bool stdin_buffer_dirty;
+  void *gui_window; // Puntero a la ventana si tiene modo GUI activo
 } task_t;
 
 // Planificador de tareas

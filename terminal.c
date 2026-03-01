@@ -37,6 +37,7 @@
 #include "task_test.h"
 #include "task_utils.h"
 
+#include "gui.h"
 #include "text_editor.h"
 #include "vfs.h"
 
@@ -48,6 +49,113 @@ extern ahci_controller_t ahci_controller;
 void cmd_top(Terminal *term);
 void cmd_stack_debug(Terminal *term);
 void terminal_show_enhanced_prompt(Terminal *term);
+
+// =================================================================
+// ESTRUCTURAS Y WRAPPERS PARA COMANDOS ASINCRONOS
+// =================================================================
+
+typedef struct {
+  Terminal *term;
+  ip_addr_t ip;
+  char ip_str[32];
+} ping_args_t;
+
+typedef struct {
+  Terminal *term;
+  char domain[256];
+} lookup_args_t;
+
+typedef struct {
+  Terminal *term;
+  char url[256];
+  char path[256];
+} wget_args_t;
+
+static void heaptest_wrapper(void *arg) {
+  Terminal *term = (Terminal *)arg;
+  heap_test_results_t test_results = heap_run_exhaustive_tests();
+  heap_print_test_results(&test_results, term);
+  task_exit(0);
+}
+
+static void ping_wrapper(void *arg) {
+  ping_args_t *p = (ping_args_t *)arg;
+  Terminal *term = p->term;
+  terminal_printf(term, "PING %s with 64 bytes of data:\r\n", p->ip_str);
+  for (int i = 1; i <= 4; i++) {
+    terminal_printf(term, "Sending ping #%d... ", i);
+    uint8_t ping_data[32];
+    uint32_t *timestamp = (uint32_t *)ping_data;
+    *timestamp = ticks_since_boot;
+
+    if (icmp_send_request(p->ip, 1234, i, ping_data, sizeof(ping_data))) {
+      terminal_puts(term, "Sent\r\n");
+    } else {
+      terminal_puts(term, "Failed to send\r\n");
+    }
+    task_sleep(1000);
+  }
+  terminal_puts(term, "\r\nPing statistics complete\r\n");
+  kernel_free(p);
+  task_exit(0);
+}
+
+static void lookup_wrapper(void *arg) {
+  lookup_args_t *l = (lookup_args_t *)arg;
+  Terminal *term = l->term;
+  ip_addr_t ip;
+  if (dns_resolve(l->domain, ip)) {
+    terminal_printf(term, "%s has address %d.%d.%d.%d\r\n", l->domain, ip[0],
+                    ip[1], ip[2], ip[3]);
+  } else {
+    terminal_printf(term, "Could not resolve %s\r\n", l->domain);
+  }
+  kernel_free(l);
+  task_exit(0);
+}
+
+static void wget_wrapper(void *arg) {
+  wget_args_t *w = (wget_args_t *)arg;
+  Terminal *term = w->term;
+  terminal_printf(term, "Downloading %s to %s...\r\n", w->url, w->path);
+  http_download(w->url, w->path);
+  kernel_free(w);
+  task_exit(0);
+}
+
+static void defrag_wrapper(void *arg) {
+  (void)arg;
+  cmd_force_defrag();
+  task_exit(0);
+}
+
+static void itest_wrapper(void *arg) {
+  (void)arg;
+  run_integration_tests();
+  task_exit(0);
+}
+
+static void sync_test_wrapper(void *arg) {
+  (void)arg;
+  run_task_utils_test_suite();
+  task_exit(0);
+}
+
+static void win_gui_wrapper(void *arg) {
+  gui_main_task(arg);
+  task_exit(0);
+}
+
+static void format_wrapper(void *arg) {
+  int result = fat32_format(&main_disk, "MYOS_DISK");
+  if (result == VFS_OK) {
+    terminal_printf(&main_terminal,
+                    "Disco formateado como FAT32 exitosamente\n");
+  } else {
+    terminal_printf(&main_terminal, "Error formateando disco: %d\n", result);
+  }
+  task_exit(0);
+}
 
 // Decodifica un color ANSI a color RGB
 uint32_t ansi_to_color(uint8_t ansi_code, uint8_t is_bright) {
@@ -93,14 +201,18 @@ static int parse_ansi_number(const char *str, int *value) {
 // FUNCIONES DE CÁLCULO DE DIMENSIONES DE TERMINAL
 // =================================================================
 
-uint32_t terminal_calculate_width(void) {
-  // Calcular el ancho basado en el framebuffer y la fuente actual
+uint32_t terminal_calculate_width(Terminal *term) {
   uint32_t char_width = g_current_font.width + g_current_font.spacing;
+  if (term && term->windowed) {
+    return term->win_w / char_width;
+  }
   return g_fb.width / char_width;
 }
 
-uint32_t terminal_calculate_height(void) {
-  // Calcular la altura basada en el framebuffer y la fuente actual
+uint32_t terminal_calculate_height(Terminal *term) {
+  if (term && term->windowed) {
+    return term->win_h / g_current_font.height;
+  }
   return g_fb.height / g_current_font.height;
 }
 
@@ -108,8 +220,7 @@ void terminal_recalculate_dimensions(Terminal *term) {
   if (!term)
     return;
 
-  term->width = terminal_calculate_width();
-  term->height = terminal_calculate_height();
+  terminal_resize(term);
 }
 
 int terminal_resize(Terminal *term) {
@@ -117,8 +228,8 @@ int terminal_resize(Terminal *term) {
     return 0;
 
   // Calcular nuevas dimensiones
-  uint32_t new_width = terminal_calculate_width();
-  uint32_t new_height = terminal_calculate_height();
+  uint32_t new_width = terminal_calculate_width(term);
+  uint32_t new_height = terminal_calculate_height(term);
 
   // Solo redimensionar si hay cambios significativos
   if (new_width == term->width && new_height == term->height) {
@@ -166,14 +277,14 @@ int terminal_resize(Terminal *term) {
     term->cursor_y = term->height - 1;
   }
 
-  // Ajustar view_start_line si es necesario
-  if (term->view_start_line + term->height > term->buffer.count) {
-    if (term->buffer.count > term->height) {
-      term->view_start_line = term->buffer.count - term->height;
-    } else {
-      term->view_start_line = 0;
-    }
+  // Forzar view_start_line al final para que el cursor sea visible
+  if (term->buffer.count > term->height) {
+    term->view_start_line = term->buffer.count - term->height;
+  } else {
+    term->view_start_line = 0;
   }
+  term->cursor_y = (term->buffer.count > 0) ? (term->buffer.count - term->view_start_line - 1) : 0;
+  if (term->cursor_y >= term->height) term->cursor_y = term->height - 1;
 
   return 1;
 }
@@ -355,8 +466,11 @@ void terminal_safe_memcpy(char *dst, const char *src, size_t size) {
   }
 }
 
+extern Terminal main_terminal;
+bool graphical_mode = false;
+
 // =================================================================
-// FUNCIONES DEL BUFFER CIRCULAR
+// HELPER FUNCTIONS FOR BUFFER MANAGEMENT
 // =================================================================
 
 int circular_buffer_init(CircularBuffer *cb, uint32_t width,
@@ -907,10 +1021,12 @@ static void terminal_clear_current_line(Terminal *term) {
     }
   }
 
-  // Borrar línea completa en pantalla
-  fill_rect(0, term->cursor_y * g_current_font.height,
-            term->width * (g_current_font.width + g_current_font.spacing),
-            g_current_font.height, term->bg_color);
+  // No dibujamos aquí para evitar parpadeo masivo.
+  // El redibujo se hará cuando se llame a terminal_draw_line o en el próximo
+  // ciclo del worker.
+  if (term->cursor_y < term->height) {
+    term->dirty_lines[term->cursor_y] = 1;
+  }
 
   // Restaurar posición del cursor (pero mantener X en 0 para nueva escritura)
   term->cursor_x = 0; // Siempre empezar desde el inicio
@@ -986,8 +1102,8 @@ void terminal_init(Terminal *term) {
   memset(term, 0, sizeof(Terminal));
 
   // Calcular dimensiones iniciales
-  term->width = terminal_calculate_width();
-  term->height = terminal_calculate_height();
+  term->width = terminal_calculate_width(term);
+  term->height = terminal_calculate_height(term);
 
   // Calcular líneas del buffer basado en la altura
   uint32_t buffer_lines = term->height * BUFFER_LINE_MULTIPLIER;
@@ -1035,10 +1151,9 @@ void terminal_init(Terminal *term) {
   strcpy(term->cwd, "/home");
   strcpy(vfs_cwd, "/home");
   strcpy(term->prompt_info.username, "user");
-  
+
   // ✅ NUEVO: Inicializar mutex de terminal
   mutex_init(&term->mutex, "terminal_mutex");
-
 
   // Estadísticas
   term->total_lines_written = 0;
@@ -1122,6 +1237,12 @@ void terminal_clear(Terminal *term) {
   term->view_offset = 0;
   term->view_start_line = 0;
 
+  // Limpiar el buffer circular (historial)
+  circular_buffer_clear(&term->buffer);
+
+  // Agregar la primera línea limpia
+  circular_buffer_add_line(&term->buffer);
+
   // Limpiar buffer de input
   term->input_pos = 0;
   memset(term->input_buffer, 0, sizeof(term->input_buffer));
@@ -1132,8 +1253,16 @@ void terminal_clear(Terminal *term) {
   term->needs_full_redraw = 1;
 
   // Limpiar pantalla físicamente
-  fill_rect(0, 0, term->width * (g_current_font.width + g_current_font.spacing),
-            term->height * g_current_font.height, term->bg_color);
+  int off_x = term->windowed ? term->win_x : 0;
+  int off_y = term->windowed ? term->win_y : 0;
+  uint32_t fill_w =
+      term->windowed
+          ? term->win_w
+          : term->width * (g_current_font.width + g_current_font.spacing);
+  uint32_t fill_h =
+      term->windowed ? term->win_h : term->height * g_current_font.height;
+
+  fill_rect(off_x, off_y, fill_w, fill_h, term->bg_color);
 
   // Redibujar
   terminal_draw(term);
@@ -1175,23 +1304,36 @@ void terminal_putchar_raw(Terminal *term, char c) {
         term->view_start_line = term->buffer.count - term->height;
       }
       // OPTIMIZACIÓN CRÍTICA: Desplazar framebuffer en lugar de redibujar todo
-      scroll_screen();
-      
+      if (!term->windowed) {
+        scroll_screen();
+      } else {
+        // En modo ventana, marcamos todo como sucio para que el siguiente frame
+        // lo redibuje
+        memset(term->dirty_lines, 1, term->height);
+      }
+
       // DESPLAZAR LÍNEAS SUCIAS: No perder cambios pendientes en otras líneas
       for (uint32_t i = 0; i < term->height - 1; i++) {
         term->dirty_lines[i] = term->dirty_lines[i + 1];
       }
       term->dirty_lines[term->height - 1] = 1;
-      
+
       // DESPLAZAR RASTRO DEL CURSOR: El cursor físico se movió arriba
       if (term->last_cursor_y > 0) {
-          term->last_cursor_y--;
-          // Forzar redibujado de la línea donde estaba el cursor para quitar "fantasma"
-          term->dirty_lines[term->last_cursor_y] = 1;
+        term->last_cursor_y--;
+        // Forzar redibujado de la línea donde estaba el cursor para quitar
+        // "fantasma"
+        term->dirty_lines[term->last_cursor_y] = 1;
       }
     } else {
       term->cursor_y++;
     }
+    
+    // Auto-scroll al fondo al escribir
+    if (term->buffer.count > term->height) {
+        term->view_start_line = term->buffer.count - term->height;
+    }
+
     if (term->cursor_y < term->height) {
       term->dirty_lines[term->cursor_y] = 1;
     }
@@ -1225,6 +1367,12 @@ void terminal_putchar_raw(Terminal *term, char c) {
       term->cursor_x++;
       if (term->cursor_x >= term->width) {
         terminal_putchar_raw(term, '\n');
+      }
+      
+      // Auto-scroll al fondo al escribir (para caracteres normales o espacios)
+      if (term->buffer.count > term->height && term->view_start_line != (term->buffer.count - term->height)) {
+          term->view_start_line = term->buffer.count - term->height;
+          memset(term->dirty_lines, 1, term->height); // Forzar redibujado completo
       }
     }
   }
@@ -1318,11 +1466,24 @@ void terminal_draw_line(Terminal *term, uint32_t screen_y) {
 
   uint32_t buffer_line = term->view_start_line + screen_y;
 
-  // Borrar línea completa con color de fondo actual
-  fill_rect(0, screen_y * g_current_font.height,
-            term->width * (g_current_font.width + g_current_font.spacing),
-            g_current_font.height,
-            term->current_attrs.bg_color); // Usar bg_color actual
+  int off_x = term->windowed ? term->win_x : 0;
+  int off_y = term->windowed ? term->win_y : 0;
+  uint32_t fill_w =
+      term->windowed
+          ? term->win_w
+          : term->width * (g_current_font.width + g_current_font.spacing);
+  uint32_t char_limit_w = term->windowed ? term->win_w : 0xFFFFFFFF;
+  uint32_t char_limit_h = term->windowed ? term->win_h : 0xFFFFFFFF;
+
+  // Clipping vertical: si la línea está fuera de la ventana, no dibujar
+  if (term->windowed &&
+      (screen_y * g_current_font.height + g_current_font.height >
+       char_limit_h)) {
+    return;
+  }
+
+  fill_rect(off_x, off_y + screen_y * g_current_font.height, fill_w,
+            g_current_font.height, term->current_attrs.bg_color);
 
   // Dibujar contenido si la línea existe en el buffer
   if (buffer_line < term->buffer.count) {
@@ -1330,29 +1491,34 @@ void terminal_draw_line(Terminal *term, uint32_t screen_y) {
     uint32_t *colors = circular_buffer_get_colors(&term->buffer, buffer_line);
 
     if (line && colors) {
-      // No necesitamos set_colors global aquí porque usamos per-char color
-
       for (uint32_t x = 0; x < term->width; x++) {
         char c = line[x];
+        uint32_t char_x = x * (g_current_font.width + g_current_font.spacing);
+
+        // Clipping estricto
+        if (char_x + g_current_font.width > char_limit_w)
+          break;
+
         if (c != ' ' && c != '\0') {
-          draw_char_with_shadow(
-              x * (g_current_font.width + g_current_font.spacing),
-              screen_y * g_current_font.height, c,
-              colors[x], // Usar color guardado
-              term->current_attrs.bg_color, COLOR_DARK_GRAY, 0);
+          draw_char_at(off_x + char_x, off_y + screen_y * g_current_font.height,
+                       c, colors[x], term->current_attrs.bg_color);
         }
       }
     }
   }
 
   // Dibujar cursor si está en esta línea y es visible
-  if (screen_y == term->cursor_y && term->cursor_visible &&
-      term->cursor_x < term->width) {
-    fill_rect(term->cursor_x * (g_current_font.width + g_current_font.spacing),
-              screen_y * g_current_font.height, g_current_font.width,
-              g_current_font.height,
-              term->current_attrs.fg_color); // Usar fg_color para cursor
+  if (screen_y == term->cursor_y && term->cursor_visible) {
+    uint32_t cursor_x_px =
+        term->cursor_x * (g_current_font.width + g_current_font.spacing);
+    if (cursor_x_px + g_current_font.width <= char_limit_w) {
+      fill_rect(off_x + cursor_x_px,
+                off_y + screen_y * g_current_font.height +
+                    (g_current_font.height - 2),
+                g_current_font.width, 2, term->current_attrs.fg_color);
+    }
   }
+  // Usar fg_color para cursor
 
   term->dirty_lines[screen_y] = 0;
 }
@@ -1368,7 +1534,6 @@ void terminal_puts(Terminal *term, const char *str) {
   terminal_draw(term);
   mutex_unlock(&term->mutex);
 }
-
 
 void terminal_scroll_up(Terminal *term) {
   if (!term)
@@ -1400,37 +1565,72 @@ void terminal_draw(Terminal *term) {
   if (!term)
     return;
 
-  mutex_lock(&term->mutex);
+  // En modo ventana (GUI), siempre redibujamos todo porque el backbuffer se
+  // limpia cada frame
+  if (term->windowed) {
+    for (uint32_t screen_y = 0; screen_y < term->height; screen_y++) {
+      term->dirty_lines[screen_y] = 1;
+    }
+  }
+
+  // Si estamos en una excepción/panic, evitamos el mutex para no bloquearnos si
+  // el crash fue dentro del terminal
+  bool use_mutex = true;
+  extern volatile int g_in_panic; // Suponiendo que existe o la creamos
+  if (g_in_panic)
+    use_mutex = false;
+
+  if (use_mutex)
+    mutex_lock(&term->mutex);
+
+  int off_x = term->windowed ? term->win_x : 0;
+  int off_y = term->windowed ? term->win_y : 0;
+  uint32_t fill_w =
+      term->windowed
+          ? term->win_w
+          : term->width * (g_current_font.width + g_current_font.spacing);
+  uint32_t fill_h =
+      term->windowed ? term->win_h : term->height * g_current_font.height;
+
   // Limpiar pantalla si es necesario (sólo para scroll completo)
   if (term->needs_full_redraw) {
-    fill_rect(0, 0,
-              term->width * (g_current_font.width + g_current_font.spacing),
-              term->height * g_current_font.height, term->bg_color);
+    fill_rect(off_x, off_y, fill_w, fill_h, term->bg_color);
     term->needs_full_redraw = 0;
     memset(term->dirty_lines, 1, term->height);
     term->last_cursor_visible = 0;
   }
 
-  // Asegurar que la línea del cursor actual esté marcada como sucia si el cursor cambió
-  if (term->cursor_state_changed || term->last_cursor_x != term->cursor_x || term->last_cursor_y != term->cursor_y) {
-    if (term->last_cursor_y < term->height) term->dirty_lines[term->last_cursor_y] = 1;
-    if (term->cursor_y < term->height) term->dirty_lines[term->cursor_y] = 1;
+  // Asegurar que la línea del cursor actual esté marcada como sucia si el
+  // cursor cambió
+  if (term->cursor_state_changed || term->last_cursor_x != term->cursor_x ||
+      term->last_cursor_y != term->cursor_y) {
+    if (term->last_cursor_y < term->height)
+      term->dirty_lines[term->last_cursor_y] = 1;
+    if (term->cursor_y < term->height)
+      term->dirty_lines[term->cursor_y] = 1;
 
-    
     term->last_cursor_x = term->cursor_x;
     term->last_cursor_y = term->cursor_y;
     term->cursor_state_changed = 0;
   }
 
   // Redibujar líneas sucias
-  for (uint32_t screen_y = 0; screen_y < term->height; screen_y++) {
+  uint32_t visible_height = term->height;
+  if (term->windowed) {
+    uint32_t possible_visible = term->win_h / g_current_font.height;
+    if (possible_visible < visible_height)
+      visible_height = possible_visible;
+  }
+
+  for (uint32_t screen_y = 0; screen_y < visible_height; screen_y++) {
     if (term->dirty_lines[screen_y]) {
       terminal_draw_line(term, screen_y);
     }
   }
-  mutex_unlock(&term->mutex);
-}
 
+  if (use_mutex)
+    mutex_unlock(&term->mutex);
+}
 
 void terminal_handle_key(Terminal *term, int key) {
   while (!term) {
@@ -1542,8 +1742,11 @@ void terminal_handle_key(Terminal *term, int key) {
         term->dirty_lines[term->cursor_y] = 1;
       }
 
-      // Redibujar solo la línea actual
-      terminal_draw_line(term, term->cursor_y);
+      // Si estamos en modo texto (no windowed), dibujamos ya para que sea
+      // snappy
+      if (!term->windowed) {
+        terminal_draw_line(term, term->cursor_y);
+      }
     }
 
     // Manejar teclas de scroll
@@ -1693,7 +1896,6 @@ void terminal_printf(Terminal *term, const char *format, ...) {
     mutex_unlock(&term->mutex);
     return;
   }
-
 
   // Manejo de mensajes largos por partes
   const int chunk_size = sizeof(buffer) - 1;
@@ -2264,16 +2466,16 @@ static void cmd_disk_info(Terminal *term, const char *args) {
 }
 
 // Función principal del editor que se puede llamar desde el kernel
-void cmd_edit(const char *args) {
+void cmd_edit(Terminal *term, const char *args) {
   if (!args || !args[0]) {
-    terminal_printf(&main_terminal, "Uso: edit <archivo>\r\n");
+    terminal_printf(term, "Uso: edit <archivo>\r\n");
     return;
   }
 
   // Crear editor
   text_editor_t *editor = editor_create(&main_terminal);
   if (!editor) {
-    terminal_printf(&main_terminal, "Error: No se pudo crear el editor\r\n");
+    terminal_printf(term, "Error: No se pudo crear el editor\r\n");
     return;
   }
 
@@ -2283,7 +2485,7 @@ void cmd_edit(const char *args) {
   // Abrir archivo
   if (editor_open_file(editor, args) != 0) {
     // Si falla, es un archivo nuevo
-    terminal_printf(&main_terminal, "Creando nuevo archivo: %s\r\n", args);
+    terminal_printf(term, "Creando nuevo archivo: %s\r\n", args);
     task_sleep(1000); // Pausa de 1 segundo
   }
 
@@ -2296,25 +2498,25 @@ void cmd_edit(const char *args) {
 
   // Restaurar terminal
   terminal_clear(&main_terminal);
-  terminal_printf(&main_terminal, "Editor cerrado.\r\n");
+  terminal_printf(term, "Editor cerrado.\r\n");
 }
 
-void verify_page_permissions(uint32_t vaddr) {
+void verify_page_permissions(Terminal *term, uint32_t vaddr) {
   uint32_t page_start = vaddr & ~0xFFF;
   uint32_t pd_index = page_start >> 22;
   uint32_t pt_index = (page_start >> 12) & 0x3FF;
 
-  terminal_printf(&main_terminal, "Checking page 0x%08x...\r\n", page_start);
+  terminal_printf(term, "Checking page 0x%08x...\r\n", page_start);
 
   if (!(page_directory[pd_index] & PAGE_PRESENT)) {
-    terminal_puts(&main_terminal, "  Page directory entry not present\r\n");
+    terminal_puts(term, "  Page directory entry not present\r\n");
     return;
   }
 
   if (page_directory[pd_index] & PAGE_4MB) {
-    terminal_puts(&main_terminal, "  4MB page\r\n");
+    terminal_puts(term, "  4MB page\r\n");
     uint32_t entry = page_directory[pd_index];
-    terminal_printf(&main_terminal,
+    terminal_printf(term,
                     "  Flags: 0x%03x\r\n"
                     "    Present: %u\r\n"
                     "    RW: %u\r\n"
@@ -2326,7 +2528,7 @@ void verify_page_permissions(uint32_t vaddr) {
 
   uint32_t pt_entry = page_tables[pd_index][pt_index];
 
-  terminal_printf(&main_terminal,
+  terminal_printf(term,
                   "  Page table entry: 0x%08x\r\n"
                   "  Flags: 0x%03x\r\n"
                   "    Present: %u\r\n"
@@ -2336,8 +2538,8 @@ void verify_page_permissions(uint32_t vaddr) {
                   (pt_entry & PAGE_RW) ? 1 : 0, (pt_entry & PAGE_USER) ? 1 : 0);
 }
 
-void verify_user_segments(void) {
-  terminal_puts(&main_terminal, "\r\n=== User Segment Verification ===\r\n");
+void verify_user_segments(Terminal *term) {
+  terminal_puts(term, "\r\n=== User Segment Verification ===\r\n");
 
   extern struct gdt_entry gdt[6];
 
@@ -2345,8 +2547,7 @@ void verify_user_segments(void) {
   uint8_t user_cs_type = gdt[3].access & 0x1F;
   uint8_t user_cs_dpl = (gdt[3].access >> 5) & 3;
 
-  terminal_printf(&main_terminal,
-                  "  Entry 3 (User CS): Type=0x%02x, DPL=%u %s\r\n",
+  terminal_printf(term, "  Entry 3 (User CS): Type=0x%02x, DPL=%u %s\r\n",
                   user_cs_type, user_cs_dpl,
                   (user_cs_type == 0xFA && user_cs_dpl == 3) ? "✓" : "✗");
 
@@ -2354,8 +2555,7 @@ void verify_user_segments(void) {
   uint8_t user_ds_type = gdt[4].access & 0x1F;
   uint8_t user_ds_dpl = (gdt[4].access >> 5) & 3;
 
-  terminal_printf(&main_terminal,
-                  "  Entry 4 (User DS): Type=0x%02x, DPL=%u %s\r\n",
+  terminal_printf(term, "  Entry 4 (User DS): Type=0x%02x, DPL=%u %s\r\n",
                   user_ds_type, user_ds_dpl,
                   (user_ds_type == 0xF2 && user_ds_dpl == 3) ? "✓" : "✗");
 }
@@ -2417,22 +2617,22 @@ task_t *create_editor_task(const char *filename) {
   return task;
 }
 
-void cmd_apic_info(void) {
+void cmd_apic_info(Terminal *term) {
   if (!apic_is_enabled()) {
-    terminal_puts(&main_terminal, "APIC is not enabled\r\n");
+    terminal_puts(term, "APIC is not enabled\r\n");
     return;
   }
 
   apic_print_info();
 }
 
-void cmd_reboot(void) {
-  terminal_puts(&main_terminal, "Rebooting system...\r\n");
+void cmd_reboot(Terminal *term) {
+  terminal_puts(term, "Rebooting system...\r\n");
 
   if (acpi_is_supported()) {
     acpi_reboot();
   } else {
-    terminal_puts(&main_terminal,
+    terminal_puts(term,
                   "ACPI not available, using keyboard controller reset\r\n");
 
     //// Método tradicional usando el controlador de teclado
@@ -2453,29 +2653,27 @@ void cmd_reboot(void) {
   }
 }
 
-void cmd_suspend(void) {
+void cmd_suspend(Terminal *term) {
   if (acpi_is_supported()) {
     acpi_suspend();
   } else {
-    terminal_puts(&main_terminal,
-                  "ACPI not available. Suspend not supported.\r\n");
+    terminal_puts(term, "ACPI not available. Suspend not supported.\r\n");
   }
 }
 
-void cmd_lspci(void) {
+void cmd_lspci(Terminal *term) {
   if (pci_device_count > 0) {
     pci_list_devices();
   } else {
-    terminal_puts(&main_terminal,
-                  "No PCI devices found or PCI not initialized\r\n");
+    terminal_puts(term, "No PCI devices found or PCI not initialized\r\n");
   }
 }
 
-void cmd_acpi_info(void) {
+void cmd_acpi_info(Terminal *term) {
   if (acpi_is_supported()) {
     acpi_list_tables();
   } else {
-    terminal_puts(&main_terminal, "ACPI not supported or not initialized\r\n");
+    terminal_puts(term, "ACPI not supported or not initialized\r\n");
   }
 }
 
@@ -2591,7 +2789,7 @@ void handle_part_command(Terminal *term, int argc, char *argv[]) {
 }
 
 // Comando para listar módulos
-void cmd_list_modules(const char *args) {
+void cmd_list_modules(Terminal *term, const char *args) {
   (void)args; // No usado
   module_list_all();
 }
@@ -2820,9 +3018,11 @@ void terminal_execute(Terminal *term, const char *cmd) {
   } else if (strcmp(command, "stack-debug") == 0) {
     cmd_stack_debug(term);
   } else if (strcmp(command, "modules") == 0) {
-    cmd_list_modules(args);
+    cmd_list_modules(term, args);
+  } else if (strcmp(command, "edit") == 0) {
+    cmd_edit(term, args);
   } else if (strcmp(command, "apic") == 0) {
-    apic_print_info();
+    cmd_apic_info(term);
   } else if (strcmp(command, "net-init") == 0) {
     network_stack_init();
     terminal_puts(term, "Network stack initialized\r\n");
@@ -2899,38 +3099,14 @@ void terminal_execute(Terminal *term, const char *cmd) {
       return;
     }
 
-    typedef struct {
-      ip_addr_t ip;
-      char ip_str[32];
-    } ping_args_t;
     ping_args_t *pargs = kernel_malloc(sizeof(ping_args_t));
-    if (!pargs) return;
+    if (!pargs)
+      return;
+    pargs->term = term;
     memcpy(pargs->ip, target_ip, sizeof(ip_addr_t));
     strncpy(pargs->ip_str, argv[1], 31);
     pargs->ip_str[31] = '\0';
 
-    void ping_wrapper(void* arg) {
-      ping_args_t* p = (ping_args_t*)arg;
-      terminal_printf(&main_terminal, "PING %s with 64 bytes of data:\r\n", p->ip_str);
-
-      // Enviar 4 pings
-      for (int i = 1; i <= 4; i++) {
-        terminal_printf(&main_terminal, "Sending ping #%d... ", i);
-        uint8_t ping_data[32];
-        uint32_t *timestamp = (uint32_t *)ping_data;
-        *timestamp = ticks_since_boot;
-
-        if (icmp_send_request(p->ip, 1234, i, ping_data, sizeof(ping_data))) {
-          terminal_puts(&main_terminal, "Sent\r\n");
-        } else {
-          terminal_puts(&main_terminal, "Failed to send\r\n");
-        }
-        task_sleep(1000); // 1 segundo exacto sin bloquear
-      }
-      terminal_puts(&main_terminal, "\r\nPing statistics complete\r\n");
-      kernel_free(p);
-      task_exit(0);
-    }
     task_create("ping", ping_wrapper, pargs, TASK_PRIORITY_NORMAL);
   } else if (strcmp(command, "net-stats") == 0) {
     // Mostrar estadísticas detalladas
@@ -3027,23 +3203,20 @@ void terminal_execute(Terminal *term, const char *cmd) {
     if (args[0] == '\0') {
       terminal_puts(term, "Usage: lookup <hostname>\r\n");
     } else {
-      char *domain_arg = kernel_malloc(128);
-      if (!domain_arg) return;
-      strncpy(domain_arg, args, 127);
-      domain_arg[127] = '\0';
-
-      void lookup_wrapper(void* arg) {
-        char* domain = (char*)arg;
-        ip_addr_t ip;
-        if (dns_resolve(domain, ip)) {
-          terminal_printf(&main_terminal, "%s has address %d.%d.%d.%d\r\n", domain, ip[0], ip[1], ip[2], ip[3]);
-        } else {
-          terminal_printf(&main_terminal, "Could not resolve %s\r\n", domain);
-        }
-        kernel_free(domain);
-        task_exit(0);
-      }
-      task_create("lookup", lookup_wrapper, domain_arg, TASK_PRIORITY_NORMAL);
+      lookup_args_t *l = (lookup_args_t *)kernel_malloc(sizeof(lookup_args_t));
+      if (!l)
+        return;
+      l->term = term;
+      strncpy(l->domain, args, sizeof(l->domain) - 1);
+      l->domain[sizeof(l->domain) - 1] = '\0';
+      task_create("lookup", lookup_wrapper, l, TASK_PRIORITY_NORMAL);
+    }
+  } else if (strcmp(command, "view") == 0) {
+    if (args[0] == '\0') {
+      terminal_puts(term, "Usage: view <image_path>\r\n");
+    } else {
+      gui_open_image_viewer(args);
+      terminal_printf(term, "Opening viewer for: %s\r\n", args);
     }
   } else if (strcmp(command, "wget") == 0) {
     // args tiene toda la línea de argumentos. Necesitamos separarlos.
@@ -3056,26 +3229,18 @@ void terminal_execute(Terminal *term, const char *cmd) {
     if (!space) {
       terminal_puts(term, "Usage: wget <url> <dest_path>\r\n");
     } else {
-      typedef struct {
-        char url[128];
-        char path[128];
-      } wget_args_t;
       wget_args_t *wargs = kernel_malloc(sizeof(wget_args_t));
-      if (!wargs) return;
+      if (!wargs)
+        return;
+      wargs->term = term;
       int url_len = space - args;
-      if (url_len > 127) url_len = 127;
+      if (url_len > 255)
+        url_len = 255;
       strncpy(wargs->url, args, url_len);
       wargs->url[url_len] = '\0';
-      strncpy(wargs->path, space + 1, 127);
-      wargs->path[127] = '\0';
+      strncpy(wargs->path, space + 1, 255);
+      wargs->path[255] = '\0';
 
-      void wget_wrapper(void *arg) {
-        wget_args_t *w = (wget_args_t *)arg;
-        terminal_printf(&main_terminal, "Downloading %s to %s...\r\n", w->url, w->path);
-        http_download(w->url, w->path);
-        kernel_free(w);
-        task_exit(0);
-      }
       task_create("wget", wget_wrapper, wargs, TASK_PRIORITY_NORMAL);
     }
   } else if (strcmp(command, "net-help") == 0) {
@@ -3118,35 +3283,34 @@ void terminal_execute(Terminal *term, const char *cmd) {
     set_colors(term->fg_color, term->bg_color);
     terminal_clear(term);
   } else if (strcmp(command, "lspci") == 0) {
-    cmd_lspci();
+    cmd_lspci(term);
   } else if (strcmp(command, "acpi") == 0) {
-    cmd_acpi_info();
+    cmd_acpi_info(term);
   } else if (strcmp(command, "reboot") == 0) {
-    cmd_reboot();
+    cmd_reboot(term);
   } else if (strcmp(command, "suspend") == 0) {
-    cmd_suspend();
+    cmd_suspend(term);
+  } else if (strcmp(command, "sse") == 0) {
+    if (!cpu_info.caps.has_sse) {
+      terminal_printf(term, "SSE no soportado por la CPU\n");
+    } else {
+      terminal_printf(term, "SSE soportado por la CPU\n");
+    }
   } else if (strcmp(command, "heap") == 0) {
     size_t libre = heap_available();
     terminal_printf(term, "Memoria libre en el heap: %u bytes\n", libre);
+  } else if (strcmp(command, "gui") == 0) {
+    terminal_puts(term, "Starting graphical interface...\n");
+    task_create("gui_task", win_gui_wrapper, NULL, TASK_PRIORITY_NORMAL);
   } else if (strcmp(command, "ticks") == 0) {
-    terminal_printf(&main_terminal, "Ticks since boot: %u\r\n",
-                    ticks_since_boot);
+    terminal_printf(term, "Ticks since boot: %u\r\n", ticks_since_boot);
   } else if (strcmp(command, "heaptest") == 0) {
-    void heaptest_wrapper(void* arg) {
-      heap_test_results_t test_results = heap_run_exhaustive_tests();
-      heap_print_test_results(&test_results, &main_terminal);
-      task_exit(0);
-    }
-    task_create("heaptest", heaptest_wrapper, NULL, TASK_PRIORITY_NORMAL);
+    task_create("heaptest", heaptest_wrapper, term, TASK_PRIORITY_NORMAL);
   } else if (strcmp(command, "async_read") == 0) {
     cmd_async_read_test();
   } else if (strcmp(command, "async_write") == 0) {
     cmd_async_write_test();
   } else if (strcmp(command, "defrag") == 0) {
-    void defrag_wrapper(void* arg) {
-      cmd_force_defrag();
-      task_exit(0);
-    }
     task_create("defrag", defrag_wrapper, NULL, TASK_PRIORITY_LOW);
   } else if (strcmp(command, "defrag_stats") == 0) {
     cmd_defrag_stats();
@@ -3159,16 +3323,6 @@ void terminal_execute(Terminal *term, const char *cmd) {
   } else if (strcmp(command, "lsblk") == 0) {
     cmd_lsblk();
   } else if (strcmp(command, "format") == 0) {
-    void format_wrapper(void* arg) {
-      int result = fat32_format(&main_disk, "MYOS_DISK");
-      if (result == VFS_OK) {
-        terminal_printf(&main_terminal,
-                        "Disco formateado como FAT32 exitosamente\n");
-      } else {
-        terminal_printf(&main_terminal, "Error formateando disco: %d\n", result);
-      }
-      task_exit(0);
-    }
     task_create("format", format_wrapper, NULL, TASK_PRIORITY_NORMAL);
   } else if (strcmp(command, "cpuinfo") == 0) {
     if (argc > 1 && strcmp(argv[1], "detailed") == 0) {
@@ -3190,7 +3344,7 @@ void terminal_execute(Terminal *term, const char *cmd) {
     // Esperar a que pasen 'measure_ticks'
     while ((ticks_since_boot - start_ticks) < measure_ticks) {
       if (ticks_since_boot >= timeout_ticks) {
-        terminal_printf(&main_terminal, "Error: timeout esperando ticks\r\n");
+        terminal_printf(term, "Error: timeout esperando ticks\r\n");
         return;
       }
       __asm__ __volatile__("pause");
@@ -3204,7 +3358,7 @@ void terminal_execute(Terminal *term, const char *cmd) {
     uint64_t cycles_per_second = (cycles_total * 100) / measure_ticks;
     uint32_t freq_mhz = (uint32_t)(cycles_per_second / 1000000ULL);
 
-    terminal_printf(&main_terminal, "Estimated CPU freq: %u MHz\r\n", freq_mhz);
+    terminal_printf(term, "Estimated CPU freq: %u MHz\r\n", freq_mhz);
   } else if (strcmp(command, "tasks") == 0) {
     task_list_all();
   } else if (strcmp(command, "task_state") == 0) {
@@ -3284,27 +3438,17 @@ void terminal_execute(Terminal *term, const char *cmd) {
   } else if (strcmp(command, "task_health") == 0) {
     task_monitor_health();
   } else if (strcmp(command, "sync-test") == 0) {
-    void sync_test_wrapper(void* arg) {
-      run_task_utils_test_suite();
-      task_exit(0);
-    }
-    task_create("sync_test", sync_test_wrapper, NULL, TASK_PRIORITY_NORMAL);
+    task_create("sync_test", sync_test_wrapper, term, TASK_PRIORITY_NORMAL);
   } else if (strcmp(command, "itest") == 0) {
-    void itest_wrapper(void* arg) {
-      run_integration_tests();
-      task_exit(0);
-    }
-    task_create("itest", itest_wrapper, NULL, TASK_PRIORITY_NORMAL);
-
-
+    task_create("itest", itest_wrapper, term, TASK_PRIORITY_NORMAL);
   } else if (strcmp(command, "install") == 0) {
 
     install_err_t result = install_os_complete(&main_disk, &options);
     if (result == INSTALL_OK) {
-      terminal_puts(&main_terminal, "¡Instalación completa exitosa!");
+      terminal_puts(term, "¡Instalación completa exitosa!");
       // Opcional: Llama a shutdown() después
     } else {
-      terminal_printf(&main_terminal, "Instalación fallida con error: %s\n",
+      terminal_printf(term, "Instalación fallida con error: %s\n",
                       installer_error_string(result));
     }
   } else if (strcmp(command, "run") == 0) {
@@ -3366,11 +3510,14 @@ void terminal_execute(Terminal *term, const char *cmd) {
     terminal_puts(term, "  start_scheduler    - Start the scheduler\r\n");
     terminal_puts(term, "  stop_scheduler     - Stop the scheduler\r\n");
     terminal_puts(term, "  create_test_task   - Create a new test task\r\n");
-    terminal_puts(term, "  task_health        - Diagnóstico de tareas zombi\r\n");
-    terminal_puts(term, "  sync-test          - Run Task/Sync/Msg Test Suite\r\n");
-    terminal_puts(term, "  itest              - Integration tests for System Sync\r\n\r\n");
+    terminal_puts(term,
+                  "  task_health        - Diagnóstico de tareas zombi\r\n");
+    terminal_puts(term,
+                  "  sync-test          - Run Task/Sync/Msg Test Suite\r\n");
+    terminal_puts(
+        term,
+        "  itest              - Integration tests for System Sync\r\n\r\n");
     terminal_puts(term, "  help_tasks         - Show this help\r\n\r\n");
-
   } else if (strcmp(command, "mounts") == 0) {
     int count = vfs_list_mounts(mounts_callback, term);
     terminal_printf(term, "Current mounts (%d):\r\n", count);
@@ -3647,7 +3794,6 @@ void terminal_execute(Terminal *term, const char *cmd) {
                       sata_disk_get_count());
       terminal_puts(term, "Commands: sata list, sata test, sata info <id>\r\n");
     }
-
   } else if (strcmp(command, "ahci") == 0) {
     if (argc > 1) {
       if (strcmp(argv[1], "list") == 0) {
@@ -3676,7 +3822,6 @@ void terminal_execute(Terminal *term, const char *cmd) {
       }
       terminal_puts(term, "Commands: ahci list, ahci port <num>\r\n");
     }
-
   } else if (strcmp(command, "dma") == 0) {
     if (argc > 1) {
       if (strcmp(argv[1], "status") == 0) {
@@ -3828,5 +3973,37 @@ void terminal_execute(Terminal *term, const char *cmd) {
     } else {
       terminal_printf(term, "Unknown command: %s\r\n", command);
     }
+  }
+}
+
+void terminal_main_task(void *arg) {
+  Terminal *term = (Terminal *)arg;
+  uint32_t last_update = 0;
+  extern Terminal main_terminal;
+
+  if (!term)
+    term = &main_terminal;
+
+  while (1) {
+    // Procesar entrada de teclado desde el buffer
+    // keyboard_getkey_nonblock devuelve -1 si está vacío, NO 0.
+    int key = keyboard_getkey_nonblock();
+    while (key != -1) {
+      terminal_handle_key(term, key);
+      key = keyboard_getkey_nonblock();
+    }
+
+    uint32_t current_time = ticks_since_boot * 10;
+    if (current_time - last_update >= 50) {
+      terminal_update_cursor_blink(term, current_time);
+
+      // Solo dibujar fuera de la GUI si no hay ventanas
+      // En la GUI se encarga el renderizador de ventanas
+      if (!term->windowed) {
+        terminal_draw(term);
+      }
+      last_update = current_time;
+    }
+    task_sleep(1); // Más responsivo (10ms)
   }
 }
